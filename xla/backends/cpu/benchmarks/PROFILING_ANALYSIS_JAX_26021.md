@@ -2,178 +2,212 @@
 
 ## Issue Summary
 
-JAX users report a **3-5x regression** in CPU execution time for robotics
-workloads (MuJoCo JAX / MJX) starting with JAX 0.4.32, persisting through
-JAX 0.9.0. The regression correlates with the introduction of the thunk-based
-CPU runtime.
+JAX users report a **2-3x regression** in CPU execution time for small-op
+workloads starting with JAX 0.4.32, persisting through JAX 0.6.0. The
+upstream fix ([xla:cpu] Resolve custom call target at construction time)
+achieved only ~9% improvement, leaving the majority of the regression
+unresolved.
 
-**Benchmark numbers (mass_matrix on Unitree G1 robot, f64, CPU):**
-| JAX Version | Avg Time | Relative |
-|------------|----------|----------|
-| 0.4.30     | 0.023 ms | 1.0x     |
-| 0.4.33     | 0.133 ms | 5.8x     |
-| 0.9.0      | 0.087 ms | 3.8x     |
+**Key observations from the issue:**
+- 2-3x slowdown on CPU; GPU unaffected
+- `--xla_cpu_use_thunk_runtime=false` made things **worse**, not better
+- The workload is many small QP (quadratic program) solves via qpax/FFI
 
-## Workload Characteristics
+## Root Cause Analysis: It's NOT (just) the Thunk Runtime
 
-MJX workloads have properties that make them especially sensitive to per-op
-overhead:
+Our initial analysis focused on thunk-internal overhead (FFI dispatch,
+buffer address checking, `std::visit` in `CreateExecutionContext`). While
+those are real costs, they account for only ~9% of the regression (matching
+the upstream fix's improvement). The **dominant overhead is in the PjRt
+execution scaffolding** — the layers between JAX's Python dispatch and XLA's
+thunk execution.
 
-1. **Many small operations**: Kinematics chains produce 50-200+ HLO
-   instructions, each operating on tiny tensors (6x6 spatial inertia matrices,
-   36-element joint vectors). Actual compute per op is ~10-100ns.
+## Per-Execution Overhead Budget
 
-2. **Sequential dependencies**: Kinematic chains are inherently sequential -
-   each joint's transform depends on the previous. This means the ThunkExecutor
-   runs in `is_sequential_` mode.
+For every single JAX operation on CPU, the following work happens before
+any actual computation:
 
-3. **F64 precision**: Robotics requires double precision, which means no
-   vectorized SIMD speedups on small tensors.
+### Layer 1: CommonPjRtClient PrepareArguments (~1-3μs)
 
-4. **Custom calls via FFI**: MJX uses JAX's FFI for specialized physics
-   computations, adding FFI dispatch overhead per call.
+**File:** `xla/pjrt/common_pjrt_client.cc:522-684`
 
-## Identified Overhead Sources
-
-### 1. FFI Custom Call Dispatch (`custom_call_thunk.cc:298-349`)
-
-**Per-call overhead in `CallTypedFFI`:**
-
+For each input buffer:
 ```
-Hot path per FFI call:
-  a) Allocate InlinedVector<DeviceAddressBase, 8> for arguments   [~20ns]
-  b) For each arg: GetDeviceAddress(slice) → StatusOr             [~15ns/arg]
-  c) Allocate InlinedVector<DeviceAddressBase, 4> for results     [~20ns]
-  d) For each ret: GetDeviceAddress(slice) → StatusOr             [~15ns/ret]
-  e) ObjectPool::GetOrCreate() → CAS + potential Copy()           [~30-50ns]
-  f) CallFrame::UpdateWithBuffers()                               [~10ns]
-  g) Construct ffi::CallOptions (with std::variant)               [~15ns]
-  h) ffi::CallAsync() → CreateExecutionContext() + Build()        [~40ns]
-     → try-catch wrapper → handler call → TakeFuture()
-  Total: ~200-300ns per FFI call
+GetBufferWithHold(kUsage):
+  absl::MutexLock lock(mu_)          [~50-100ns per buffer]
+  WaitForOutstandingDonationHold()
+  AcquireHoldLocked()
+
+Shape validation (if strict_shape_checking)  [~10ns per buffer]
+TestBufferDonationClashes()                  [~10ns per buffer]
+AddDefinitionEventsToSet()                   [~10-20ns per buffer]
 ```
 
-The old runtime dispatched custom calls with a direct function pointer call
-(~5-10ns), so this represents a ~20-30x overhead per custom call.
+For 4 input buffers: ~300-500ns just in mutex locks + event tracking.
 
-**Key concern:** `CreateExecutionContext()` in `ffi_api.cc:86-121` uses
-`std::visit(BackendVisitor{}, options.backend_options)` on every call. This
-variant dispatch is unnecessary since the backend type is known at compile time
-for CPU.
+### Layer 2: Output Buffer Allocation (~0.5-1μs)
 
-### 2. ThunkExecutor Sequential Dispatch (`thunk_executor.cc:308-378`)
-
-For MJX workloads, `is_sequential_ = true` (small buffers < 512 bytes), so
-`ExecuteSequential` is used. Per-thunk overhead:
+**File:** `xla/pjrt/common_pjrt_client.cc:686-808`
 
 ```
-Per thunk in sequential path:
-  a) TracedExecute: check TraceMe::Active()                       [~5ns]
-  b) thunk.Execute() virtual dispatch                             [~5ns]
-  c) AsyncValueRef creation/checking                              [~10-15ns]
-  d) thunk.IsOkExecuteEvent() check                              [~5ns]
-  Total: ~25-30ns per thunk (excluding actual compute)
+AllocateOutputBuffersWithInputReuse():
+  Per output: memory space lookup, alias check, buffer allocation
+  AllocateRawBufferForExecute() with OOM retry logic
 ```
 
-With 100+ thunks, this adds ~3us per execution, which is significant when
-total execution is ~23us (JAX 0.4.30 baseline).
+### Layer 3: CpuPjRtRawLoadedExecutable::Execute (~2-5μs)
 
-### 3. CallFrame ObjectPool (`object_pool.h`)
+**File:** `xla/pjrt/cpu/cpu_client.cc:1491-1827`
 
-The `ObjectPool<CallFrame>` uses lock-free CAS operations:
-- First call: allocates + copies call frame (~500ns)
-- Steady state: PopEntry() CAS + PushEntry() CAS (~30-50ns per borrow/return)
-- The `BorrowedObject` destructor returns the frame to the pool
+```
+MakeConstructedAsyncValueRef<CpuEvent>() x2         [~50ns each]
+CreateBufferTable() — iterates all allocations       [~100-500ns]
+  Per allocation: MemoryForAllocation()
+  Handles params, constants, temps, outputs
 
-While the pool is well-optimized, the Copy() path for CallFrame allocates:
-- `make_unique<Arguments>` (copies vector of buffers)
-- `make_unique<Results>` (copies vector of buffers)
-- Runs `FixUpArgs` and `FixUpRets` to fix internal pointers
+Semaphore::ScopedAcquire(1)                          [~100-300ns]
+  absl::Mutex::LockWhen(Condition) + unlock
+  NOTE: has TODO "Optimize semaphore related overhead"
 
-### 4. StatusOr Overhead on Hot Path
+ExecutableRunOptions setup                           [~50ns]
+CpuExecutableRunOptions allocation (make_unique)     [~50ns]
+CollectiveExecuteParams::Create()                    [~20ns]
+CustomCallExecuteParams::Create()                    [~20ns]
+ThreadPoolTaskRunner construction                    [~20ns]
 
-Multiple functions on the hot path return `absl::StatusOr<T>` which has
-non-trivial overhead vs returning T directly:
+Buffer table → buffer_device_mem conversion loop     [~50-100ns]
+BufferAllocations construction                       [~20ns]
 
-- `GetDeviceAddress(slice)` → `StatusOr<DeviceAddressBase>` (called per buffer)
-- `call_frames_.GetOrCreate()` → `StatusOr<BorrowedObject>`
-- `CallAsync()` → `StatusOr<XLA_FFI_Future*>` internally
+Thunk::ExecuteParams construction                    [~20ns]
 
-In an inner loop running 100+ times per execution, these add up.
+ScopedFlushDenormal + ScopedSetRound                 [~20ns]
+```
 
-### 5. BufferAllocations::GetDeviceAddress
+### Layer 4: Post-Execution (~0.5-2μs)
 
-Each buffer lookup does bounds checking and offset computation:
+**File:** `xla/pjrt/common_pjrt_client.cc:967-998`
+
+```
+For each input buffer:
+  ConvertUsageHold():
+    absl::MutexLock lock(parent()->mu_)    [~50-100ns per buffer]
+    AddUsageEvent()
+    DecrementUsage()
+
+Semaphore::Release(1)                      [~100ns]
+  absl::MutexLock + value_ += amount
+
+AsyncValueRef SetStateConcrete()           [~20ns]
+```
+
+### Layer 5: Thunk Execution (~0.5-3μs for thunk overhead)
+
+**File:** `xla/backends/cpu/runtime/thunk_executor.cc`
+
+```
+Per thunk (sequential path):
+  TracedExecute()                          [~5ns]
+  thunk.Execute() virtual dispatch         [~5ns]
+  AsyncValueRef check                      [~10ns]
+  Total: ~20-25ns × N thunks
+```
+
+For 100 thunks: ~2-2.5μs in dispatch overhead.
+
+### Total Per-Execution Overhead
+
+| Component | Estimated Cost | Notes |
+|-----------|---------------|-------|
+| Buffer hold acquisition | 300-500ns | N × mutex lock per input |
+| Output allocation | 500-1000ns | Memory alloc per output |
+| CreateBufferTable | 100-500ns | Per buffer-assignment alloc |
+| Semaphore acquire+release | 200-600ns | 2 mutex operations |
+| AsyncValue creation | 100-200ns | 2-3 async values per exec |
+| Post-exec hold conversion | 300-500ns | N × mutex lock per input |
+| Thunk dispatch overhead | 500-2500ns | 20-25ns × N thunks |
+| **Total overhead** | **2-6μs** | **Before any real work** |
+
+For a computation that should take ~23μs (JAX 0.4.30 baseline), adding
+4-6μs of overhead = 1.2-1.3x slowdown from PjRt alone. Combined with
+thunk runtime overhead, this could explain the 2-3x regression.
+
+## Why the Thunk Runtime Flag Didn't Help
+
+The user reported `--xla_cpu_use_thunk_runtime=false` made things worse.
+Current code at `cpu_client.cc:1662` shows:
+
 ```cpp
-StatusOr<DeviceAddressBase> GetDeviceAddress(
-    const BufferAllocation::Slice& buffer_slice) const;
+if (!cpu_executable->has_thunks()) {
+    return Internal("CpuExecutable has no thunks.");
+}
 ```
 
-For the kernel thunk, there's an optimized unchecked path
-(`GetDeviceAddressUnchecked`) used when `ShouldCheckBufferSlices()` is false.
-The custom call thunk does NOT use this optimization.
+The non-thunk path no longer exists in the PjRt CPU client. The flag may
+affect compilation but the execution path requires thunks.
 
-### 6. AsyncValue Infrastructure
+## What Changed Between 0.4.31 and 0.4.32
 
-Every thunk execution creates and returns `AsyncValueRef<ExecuteEvent>`.
-Even for synchronous operations that complete immediately:
-- `OkExecuteEvent()` returns a pre-allocated static async value (good)
-- But the checking path (`IsOkExecuteEvent`, `IsAvailable`) still has overhead
+The regression is likely a combination of:
+
+1. **Thunk runtime became default** — added per-thunk dispatch overhead
+   (~20-25ns/thunk) that didn't exist with direct function calls
+
+2. **PjRt execution machinery grew** — more event tracking, async
+   execution tracking (CpuAsyncExecutionTracker), stream event maps
+
+3. **Buffer management added more safety** — mutex-based holds, donation
+   tracking, event chains for correctness
+
+4. **FFI dispatch overhead** — thunk-based FFI dispatch is heavier than
+   the old direct function pointer call
 
 ## Recommendations
 
-### High Impact (Expected: 2-3x improvement)
+### High Impact: PjRt Layer
 
-1. **Add unchecked buffer address path for CustomCallThunk**
-   Like `KernelThunk`, skip bounds checking in release builds:
+1. **Skip semaphore for cheap computations** — The `cheap_computation_`
+   flag already exists (line 1631). Use it to skip semaphore acquire:
    ```cpp
-   // Instead of:
-   TF_ASSIGN_OR_RETURN(arguments.emplace_back(),
-                        params.buffer_allocations->GetDeviceAddress(slice));
-   // Use:
-   arguments.emplace_back(
-       params.buffer_allocations->GetDeviceAddressUnchecked(slice));
+   if (!executable_->cheap_computation_) {
+     compute_reservation = std::make_unique<Semaphore::ScopedReservation>(
+         device_->max_inflight_computations_semaphore().ScopedAcquire(1));
+   }
    ```
 
-2. **Cache ExecutionContext per-execution instead of per-call**
-   `CreateExecutionContext()` creates the same context for every FFI call in a
-   single execution. It should be created once in `ExecuteThunks()` and passed
-   through `ExecuteParams`:
-   ```cpp
-   // In cpu_executable.cc ExecuteThunks():
-   XLA_FFI_ExecutionContext ffi_ctx = CreateExecutionContext(options);
-   // Pass ffi_ctx through execute_params to avoid recreating per custom call
-   ```
+2. **Fast-path for synchronous execution** — When `execute_inline` is
+   true, many async tracking structures are unnecessary. Skip:
+   - `CpuAsyncExecutionTracker::NewAsyncExecution()`
+   - `ExecutionStreamEventMap` tracking
+   - Extra `AsyncValueRef<CpuEvent>` creation
 
-3. **Avoid std::visit for backend context on CPU**
-   Since the CPU backend always uses `CpuOptions`, the variant dispatch is
-   unnecessary. Use a direct struct access or template specialization.
+3. **Reduce per-buffer mutex overhead** — For `ConvertUsageHold`, batch
+   the mutex acquisition or use lock-free event tracking for usage events.
 
-4. **Pre-build XLA_FFI_CallFrame in CallFrame**
-   Instead of calling `Build()` on every invocation, cache the
-   `XLA_FFI_CallFrame` struct and only update the `ctx` pointer.
+4. **Pre-allocate buffer table** — `CreateBufferTable` creates a new
+   `vector<AsyncValueRef>` each execution. For repeated execution of the
+   same program, reuse the table.
 
-### Medium Impact (Expected: 20-50% improvement)
+### Medium Impact: Thunk Layer
 
-5. **Remove try-catch from FFI hot path for internal handlers**
-   For statically-linked handlers (which is the common case for CPU), the
-   try-catch in `ffi_api.cc:176-186` is unnecessary. Use a separate dispatch
-   path for internal handlers.
+5. **Unchecked buffer addresses in CustomCallThunk** — ✅ Already done in
+   this branch. Matches `KernelThunk` pattern using
+   `ShouldCheckBufferSlices()`.
 
-6. **Inline OkExecuteEvent check in ExecuteSequential**
-   The `IsOkExecuteEvent` check can be made branchless or combined with the
-   `IsAvailable` check.
+6. **Cache ExecutionContext per-execution** — Create
+   `XLA_FFI_ExecutionContext` once in `ExecuteThunks` and pass through
+   `ExecuteParams`, avoiding reconstruction per custom call.
 
-7. **Consider templating CustomCallThunk on buffer count**
-   Like `SmallKernelThunk<N,M>`, specialize for common buffer counts to
-   eliminate dynamic vector allocation.
+7. **InvokeAsync with pre-built context** — Main's `InvokeContext` is
+   already cleaner, but still uses `std::visit` internally. For the CPU
+   backend, directly construct `XLA_FFI_ExecutionContext::CpuContext`.
 
-### Low Impact (Cleanup)
+### Low Impact: Thunk Internals
 
-8. **Profile with `perf` and trace with `--xla_dump_to`**
-   Run with `XLA_FLAGS=--xla_dump_to=/tmp/xla_dump` to capture HLO and
-   identify the exact operation mix. Use `perf record` on the benchmark
-   to confirm overhead distribution.
+8. **Remove try-catch for internal handlers** — For statically-linked
+   handlers, the exception guard adds ~5-10ns overhead.
+
+9. **Template CustomCallThunk on buffer count** — Like
+   `SmallKernelThunk<N,M>`, avoid dynamic allocation for common cases.
 
 ## How to Profile
 
@@ -193,11 +227,14 @@ perf record -g ./bazel-bin/xla/backends/cpu/benchmarks/many_small_ops_benchmark_
 perf report --no-children
 ```
 
-### Profile with XLA tracing:
+### Profile the FULL execution path (PjRt + XLA):
 ```bash
-XLA_FLAGS="--xla_dump_to=/tmp/xla_dump" \
-  ./bazel-bin/xla/backends/cpu/benchmarks/many_small_ops_benchmark_test \
-  --benchmark_filter="BM_InterleavedComputeAndCustomCalls/25"
+# Use JAX profiler to capture the complete picture:
+import jax
+jax.profiler.start_trace("/tmp/jax_trace")
+# ... run workload ...
+jax.profiler.stop_trace()
+# View in TensorBoard
 ```
 
 ### Compare with blocking executor (shows per-thunk timing):
@@ -209,12 +246,17 @@ bazel run -c opt --copt=-DXLA_CPU_USE_BLOCKING_THUNK_EXECUTOR \
 
 ## Files of Interest
 
-| File | Relevance |
-|------|-----------|
-| `xla/backends/cpu/runtime/custom_call_thunk.cc` | FFI dispatch hot path |
-| `xla/backends/cpu/runtime/thunk_executor.cc` | Sequential execution loop |
-| `xla/ffi/ffi_api.cc` | CreateExecutionContext, Call/CallAsync |
-| `xla/ffi/call_frame.cc` | UpdateWithBuffers, Copy, Build |
-| `xla/runtime/object_pool.h` | Lock-free call frame pooling |
-| `xla/backends/cpu/runtime/kernel_thunk.cc` | Optimized kernel dispatch (reference) |
-| `xla/service/cpu/cpu_executable.cc` | ExecuteThunks entry point |
+| File | Layer | Relevance |
+|------|-------|-----------|
+| `xla/pjrt/common_pjrt_client.cc` | PjRt | PrepareArguments, buffer holds |
+| `xla/pjrt/abstract_tracked_device_buffer.cc` | PjRt | Per-buffer mutex locks |
+| `xla/pjrt/cpu/cpu_client.cc` | PjRt/CPU | Execute path, semaphore, buffer table |
+| `xla/pjrt/cpu/cpu_device.h` | PjRt/CPU | Semaphore TODO comment |
+| `xla/pjrt/semaphore.h` | PjRt | Mutex-based semaphore |
+| `xla/pjrt/cpu/cpu_async_execution_tracker.h` | PjRt/CPU | Async tracking overhead |
+| `xla/backends/cpu/runtime/custom_call_thunk.cc` | Thunk | FFI dispatch hot path |
+| `xla/backends/cpu/runtime/thunk_executor.cc` | Thunk | Sequential execution loop |
+| `xla/ffi/invoke.cc` | FFI | InvokeAsync, CreateExecutionContext |
+| `xla/ffi/call_frame.cc` | FFI | UpdateWithBuffers, Copy, Build |
+| `xla/backends/cpu/runtime/kernel_thunk.cc` | Thunk | Reference: optimized dispatch |
+| `xla/service/cpu/cpu_executable.cc` | XLA | ExecuteThunks entry point |
