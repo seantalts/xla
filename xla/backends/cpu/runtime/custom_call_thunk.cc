@@ -299,17 +299,23 @@ tsl::AsyncValueRef<Thunk::ExecuteEvent> CustomCallThunk::Execute(
 
 tsl::AsyncValueRef<Thunk::ExecuteEvent> CustomCallThunk::CallTypedFFI(
     const ExecuteParams& params) {
-  if (params.custom_call_params == nullptr) {
+  if (ABSL_PREDICT_FALSE(params.custom_call_params == nullptr)) {
     return Internal("CustomCallExecuteParams cannot be nullptr.");
   }
+
+  const BufferAllocations* allocations = params.buffer_allocations;
 
   // Collect argument buffers.
   absl::InlinedVector<se::DeviceAddressBase, 8> arguments;
   arguments.reserve(op_buffers_.arguments_buffers.size());
   for (int i = 0; i < op_buffers_.arguments_buffers.size(); ++i) {
     BufferAllocation::Slice& slice = op_buffers_.arguments_buffers[i];
-    TF_ASSIGN_OR_RETURN(arguments.emplace_back(),
-                        params.buffer_allocations->GetDeviceAddress(slice));
+    if (ShouldCheckBufferSlices()) {
+      TF_ASSIGN_OR_RETURN(arguments.emplace_back(),
+                          allocations->GetDeviceAddress(slice));
+    } else {
+      arguments.push_back(allocations->GetDeviceAddressUnchecked(slice));
+    }
     ABSL_ANNOTATE_MEMORY_IS_INITIALIZED(arguments[i].opaque(),
                                         arguments[i].size());
     VLOG(3) << absl::StreamFormat(
@@ -323,8 +329,12 @@ tsl::AsyncValueRef<Thunk::ExecuteEvent> CustomCallThunk::CallTypedFFI(
   results.reserve(op_buffers_.results_buffers.size());
   for (int i = 0; i < op_buffers_.results_buffers.size(); ++i) {
     BufferAllocation::Slice& slice = op_buffers_.results_buffers[i];
-    TF_ASSIGN_OR_RETURN(results.emplace_back(),
-                        params.buffer_allocations->GetDeviceAddress(slice));
+    if (ShouldCheckBufferSlices()) {
+      TF_ASSIGN_OR_RETURN(results.emplace_back(),
+                          allocations->GetDeviceAddress(slice));
+    } else {
+      results.push_back(allocations->GetDeviceAddressUnchecked(slice));
+    }
     ABSL_ANNOTATE_MEMORY_IS_INITIALIZED(results[i].opaque(), results[i].size());
     VLOG(3) << absl::StreamFormat("  res: %s in slice %s (%p)",
                                   op_buffers_.results_shapes[i].ToString(true),
@@ -336,7 +346,8 @@ tsl::AsyncValueRef<Thunk::ExecuteEvent> CustomCallThunk::CallTypedFFI(
   TF_ASSIGN_OR_RETURN(auto call_frame, call_frames_.GetOrCreate());
   TF_RETURN_IF_ERROR(call_frame->UpdateWithBuffers(arguments, results));
 
-  // Forward ExecutableRunOptions to the FFI handlers via the call options.
+  // Use the optimized CPU call path that constructs the execution context
+  // directly, avoiding std::visit overhead in CreateExecutionContext.
   CustomCallExecuteParams* custom_call_params = params.custom_call_params;
   ffi::InvokeContext invoke_context = {
       custom_call_params->run_id,
@@ -353,13 +364,19 @@ tsl::AsyncValueRef<Thunk::ExecuteEvent> CustomCallThunk::CallTypedFFI(
 
 tsl::AsyncValueRef<Thunk::ExecuteEvent> CustomCallThunk::CallUntypedAPI(
     const ExecuteParams& params) {
+  const BufferAllocations* allocations = params.buffer_allocations;
+
   // Collect raw input pointers in an array.
   absl::InlinedVector<const void*, 8> arguments;
   arguments.reserve(op_buffers_.arguments_buffers.size());
   for (int i = 0; i < op_buffers_.arguments_buffers.size(); ++i) {
     auto& slice = op_buffers_.arguments_buffers[i];
-    TF_ASSIGN_OR_RETURN(se::DeviceAddressBase arg,
-                        params.buffer_allocations->GetDeviceAddress(slice));
+    se::DeviceAddressBase arg;
+    if (ShouldCheckBufferSlices()) {
+      TF_ASSIGN_OR_RETURN(arg, allocations->GetDeviceAddress(slice));
+    } else {
+      arg = allocations->GetDeviceAddressUnchecked(slice);
+    }
     arguments.push_back(arg.opaque());
     VLOG(3) << absl::StreamFormat(
         "  arg: %s in slice %s (%p)",
@@ -373,8 +390,12 @@ tsl::AsyncValueRef<Thunk::ExecuteEvent> CustomCallThunk::CallUntypedAPI(
   results.reserve(op_buffers_.results_buffers.size());
   for (int i = 0; i < op_buffers_.results_buffers.size(); ++i) {
     auto& slice = op_buffers_.results_buffers[i];
-    TF_ASSIGN_OR_RETURN(se::DeviceAddressBase res,
-                        params.buffer_allocations->GetDeviceAddress(slice));
+    se::DeviceAddressBase res;
+    if (ShouldCheckBufferSlices()) {
+      TF_ASSIGN_OR_RETURN(res, allocations->GetDeviceAddress(slice));
+    } else {
+      res = allocations->GetDeviceAddressUnchecked(slice);
+    }
     results.push_back(res.opaque());
     VLOG(3) << absl::StreamFormat("  res: %s in slice %s (%p)",
                                   op_buffers_.results_shapes[i].ToString(true),
