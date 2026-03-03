@@ -17,7 +17,7 @@
 | 0.7.0 | 158.21 | 5.0x |
 | 0.9.1 | 199.84 | 6.3x |
 
-### Known primary regression commit
+### Suspected regression commit (NOT VERIFIED — needs actual bisect)
 
 **`0a4d157ba44b378221a915965036c0aff0120a70`** (2024-08-07) — "[xla:cpu] Switch XLA:CPU runtime to thunks interpreter" by Eugene Zhulenev. One-line change in `xla/debug_options_flags.cc`:
 
@@ -26,36 +26,49 @@
 +  opts.set_xla_cpu_use_thunk_runtime(true);
 ```
 
-This is the biggest single regression. But even with `--xla_cpu_use_thunk_runtime=false` on 0.4.33, performance only recovers to ~98us (still 3x worse than 0.4.30's 31.7us), suggesting **additional regression sources**.
+**IMPORTANT: This commit was identified by searching git log for thunks-related changes, NOT by building and benchmarking XLA at this commit.** It is a strong candidate because:
+- It's the commit that flipped the thunks runtime on by default
+- The `--xla_cpu_use_thunk_runtime=false` flag partially recovers performance on jaxlib 0.4.33
+- The commit message explicitly warns about regressions for "while loops with large number of iterations and small computation"
+
+But it has NOT been verified by actually building XLA at this commit and measuring. There could be multiple regression commits in the range.
+
+### What the pip-based bisect tells us
+
+The coarse bisect only narrowed the regression to a **44-day, thousands-of-commits window**:
+- **Last fast XLA commit**: `95e3eea8d2` (jaxlib 0.4.31 pin, 2024-07-28)
+- **First slow XLA commit**: `720b2c5334` (jaxlib 0.4.32/0.4.33 pin, 2024-09-10)
+
+We could NOT build XLA from source in this environment (bazel failed due to proxy authentication errors), so no individual XLA commit was ever benchmarked.
+
+### Evidence for multiple regressions
+
+Even with `--xla_cpu_use_thunk_runtime=false` on jaxlib 0.4.33, performance only recovers to ~98us (still **3x worse** than 0.4.30's 31.7us). This proves there are **at least two independent regression sources** in the 0.4.31 → 0.4.33 range:
+1. The thunks switch (~3x)
+2. Something else (~3x)
 
 ### Workaround status
 
 - `--xla_cpu_use_thunk_runtime=false` helps on 0.4.33 but on 0.7.1 (last version with the flag) it's actually 1.5x SLOWER — the thunks runtime was optimized enough by then.
 - On 0.7.2+ the flag is deprecated/removed. No workaround exists for current JAX.
 
-## What Still Needs Bisecting
+## What Needs Bisecting
 
-### 1. Fine-grained bisect of the thunks switch (CONFIRMED — optional verification)
+### Bisect 1: Primary regression (thunks switch + others)
 
 XLA commit range: `95e3eea8d2` (0.4.31 pin, 2024-07-28) → `720b2c5334` (0.4.33 pin, 2024-09-10)
 
-The regression commit `0a4d157ba4` is already identified. You can verify this by testing commits immediately before and after.
+Run `git bisect` with the HLO benchmark (thunks ON, which is the default). This should find the thunks switch commit and confirm or refute `0a4d157ba4`. Use a threshold of ~50us to distinguish good (<40us) from bad (>100us).
 
-### 2. The "other 3x" regression — NEEDS INVESTIGATION
+### Bisect 2: The "other 3x" regression
 
-Even with thunks disabled, 0.4.33 is 3x slower than 0.4.30. This needs a separate bisect with `--xla_cpu_use_thunk_runtime=false` to isolate non-thunks regressions.
+Same XLA commit range, but run with `XLA_FLAGS=--xla_cpu_use_thunk_runtime=false` to isolate non-thunks regressions. This will find whatever else caused a 3x slowdown independently of the thunks switch.
 
 XLA commit range: `79fd5733f9` (0.4.30 pin) → `720b2c5334` (0.4.33 pin)
 
-### 3. Post-0.4.33 improvements and remaining gap — NEEDS INVESTIGATION
+### Bisect 3 (optional): 0.7.0 → 0.9.1 re-regression
 
-Performance improved from 9.3x (0.4.33) to 5.0x (0.7.0) with thunks runtime optimizations. Identify which optimization commits had the most impact to understand what patterns help.
-
-### 4. 0.7.0 → 0.9.1 regression — NEEDS INVESTIGATION
-
-Performance went from 5.0x (0.7.0) to 6.3x (0.9.1). Something regressed again in this range.
-
-XLA commit range for 0.7.0 → 0.9.1 can be found by checking JAX's `third_party/xla/workspace.bzl`.
+Performance went from 5.0x (0.7.0) to 6.3x (0.9.1). Something regressed again. Find XLA pins from JAX's `third_party/xla/workspace.bzl` and bisect.
 
 ## HLO File Location
 
