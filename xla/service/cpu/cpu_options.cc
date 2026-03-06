@@ -167,4 +167,10 @@ bool EnableTiledEmitter(const HloModuleConfig& config) {
   return extra_options_map.count(kDisableTiledEmitter) == 0;
 }
 
+bool EnableTwoPhaseFusion(const HloModuleConfig& config) {
+  const auto& extra_options_map =
+      config.debug_options().xla_backend_extra_options();
+  return extra_options_map.count(kEnableTwoPhaseFusion) > 0;
+}
+
 }  // namespace xla::cpu::options

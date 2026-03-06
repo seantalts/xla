@@ -54,6 +54,8 @@ inline constexpr absl::string_view kDisablePlatformDependentMath =
     "xla_cpu_disable_platform_dependent_math";
 inline constexpr absl::string_view kDisableTiledEmitter =
     "xla_cpu_disable_tiled_emitter";
+inline constexpr absl::string_view kEnableTwoPhaseFusion =
+    "xla_cpu_enable_two_phase_fusion";
 
 bool OptimizeForSizeRequested(const HloModuleConfig& config);
 bool VectorizedReduceDisabled(const HloModuleConfig& config);
@@ -71,6 +73,7 @@ bool UseExperimentalLoopFusion(const HloModuleConfig& config);
 bool FlattenAfterFusion(const HloModuleConfig& config);
 bool UseMultiOutputFusion(const HloModuleConfig& config);
 bool EnableTiledEmitter(const HloModuleConfig& config);
+bool EnableTwoPhaseFusion(const HloModuleConfig& config);
 
 }  // namespace xla::cpu::options
 

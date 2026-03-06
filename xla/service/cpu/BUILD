@@ -142,6 +142,7 @@ cc_library(
         ":metrics",
         ":parallel_task_assignment",
         ":small_while_loop_hoisting_pass",
+        ":subcomputation_fusion",
         ":thunk_emitter",
         "//xla:debug_options_flags",
         "//xla:literal",
@@ -1060,6 +1061,20 @@ xla_cc_test(
     ],
 )
 
+xla_cc_test(
+    name = "subcomputation_fusion_test",
+    srcs = ["subcomputation_fusion_test.cc"],
+    deps = [
+        ":subcomputation_fusion",
+        "//xla/hlo/ir:hlo",
+        "//xla/hlo/testlib:hlo_hardware_independent_test_base",
+        "//xla/tests:xla_internal_test_main",
+        "//xla/tsl/platform:statusor",
+        "@com_google_absl//absl/status:statusor",
+        "@com_google_googletest//:gtest",
+    ],
+)
+
 cc_library(
     name = "cpu_instruction_fusion",
     srcs = ["cpu_instruction_fusion.cc"],
@@ -1076,6 +1091,25 @@ cc_library(
         "//xla/service:pattern_matcher",
         "@com_google_absl//absl/algorithm:container",
         "@com_google_absl//absl/container:flat_hash_map",
+        "@com_google_absl//absl/container:flat_hash_set",
+        "@com_google_absl//absl/log",
+        "@com_google_absl//absl/status:statusor",
+        "@com_google_absl//absl/strings:string_view",
+    ],
+)
+
+cc_library(
+    name = "subcomputation_fusion",
+    srcs = ["subcomputation_fusion.cc"],
+    hdrs = ["subcomputation_fusion.h"],
+    deps = [
+        ":cpu_instruction_fusion",
+        ":cpu_multi_output_fusion",
+        "//xla/hlo/analysis:alias_info",
+        "//xla/hlo/ir:hlo",
+        "//xla/hlo/pass:hlo_pass",
+        "//xla/hlo/transforms/simplifiers:tuple_simplifier",
+        "//xla/service:call_graph",
         "@com_google_absl//absl/container:flat_hash_set",
         "@com_google_absl//absl/log",
         "@com_google_absl//absl/status:statusor",

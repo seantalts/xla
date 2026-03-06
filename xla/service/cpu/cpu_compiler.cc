@@ -178,6 +178,7 @@ limitations under the License.
 #include "xla/service/cpu/dot_op_emitter.h"
 #include "xla/service/cpu/executable.pb.h"
 #include "xla/service/cpu/fusion_wrapper.h"
+#include "xla/service/cpu/subcomputation_fusion.h"
 #include "xla/service/cpu/ir_emitter.h"
 #include "xla/service/cpu/ir_emitter2.h"
 #include "xla/service/cpu/metrics.h"
@@ -1019,6 +1020,30 @@ absl::Status CpuCompiler::RunHloPassesAfterLayoutAssn(
   AliasInfo alias_info;
   bool use_multi_output_fusion =
       options::UseMultiOutputFusion(module->config());
+  bool use_two_phase_fusion =
+      options::EnableTwoPhaseFusion(module->config());
+
+  if (use_two_phase_fusion) {
+    // Two-phase fusion pipeline:
+    //   Phase 1: Run fusion on all computations (including outlined
+    //            sub-computations) to pre-compact them.
+    //   Phase 2: Inline ALL sub-computations (not just single-call-site).
+    //            Each inlined body is already compacted by Phase 1.
+    //   Phase 3: Run fusion again on the fully inlined graph to discover
+    //            cross-boundary fusion opportunities.
+    // Phase 1: Run CpuInstructionFusion (+ multi-output fusion) on all
+    // computations including outlined sub-computations. FusionWrapper is
+    // deferred to Phase 3 so that Phase 3 can merge raw ops across
+    // former call boundaries.
+    pipeline.AddPass<SubcomputationFusionPass>(use_multi_output_fusion);
+
+    // Phase 2: Inline all sub-computations (including multi-call-site).
+    pipeline.AddPass<FlattenCallGraph>();
+    pipeline.AddPass<CallInliner>(/*single_call_site=*/false);
+    pipeline.AddPass<HloCSE>(/*is_layout_sensitive=*/true);
+  }
+
+  // Phase 3 (or standard single-phase): Run fusion on the (now-inlined) graph.
   pipeline.AddPass<CpuInstructionFusion>(
       &alias_info,
       /*may_duplicate=*/!use_multi_output_fusion);
@@ -1036,7 +1061,9 @@ absl::Status CpuCompiler::RunHloPassesAfterLayoutAssn(
     pipeline.AddPass<TupleSimplifier>();
   }
 
-  if (flatten_after_fusion) {
+  if (flatten_after_fusion && !use_two_phase_fusion) {
+    // Skip this when two-phase fusion is enabled since we already inlined
+    // everything in Phase 2.
     pipeline.AddPass<FlattenCallGraph>();
     pipeline.AddPass<CallInliner>(/*single_call_site=*/true);
   }
