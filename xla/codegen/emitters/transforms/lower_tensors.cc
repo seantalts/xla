@@ -15,6 +15,7 @@ limitations under the License.
 #include <cassert>
 #include <cstdint>
 #include <memory>
+#include <numeric>
 #include <optional>
 #include <string>
 #include <tuple>
@@ -131,19 +132,53 @@ Value GetDestinationBuffer(Value dest) {
   return dest;
 }
 
+// Returns the largest power of 2 that is known to divide `value` at compile
+// time, by recursively inspecting the arithmetic operations that define it.
+// For example, if value = x * 256 + y * 64, returns 64.
+int64_t GetKnownAlignment(Value value, int depth = 0) {
+  if (depth > 8) return 1;
+
+  // Match integer/index constants.
+  llvm::APInt const_val;
+  if (mlir::matchPattern(value, mlir::m_ConstantInt(&const_val))) {
+    if (const_val.isZero()) return int64_t{1} << 62;
+    uint64_t abs_val = const_val.abs().getZExtValue();
+    return int64_t{1} << absl::countr_zero(abs_val);
+  }
+
+  // muli: if a is a multiple of 2^A and b is a multiple of 2^B,
+  // then a*b is a multiple of 2^(A+B).
+  if (auto muli = value.getDefiningOp<mlir::arith::MulIOp>()) {
+    int64_t lhs_align = GetKnownAlignment(muli.getLhs(), depth + 1);
+    int64_t rhs_align = GetKnownAlignment(muli.getRhs(), depth + 1);
+    // Clamp the product to avoid overflow.
+    if (lhs_align <= (int64_t{1} << 32) && rhs_align <= (int64_t{1} << 32)) {
+      return lhs_align * rhs_align;
+    }
+    return int64_t{1} << 62;
+  }
+
+  // addi: gcd of the two operand alignments.
+  if (auto addi = value.getDefiningOp<mlir::arith::AddIOp>()) {
+    return std::min(GetKnownAlignment(addi.getLhs(), depth + 1),
+                    GetKnownAlignment(addi.getRhs(), depth + 1));
+  }
+
+  // Index casts preserve alignment.
+  if (auto cast = value.getDefiningOp<mlir::arith::IndexCastUIOp>()) {
+    return GetKnownAlignment(cast.getIn(), depth + 1);
+  }
+  if (auto cast = value.getDefiningOp<mlir::arith::IndexCastOp>()) {
+    return GetKnownAlignment(cast.getIn(), depth + 1);
+  }
+
+  return 1;
+}
+
 std::optional<int> GetAlignmentFromArg(Value addr, ValueRange indices) {
   CHECK_LE(indices.size(), 1) << "Only 0D and 1D tensors are supported";
 
-  // If the offset isn't empty or {0}, we don't return any alignment because
-  // computing it isn't trivial and it's unclear that we need to deal with that
-  // case in practice.
-  auto effective_offset_is_zero = [](ValueRange offsets) -> bool {
-    if (offsets.empty()) return true;
-    return mlir::matchPattern(offsets[0].getDefiningOp(), mlir::m_Zero());
-  };
-  if (!effective_offset_is_zero(indices)) return std::nullopt;
-
-  // Try to get the alignment from the function signature.
+  // Try to get the base alignment from the function signature.
   auto base = mlir::dyn_cast<mlir::BlockArgument>(addr);
   if (!base) return std::nullopt;
   auto func =
@@ -152,7 +187,28 @@ std::optional<int> GetAlignmentFromArg(Value addr, ValueRange indices) {
   auto align_attr =
       func.getArgAttr(base.getArgNumber(), ml::LLVMDialect::getAlignAttrName());
   if (!align_attr) return std::nullopt;
-  return mlir::cast<mlir::IntegerAttr>(align_attr).getValue().getSExtValue();
+  int64_t base_alignment =
+      mlir::cast<mlir::IntegerAttr>(align_attr).getValue().getSExtValue();
+
+  // If offset is zero, return base alignment directly.
+  if (indices.empty()) return base_alignment;
+  if (mlir::matchPattern(indices[0].getDefiningOp(), mlir::m_Zero())) {
+    return base_alignment;
+  }
+
+  // For non-zero offsets, the effective alignment of (base + index * elem_size)
+  // is gcd(base_alignment, index * elem_size). We analyze the index value to
+  // find its known alignment factor (largest power of 2 dividing it).
+  auto tensor_type = mlir::dyn_cast<mlir::RankedTensorType>(addr.getType());
+  if (!tensor_type) return std::nullopt;
+  auto data_layout = mlir::DataLayout::closest(func);
+  int64_t elem_bits = data_layout.getTypeSizeInBits(tensor_type.getElementType());
+  if (elem_bits == 0 || elem_bits % 8 != 0) return std::nullopt;
+  int64_t elem_bytes = elem_bits / 8;
+
+  int64_t index_alignment = GetKnownAlignment(indices[0]);
+  int64_t offset_byte_alignment = index_alignment * elem_bytes;
+  return std::gcd(base_alignment, offset_byte_alignment);
 }
 
 template <typename Op>

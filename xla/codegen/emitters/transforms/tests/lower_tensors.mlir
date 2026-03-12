@@ -972,7 +972,7 @@ func.func @transfer_read_alignment_non_zero_index(%arg0: tensor<16xi64> {llvm.al
 // CHECK-LABEL: @transfer_read_alignment_non_zero_index(
 // CHECK-SAME:  %[[ARG0:.*]]: !llvm.ptr
 // CHECK:           %[[PTR:.*]] = llvm.getelementptr inbounds %[[ARG0]][0, 8]
-// CHECK-NEXT:      llvm.load %[[PTR]] {alignment = 8 : i64} : !llvm.ptr -> vector<8xi64>
+// CHECK-NEXT:      llvm.load %[[PTR]] {alignment = 32 : i64} : !llvm.ptr -> vector<8xi64>
 
 // -----
 
@@ -1002,7 +1002,39 @@ func.func @transfer_write_alignment_non_zero_index(%arg0: tensor<8xi64> {llvm.al
 // CHECK-DAG:       %[[C0_I64:.*]] = arith.constant dense<0> : vector<8xi64>
 // CHECK:           %[[GEP:.*]] = llvm.getelementptr inbounds %[[ARG0]][0, 8] :
 // CHECK-SAME:        !llvm.array<8 x i64>
-// CHECK:           llvm.store %[[C0_I64]], %[[GEP]] {alignment = 8 : i64} : vector<8xi64>, !llvm.ptr
+// CHECK:           llvm.store %[[C0_I64]], %[[GEP]] {alignment = 32 : i64} : vector<8xi64>, !llvm.ptr
+
+// -----
+
+// Test alignment for dynamic offsets with known multiplicative factors.
+// base align=64, index = x * 128, elem_bytes = 2 (bf16)
+// offset_byte_alignment = 128 * 2 = 256, gcd(64, 256) = 64
+func.func @transfer_read_alignment_dynamic_offset(
+    %arg0: tensor<65536xbf16> {llvm.align = 64 : index}, %x: index) -> vector<16xbf16> {
+  %c128 = arith.constant 128 : index
+  %idx = arith.muli %x, %c128 : index
+  %c0 = arith.constant 0.0 : bf16
+  %0 = vector.transfer_read %arg0[%idx], %c0 {in_bounds = [true]} : tensor<65536xbf16>, vector<16xbf16>
+  return %0 : vector<16xbf16>
+}
+// CHECK-LABEL: @transfer_read_alignment_dynamic_offset(
+// CHECK-SAME:  %[[ARG0:.*]]: !llvm.ptr
+// CHECK:           llvm.load {{.*}} {alignment = 64 : i64} : !llvm.ptr -> vector<16xbf16>
+
+// -----
+
+// Test alignment for dynamic offsets without known factors.
+// base align=64, index = unknown, elem_bytes = 2 (bf16)
+// offset_byte_alignment = 1 * 2 = 2, gcd(64, 2) = 2
+func.func @transfer_read_alignment_unknown_offset(
+    %arg0: tensor<65536xbf16> {llvm.align = 64 : index}, %idx: index) -> vector<16xbf16> {
+  %c0 = arith.constant 0.0 : bf16
+  %0 = vector.transfer_read %arg0[%idx], %c0 {in_bounds = [true]} : tensor<65536xbf16>, vector<16xbf16>
+  return %0 : vector<16xbf16>
+}
+// CHECK-LABEL: @transfer_read_alignment_unknown_offset(
+// CHECK-SAME:  %[[ARG0:.*]]: !llvm.ptr
+// CHECK:           llvm.load {{.*}} {alignment = 2 : i64} : !llvm.ptr -> vector<16xbf16>
 
 // -----
 
