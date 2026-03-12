@@ -5,7 +5,19 @@ load("@bazel_tools//tools/build_defs/repo:http.bzl", "http_archive")
 load("@build_bazel_apple_support//lib:repositories.bzl", "apple_support_dependencies")
 load("@build_bazel_rules_apple//apple:repositories.bzl", "apple_rules_dependencies")
 load("@build_bazel_rules_swift//swift:repositories.bzl", "swift_rules_dependencies")
-load("@com_github_grpc_grpc//bazel:grpc_extra_deps.bzl", "grpc_extra_deps")
+load("@bazel_features//:deps.bzl", "bazel_features_deps")
+load("@bazel_gazelle//:deps.bzl", "gazelle_dependencies")
+load("@com_envoyproxy_protoc_gen_validate//:dependencies.bzl", "go_third_party")
+load("@com_google_googleapis//:repository_rules.bzl", "switched_rules_by_language")
+load("@com_google_googletest//:googletest_deps.bzl", "googletest_deps")
+load("@com_google_protobuf//:protobuf_deps.bzl", "protobuf_deps")
+load("@envoy_api//bazel:repositories.bzl", "api_dependencies")
+load("@google_cloud_cpp//bazel:google_cloud_cpp_deps.bzl", "google_cloud_cpp_deps")
+load("@io_bazel_rules_go//go:deps.bzl", "go_register_toolchains", "go_rules_dependencies")
+load("@rules_java//java:rules_java_deps.bzl", "rules_java_dependencies")
+load("@rules_proto//proto:repositories.bzl", "rules_proto_dependencies")
+load("@rules_python//python:repositories.bzl", "py_repositories")
+load("@rules_shell//shell:repositories.bzl", "rules_shell_dependencies", "rules_shell_toolchains")
 load("@com_google_benchmark//:bazel/benchmark_deps.bzl", "benchmark_deps")
 load("//third_party:repo.bzl", "tf_http_archive", "tf_mirror_urls")
 
@@ -151,7 +163,32 @@ def workspace():
     # at the end of the WORKSPACE file.
     _tf_bind()
 
-    grpc_extra_deps()
+    # Inlined grpc_extra_deps() with host Go SDK instead of downloading Go 1.22.5.
+    # The proxy in Claude Code remote env blocks go.dev and dl.google.com,
+    # so we use the pre-installed host Go SDK instead.
+    # Original: grpc_extra_deps()
+    rules_shell_dependencies()
+    rules_shell_toolchains()
+    rules_java_dependencies()
+    protobuf_deps()
+    rules_proto_dependencies()
+    bazel_features_deps()
+    api_dependencies()
+    go_rules_dependencies()
+    go_register_toolchains(version = "host")
+    gazelle_dependencies()
+    go_third_party()
+    apple_rules_dependencies()
+    apple_support_dependencies()
+    switched_rules_by_language(
+        name = "com_google_googleapis_imports",
+        cc = True,
+        grpc = True,
+        python = True,
+    )
+    google_cloud_cpp_deps()
+    py_repositories()
+    googletest_deps()
 
 # Alias so it can be loaded without assigning to a different symbol to prevent
 # shadowing previous loads and trigger a buildifier warning.
