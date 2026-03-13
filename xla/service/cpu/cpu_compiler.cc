@@ -1021,13 +1021,21 @@ absl::Status CpuCompiler::RunHloPassesAfterLayoutAssn(
   }
 
   AliasInfo alias_info;
+  const bool is_fast_compile = options::IsFastCompileMode(module->config());
   bool use_multi_output_fusion =
-      options::UseMultiOutputFusion(module->config());
-  pipeline.AddPass<CpuInstructionFusion>(
-      &alias_info,
-      /*may_duplicate=*/!use_multi_output_fusion);
+      !is_fast_compile && options::UseMultiOutputFusion(module->config());
 
-  if (is_fusion_emitters) {
+  // In O1 (fast compile) mode, skip instruction fusion entirely so that
+  // individual ops are lowered through the MLIR elemental emitter path.
+  // This avoids creating fusions that would fall back to the legacy
+  // elemental_ir_emitter.
+  if (!is_fast_compile) {
+    pipeline.AddPass<CpuInstructionFusion>(
+        &alias_info,
+        /*may_duplicate=*/!use_multi_output_fusion);
+  }
+
+  if (is_fusion_emitters && !is_fast_compile) {
     bool use_experimental_loop_fusion =
         options::UseExperimentalLoopFusion(module->config());
     bool use_tiled_emitter = options::EnableTiledEmitter(module->config());

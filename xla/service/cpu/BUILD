@@ -1275,6 +1275,7 @@ cc_library(
     srcs = ["cpu_options.cc"],
     hdrs = ["cpu_options.h"],
     deps = [
+        "//xla:xla_proto_cc",
         "//xla/service:hlo_module_config",
         "@com_google_absl//absl/log:check",
         "@com_google_absl//absl/status",

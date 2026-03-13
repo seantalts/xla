@@ -29,6 +29,7 @@ limitations under the License.
 #include "absl/strings/str_split.h"
 #include "absl/strings/string_view.h"
 #include "xla/service/hlo_module_config.h"
+#include "xla/xla.pb.h"
 
 namespace xla::cpu::options {
 
@@ -165,6 +166,25 @@ bool EnableTiledEmitter(const HloModuleConfig& config) {
   const auto& extra_options_map =
       config.debug_options().xla_backend_extra_options();
   return extra_options_map.count(kDisableTiledEmitter) == 0;
+}
+
+DebugOptions::CpuOptimizationLevel GetCpuOptimizationLevel(
+    const HloModuleConfig& config) {
+  auto level = config.debug_options().xla_cpu_optimization_level();
+  if (level == DebugOptions::CPU_OPTIMIZATION_LEVEL_DEFAULT) {
+    return DebugOptions::CPU_OPTIMIZATION_LEVEL_O2;
+  }
+  return level;
+}
+
+bool IsFastCompileMode(const HloModuleConfig& config) {
+  return GetCpuOptimizationLevel(config) ==
+         DebugOptions::CPU_OPTIMIZATION_LEVEL_O1;
+}
+
+bool IsFullOptimizationMode(const HloModuleConfig& config) {
+  return GetCpuOptimizationLevel(config) ==
+         DebugOptions::CPU_OPTIMIZATION_LEVEL_O2;
 }
 
 }  // namespace xla::cpu::options
