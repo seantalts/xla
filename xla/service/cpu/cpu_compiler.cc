@@ -1086,11 +1086,13 @@ absl::Status CpuCompiler::RunHloPassesAfterLayoutAssn(
   }();
 
   // Outline ops in the entry computation into calls to subcomputations.
-  if (!is_aot_compile) {
+  if (!is_aot_compile && !is_fast_compile) {
     // Run ParallelTaskAssigner to assign parallel tasks to HLOs in module.
     // Note this is not run for AOT because it would bring in thread pool
     // and thread synchronization dependencies which would likely increase
     // binary size (and most AOT applications are single-threaded).
+    // In O1 (fast compile) mode, skip parallel task assignment as the
+    // overhead of parallelizing small ops exceeds the benefit.
     // TODO(b/29630486) Support multi-threaded AOT.
     pipeline.AddPass<ParallelTaskAssigner>(
         max_parallelism, ShapeSizeBytesFunction(), target_machine_features);
@@ -2094,20 +2096,22 @@ absl::StatusOr<std::unique_ptr<Executable>> CpuCompiler::RunBackend(
   }
 
   // Options for compiling LLVM IR to machine code.
+  const bool is_fast_compile = options::IsFastCompileMode(module->config());
   IrCompiler::Options ir_compiler_options{
       /*optimization_level=*/IrCompiler::GetCodeGenOptLevel(module->config()),
-      /*optimize_for_size=*/options::OptimizeForSizeRequested(module->config()),
+      /*optimize_for_size=*/is_fast_compile ||
+          options::OptimizeForSizeRequested(module->config()),
       /*target_machine_options=*/
       target_machine_options,
       /*fast_math_flags=*/llvm_ir::GetCpuFastMathFlags(module->config()),
-      /*disable_expensive_passes=*/
-      module->config().debug_options().xla_llvm_disable_expensive_passes(),
-      /*slp_vectorizer_disabled=*/
-      options::SlpVectorizerDisabled(module->config()),
-      /*disable_loop_unrolling=*/
-      options::DisableLoopUnrolling(module->config()),
-      /*disable_platform_dependent_math=*/
-      options::DisablePlatformDependentMath(module->config()),
+      /*disable_expensive_passes=*/is_fast_compile ||
+          module->config().debug_options().xla_llvm_disable_expensive_passes(),
+      /*slp_vectorizer_disabled=*/is_fast_compile ||
+          options::SlpVectorizerDisabled(module->config()),
+      /*disable_loop_unrolling=*/is_fast_compile ||
+          options::DisableLoopUnrolling(module->config()),
+      /*disable_platform_dependent_math=*/is_fast_compile ||
+          options::DisablePlatformDependentMath(module->config()),
   };
 
   ThunkEmitter::Options thunk_emitter_options = {
@@ -2236,20 +2240,22 @@ CpuCompiler::CompileAheadOfTimeThunks(
       triple.normalize(), target_machine->getTargetCPU(),
       target_machine->getTargetFeatureString());
 
+  const bool is_fast_compile_aot =
+      options::IsFastCompileMode(module->config());
   IrCompiler::Options ir_compiler_options = {
       /*optimization_level=*/target_machine->getOptLevel(),
-      /*optimize_for_size=*/
-      options::OptimizeForSizeRequested(module->config()),
+      /*optimize_for_size=*/is_fast_compile_aot ||
+          options::OptimizeForSizeRequested(module->config()),
       /*target_machine_options=*/target_machine_options,
       /*fast_math_flags=*/llvm_ir::GetCpuFastMathFlags(module->config()),
-      /*disable_expensive_passes=*/
-      module->config().debug_options().xla_llvm_disable_expensive_passes(),
-      /*disable_slp_vectorizer=*/
-      options::SlpVectorizerDisabled(module->config()),
-      /*disable_loop_unrolling=*/
-      options::DisableLoopUnrolling(module->config()),
-      /*disable_platform_dependent_math=*/
-      options::DisablePlatformDependentMath(module->config()),
+      /*disable_expensive_passes=*/is_fast_compile_aot ||
+          module->config().debug_options().xla_llvm_disable_expensive_passes(),
+      /*disable_slp_vectorizer=*/is_fast_compile_aot ||
+          options::SlpVectorizerDisabled(module->config()),
+      /*disable_loop_unrolling=*/is_fast_compile_aot ||
+          options::DisableLoopUnrolling(module->config()),
+      /*disable_platform_dependent_math=*/is_fast_compile_aot ||
+          options::DisablePlatformDependentMath(module->config()),
       /*dfsan_enabled=*/aot_options.sanitize_dataflow(),
       /*dfsan_abilists_enabled=*/aot_options.sanitize_abilists_dataflow()};
 
