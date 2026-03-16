@@ -136,6 +136,7 @@ cc_library(
         ":dot_op_emitter",
         ":executable_proto_cc",
         ":fusion_wrapper",
+        ":mega_fusion_pass",
         ":ir_emission_utils",
         ":ir_emitter",
         ":ir_emitter2",
@@ -1101,6 +1102,34 @@ xla_cc_test(
     srcs = ["fusion_wrapper_test.cc"],
     deps = [
         ":fusion_wrapper",
+        "//xla/hlo/ir:hlo",
+        "//xla/hlo/testlib:hlo_hardware_independent_test_base",
+        "//xla/tests:xla_internal_test_main",
+        "//xla/tsl/platform:statusor",
+        "@com_google_absl//absl/strings:string_view",
+        "@com_google_googletest//:gtest",
+    ],
+)
+
+cc_library(
+    name = "mega_fusion_pass",
+    srcs = ["mega_fusion_pass.cc"],
+    hdrs = ["mega_fusion_pass.h"],
+    deps = [
+        "//xla/hlo/ir:hlo",
+        "//xla/hlo/pass:hlo_pass",
+        "//xla/tsl/platform:errors",
+        "@com_google_absl//absl/container:flat_hash_set",
+        "@com_google_absl//absl/status:statusor",
+        "@com_google_absl//absl/strings:string_view",
+    ],
+)
+
+xla_cc_test(
+    name = "mega_fusion_pass_test",
+    srcs = ["mega_fusion_pass_test.cc"],
+    deps = [
+        ":mega_fusion_pass",
         "//xla/hlo/ir:hlo",
         "//xla/hlo/testlib:hlo_hardware_independent_test_base",
         "//xla/tests:xla_internal_test_main",

@@ -178,6 +178,7 @@ limitations under the License.
 #include "xla/service/cpu/dot_op_emitter.h"
 #include "xla/service/cpu/executable.pb.h"
 #include "xla/service/cpu/fusion_wrapper.h"
+#include "xla/service/cpu/mega_fusion_pass.h"
 #include "xla/service/cpu/ir_emitter.h"
 #include "xla/service/cpu/ir_emitter2.h"
 #include "xla/service/cpu/metrics.h"
@@ -1027,8 +1028,9 @@ absl::Status CpuCompiler::RunHloPassesAfterLayoutAssn(
 
   // In O1 (fast compile) mode, skip CpuInstructionFusion (which creates
   // multi-op fusions that may fall back to the legacy elemental_ir_emitter).
-  // Instead, we rely on FusionWrapper below to wrap individual ops into
-  // single-op fusions that go through the MLIR LoopFusionKernelEmitter.
+  // Instead, use MegaFusionPass to greedily create maximal kLoop fusions
+  // that go through the MLIR LoopFusionKernelEmitter, followed by
+  // FusionWrapper to catch any remaining unwrapped ops.
   if (!is_fast_compile) {
     pipeline.AddPass<CpuInstructionFusion>(
         &alias_info,
@@ -1036,8 +1038,12 @@ absl::Status CpuCompiler::RunHloPassesAfterLayoutAssn(
   }
 
   if (is_fusion_emitters) {
-    // In O1 mode, use FusionWrapper with loop fusion but without the tiled
-    // emitter (simpler MLIR lowering). In O2 mode, use the full pipeline.
+    if (is_fast_compile) {
+      // In O1 mode, use MegaFusionPass to create maximal fusions, then
+      // FusionWrapper to wrap any remaining single ops (e.g. scatter).
+      pipeline.AddPass<MegaFusionPass>();
+    }
+    // In O2 mode, use the full pipeline with tiled emitter support.
     bool use_experimental_loop_fusion =
         options::UseExperimentalLoopFusion(module->config());
     bool use_tiled_emitter =
