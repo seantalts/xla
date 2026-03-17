@@ -16,12 +16,14 @@ limitations under the License.
 #include <algorithm>
 #include <cassert>
 #include <cstdint>
+#include <limits>
 
 #include "absl/log/check.h"
 #include "llvm/ADT/DenseSet.h"
 #include "llvm/ADT/STLExtras.h"
 #include "llvm/ADT/SmallVector.h"
 #include "llvm/ADT/SmallVectorExtras.h"
+#include "llvm/ADT/StringRef.h"
 #include "llvm/Support/LogicalResult.h"
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/Bufferization/IR/BufferizableOpInterface.h"
@@ -29,6 +31,7 @@ limitations under the License.
 #include "mlir/Dialect/MemRef/IR/MemRef.h"
 #include "mlir/Dialect/SCF/IR/SCF.h"
 #include "mlir/Dialect/Tensor/IR/Tensor.h"
+#include "mlir/IR/AffineMap.h"
 #include "mlir/IR/Attributes.h"
 #include "mlir/IR/Builders.h"
 #include "mlir/IR/BuiltinAttributes.h"
@@ -45,6 +48,97 @@ limitations under the License.
 #include "xla/codegen/xtile/ir/xtile_ops.h"
 
 namespace xla::xtile {
+
+// Vector register file capacity threshold for deciding whether a tile should
+// be forced into a local stack buffer. AVX-512 has 32 x 64-byte registers =
+// 2048 bytes; we use 75% to leave headroom for intermediate values and
+// loop-carried state.
+static constexpr int64_t kVectorRegisterFileThresholdBytes = 1536;
+
+// Returns true if `op` is a data-layout-altering operation such as transpose
+// or broadcast. These operations have non-sequential memory access patterns
+// that perform poorly when operating directly on strided buffer subviews
+// (cache-line bouncing, register spill).
+static bool IsLayoutAlteringOp(mlir::Operation* op) {
+  llvm::StringRef name = op->getName().getStringRef();
+
+  // Explicit transpose or broadcast operations from any dialect.
+  if (name == "linalg.transpose" || name == "vector.transpose" ||
+      name == "linalg.broadcast" || name == "vector.broadcast" ||
+      name == "stablehlo.transpose" ||
+      name == "stablehlo.broadcast_in_dim") {
+    return true;
+  }
+
+  // For linalg.generic, check if input indexing maps differ from the output
+  // map, which indicates a data-layout transformation (e.g., the input is
+  // accessed in transposed order relative to the output).
+  if (name == "linalg.generic") {
+    auto indexing_maps_attr =
+        op->getAttrOfType<mlir::ArrayAttr>("indexing_maps");
+    if (!indexing_maps_attr || indexing_maps_attr.size() < 2) {
+      return false;
+    }
+
+    // The last map is the output; compare every input map against it.
+    auto output_map =
+        mlir::cast<mlir::AffineMapAttr>(indexing_maps_attr.getValue().back())
+            .getValue();
+    for (auto map_attr : indexing_maps_attr.getValue().drop_back()) {
+      auto input_map = mlir::cast<mlir::AffineMapAttr>(map_attr).getValue();
+      // A map with fewer results than the output indicates broadcast;
+      // a map with the same results but different ordering indicates
+      // transpose / permutation.
+      if (input_map != output_map) {
+        return true;
+      }
+    }
+  }
+
+  return false;
+}
+
+// Returns true if any direct user of `value` is a layout-altering op.
+static bool HasLayoutAlteringUser(mlir::Value value) {
+  for (mlir::Operation* user : value.getUsers()) {
+    if (IsLayoutAlteringOp(user)) {
+      return true;
+    }
+  }
+  return false;
+}
+
+// Conservative estimate of a tile's memory footprint in bytes. Returns
+// int64_t max for dynamic shapes so the caller treats them as "large".
+static int64_t EstimateTileFootprintBytes(mlir::RankedTensorType type) {
+  if (!type.hasStaticShape()) {
+    return std::numeric_limits<int64_t>::max();
+  }
+  int64_t num_elements = 1;
+  for (int64_t dim : type.getShape()) {
+    num_elements *= dim;
+  }
+  int64_t element_bits = type.getElementTypeBitWidth();
+  return num_elements * ((element_bits + 7) / 8);
+}
+
+// Decides whether `op` should force a contiguous local buffer allocation
+// instead of yielding a (possibly strided) subview directly. This prevents
+// performance regressions for:
+//   1. Layout-altering ops (transpose, broadcast) that have non-sequential
+//      access patterns on strided subviews → poor cache utilisation.
+//   2. Large tiles that exceed the vector register file → register spill and
+//      SROA (Scalar Replacement of Aggregates) failure.
+static bool ShouldForceLocalBuffer(ExtractTileOp op) {
+  if (HasLayoutAlteringUser(op.getResult())) {
+    return true;
+  }
+  if (EstimateTileFootprintBytes(op.getResult().getType()) >
+      kVectorRegisterFileThresholdBytes) {
+    return true;
+  }
+  return false;
+}
 
 static llvm::SmallVector<mlir::OpFoldResult> GetStaticFoldResult(
     mlir::OpBuilder& builder, llvm::ArrayRef<int64_t> input) {
@@ -255,16 +349,23 @@ llvm::LogicalResult ExtractTileOp::bufferize(
       [&](mlir::OpBuilder& builder, mlir::Location loc) {
         mlir::ImplicitLocOpBuilder then_builder(loc, builder);
         auto buffer = GetFullTileSubView(then_builder, *this);
-        if (buffer.getType().getLayout().isIdentity()) {
+        bool force_local = ShouldForceLocalBuffer(*this);
+        if (buffer.getType().getLayout().isIdentity() && !force_local) {
+          // Fast path: the subview is contiguous and the downstream compute
+          // is simple element-wise with a small tile. Allow the one-shot
+          // bufferizer to fold through this tensor without an extra copy.
           auto to_tensor_op = mlir::bufferization::ToTensorOp::create(
               then_builder, getType(), buffer);
           mlir::scf::YieldOp::create(then_builder, {to_tensor_op});
         } else {
-          // If the buffer doesn't have an identity layout, we can get a
-          // miscompile during bufferization as some ops don't support
-          // non-identity layouts. So we allocate a new buffer with the same
-          // shape but default layout.
-          // TODO(willfroom): Look into how we can remove this constraint.
+          // Slow path: either the layout is non-identity (strided subview)
+          // or the heuristic determined we need a local buffer because:
+          //   - A downstream op alters data layout (transpose, broadcast)
+          //     and would perform poorly on a strided/aliased subview, or
+          //   - The tile exceeds the vector register file threshold and
+          //     keeping it in a subview would cause register spill / SROA
+          //     failure.
+          // Allocate a contiguous local buffer and copy into it.
           mlir::MemRefType default_buffer_type =
               mlir::MemRefType::Builder(buffer.getType()).setLayout(nullptr);
           auto default_buffer =

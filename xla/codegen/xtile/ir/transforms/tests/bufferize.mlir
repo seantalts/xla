@@ -81,3 +81,69 @@ func.func @insert_strided(%source: tensor<8xf32>, %destination: memref<16xf32>, 
   xtile.insert %source into %destination[%tile_id][8][2] : tensor<8xf32> -> memref<16xf32>
   return
 }
+
+// -----
+
+// Test: identity-layout extract feeding a layout-altering op (stablehlo.transpose)
+// should force a local buffer allocation instead of yielding the subview directly.
+
+// CHECK-LABEL: @extract_identity_transpose
+func.func @extract_identity_transpose(%source: memref<64xf32>, %tile_id: index) -> tensor<8xf32> {
+  // The tile is 8 x f32 = 32 bytes (below register threshold), unit stride,
+  // so identity layout. But the user is stablehlo.transpose → force alloc.
+
+  // CHECK: scf.if
+  // Full-tile branch: should alloc + copy due to transpose user.
+  // CHECK: memref.subview
+  // CHECK: memref.alloc() : memref<8xf32>
+  // CHECK: memref.copy
+  // CHECK: scf.yield
+
+  %tile = xtile.extract %source[%tile_id][8][1] : memref<64xf32> -> tensor<8xf32>
+  %transposed = stablehlo.transpose %tile, dims = [0] : (tensor<8xf32>) -> tensor<8xf32>
+  return %transposed : tensor<8xf32>
+}
+
+// -----
+
+// Test: identity-layout extract feeding a simple element-wise op (arith.addf)
+// with a small tile should yield the subview directly (no alloc in full-tile
+// branch).
+
+// CHECK-LABEL: @extract_identity_elementwise
+func.func @extract_identity_elementwise(%source: memref<64xf32>, %tile_id: index) -> tensor<8xf32> {
+  // 8 x f32 = 32 bytes, well below the 1536-byte register threshold, and
+  // arith.addf is element-wise → no forced alloc needed.
+
+  // CHECK: scf.if
+  // Full-tile branch: should yield subview directly via to_tensor (no alloc).
+  // CHECK: memref.subview
+  // CHECK-NOT: memref.alloc
+  // CHECK: bufferization.to_tensor
+  // CHECK: scf.yield
+
+  %tile = xtile.extract %source[%tile_id][8][1] : memref<64xf32> -> tensor<8xf32>
+  %tile2 = xtile.extract %source[%tile_id][8][1] : memref<64xf32> -> tensor<8xf32>
+  %result = arith.addf %tile, %tile2 : tensor<8xf32>
+  return %result : tensor<8xf32>
+}
+
+// -----
+
+// Test: identity-layout extract with a large tile (exceeds register file
+// threshold) should force a local buffer even for element-wise users.
+
+// CHECK-LABEL: @extract_identity_large_tile
+func.func @extract_identity_large_tile(%source: memref<1024xf32>, %tile_id: index) -> tensor<512xf32> {
+  // 512 x f32 = 2048 bytes > 1536-byte threshold → force alloc.
+
+  // CHECK: scf.if
+  // Full-tile branch: should alloc + copy due to size.
+  // CHECK: memref.subview
+  // CHECK: memref.alloc() : memref<512xf32>
+  // CHECK: memref.copy
+  // CHECK: scf.yield
+
+  %tile = xtile.extract %source[%tile_id][512][1] : memref<1024xf32> -> tensor<512xf32>
+  return %tile : tensor<512xf32>
+}
