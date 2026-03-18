@@ -16,14 +16,12 @@ limitations under the License.
 #include <algorithm>
 #include <cassert>
 #include <cstdint>
-#include <limits>
 
 #include "absl/log/check.h"
 #include "llvm/ADT/DenseSet.h"
 #include "llvm/ADT/STLExtras.h"
 #include "llvm/ADT/SmallVector.h"
 #include "llvm/ADT/SmallVectorExtras.h"
-#include "llvm/ADT/StringRef.h"
 #include "llvm/Support/LogicalResult.h"
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/Bufferization/IR/BufferizableOpInterface.h"
@@ -31,7 +29,6 @@ limitations under the License.
 #include "mlir/Dialect/MemRef/IR/MemRef.h"
 #include "mlir/Dialect/SCF/IR/SCF.h"
 #include "mlir/Dialect/Tensor/IR/Tensor.h"
-#include "mlir/IR/AffineMap.h"
 #include "mlir/IR/Attributes.h"
 #include "mlir/IR/Builders.h"
 #include "mlir/IR/BuiltinAttributes.h"
@@ -49,95 +46,68 @@ limitations under the License.
 
 namespace xla::xtile {
 
-// Vector register file capacity threshold for deciding whether a tile should
-// be forced into a local stack buffer. AVX-512 has 32 x 64-byte registers =
-// 2048 bytes; we use 75% to leave headroom for intermediate values and
-// loop-carried state.
-static constexpr int64_t kVectorRegisterFileThresholdBytes = 1536;
+// Returns true when the tile is guaranteed to cover the full buffer extent in
+// every non-reduced dimension at compile time. When this holds, the only valid
+// tile position is offset = 0 for each dimension, so the runtime bounds check
+// (`TileIsFullSize` + `scf.if`) can be eliminated entirely.
+//
+// The condition per dimension is:
+//   full_tile_size * max(stride, 1) >= buffer_size
+// which means there is exactly one tile position that fits.
+static bool IsStaticallyFullTile(TiledBufferInterface op) {
+  llvm::ArrayRef<int64_t> buffer_shape = op.getBuffer().getType().getShape();
+  llvm::ArrayRef<int64_t> full_tile_shape = op.getFullTileShape();
+  llvm::ArrayRef<int64_t> strides = op.getStrides();
+  llvm::SmallDenseSet<unsigned> reduced_dims = op.getReducedDimensions();
 
-// Returns true if `op` is a data-layout-altering operation such as transpose
-// or broadcast. These operations have non-sequential memory access patterns
-// that perform poorly when operating directly on strided buffer subviews
-// (cache-line bouncing, register spill).
-static bool IsLayoutAlteringOp(mlir::Operation* op) {
-  llvm::StringRef name = op->getName().getStringRef();
-
-  // Explicit transpose or broadcast operations from any dialect.
-  if (name == "linalg.transpose" || name == "vector.transpose" ||
-      name == "linalg.broadcast" || name == "vector.broadcast" ||
-      name == "stablehlo.transpose" ||
-      name == "stablehlo.broadcast_in_dim") {
-    return true;
-  }
-
-  // For linalg.generic, check if input indexing maps differ from the output
-  // map, which indicates a data-layout transformation (e.g., the input is
-  // accessed in transposed order relative to the output).
-  if (name == "linalg.generic") {
-    auto indexing_maps_attr =
-        op->getAttrOfType<mlir::ArrayAttr>("indexing_maps");
-    if (!indexing_maps_attr || indexing_maps_attr.size() < 2) {
+  int64_t idx = 0;
+  for (auto [buffer_dim, tile_dim, stride] :
+       llvm::zip(buffer_shape, full_tile_shape, strides)) {
+    if (reduced_dims.contains(idx++)) {
+      continue;
+    }
+    if (mlir::ShapedType::isDynamic(buffer_dim)) {
       return false;
     }
-
-    // The last map is the output; compare every input map against it.
-    auto output_map =
-        mlir::cast<mlir::AffineMapAttr>(indexing_maps_attr.getValue().back())
-            .getValue();
-    for (auto map_attr : indexing_maps_attr.getValue().drop_back()) {
-      auto input_map = mlir::cast<mlir::AffineMapAttr>(map_attr).getValue();
-      // A map with fewer results than the output indicates broadcast;
-      // a map with the same results but different ordering indicates
-      // transpose / permutation.
-      if (input_map != output_map) {
-        return true;
-      }
+    int64_t effective_stride = std::max<int64_t>(stride, 1);
+    if (tile_dim * effective_stride < buffer_dim) {
+      return false;
     }
   }
-
-  return false;
+  return true;
 }
 
-// Returns true if any direct user of `value` is a layout-altering op.
-static bool HasLayoutAlteringUser(mlir::Value value) {
-  for (mlir::Operation* user : value.getUsers()) {
-    if (IsLayoutAlteringOp(user)) {
-      return true;
-    }
+// Emits the full-tile-path body for ExtractTileOp: get the subview, and either
+// yield it directly (identity layout) or copy into a local buffer (strided).
+static mlir::Value EmitExtractFullTilePath(
+    mlir::ImplicitLocOpBuilder& builder, ExtractTileOp op) {
+  auto buffer = GetFullTileSubView(builder, op);
+  if (buffer.getType().getLayout().isIdentity()) {
+    return mlir::bufferization::ToTensorOp::create(builder, op.getType(),
+                                                   buffer);
   }
-  return false;
+  // Non-identity layout: allocate a contiguous local buffer and copy.
+  mlir::MemRefType default_buffer_type =
+      mlir::MemRefType::Builder(buffer.getType()).setLayout(nullptr);
+  auto default_buffer =
+      mlir::memref::AllocOp::create(builder, default_buffer_type);
+  mlir::memref::CopyOp::create(builder, buffer, default_buffer);
+  auto to_tensor_op = mlir::bufferization::ToTensorOp::create(
+      builder, op.getType(), default_buffer);
+  to_tensor_op.setWritable(true);
+  to_tensor_op.setRestrict(true);
+  return to_tensor_op;
 }
 
-// Conservative estimate of a tile's memory footprint in bytes. Returns
-// int64_t max for dynamic shapes so the caller treats them as "large".
-static int64_t EstimateTileFootprintBytes(mlir::RankedTensorType type) {
-  if (!type.hasStaticShape()) {
-    return std::numeric_limits<int64_t>::max();
-  }
-  int64_t num_elements = 1;
-  for (int64_t dim : type.getShape()) {
-    num_elements *= dim;
-  }
-  int64_t element_bits = type.getElementTypeBitWidth();
-  return num_elements * ((element_bits + 7) / 8);
-}
-
-// Decides whether `op` should force a contiguous local buffer allocation
-// instead of yielding a (possibly strided) subview directly. This prevents
-// performance regressions for:
-//   1. Layout-altering ops (transpose, broadcast) that have non-sequential
-//      access patterns on strided subviews → poor cache utilisation.
-//   2. Large tiles that exceed the vector register file → register spill and
-//      SROA (Scalar Replacement of Aggregates) failure.
-static bool ShouldForceLocalBuffer(ExtractTileOp op) {
-  if (HasLayoutAlteringUser(op.getResult())) {
-    return true;
-  }
-  if (EstimateTileFootprintBytes(op.getResult().getType()) >
-      kVectorRegisterFileThresholdBytes) {
-    return true;
-  }
-  return false;
+// Emits the full-tile-path body for InsertTileOp: get the subview and
+// materialize the source tensor into it.
+static void EmitInsertFullTilePath(mlir::ImplicitLocOpBuilder& builder,
+                                   InsertTileOp op) {
+  auto target_buffer_subview = GetFullTileSubView(builder, op);
+  auto materialize_op =
+      mlir::bufferization::MaterializeInDestinationOp::create(
+          builder, op.getSource(), target_buffer_subview);
+  materialize_op.setWritable(true);
 }
 
 static llvm::SmallVector<mlir::OpFoldResult> GetStaticFoldResult(
@@ -343,40 +313,24 @@ llvm::LogicalResult ExtractTileOp::bufferize(
     mlir::bufferization::BufferizationState& state) {
   mlir::ImplicitLocOpBuilder builder(getLoc(), rewriter);
 
+  // Fast path: when the tile statically covers the entire buffer, the tile is
+  // always full. Skip the runtime bounds check and emit the full-tile path
+  // directly. This eliminates branch overhead that dominates small-tensor
+  // element-wise kernels.
+  if (IsStaticallyFullTile(*this)) {
+    mlir::Value result = EmitExtractFullTilePath(builder, *this);
+    rewriter.replaceOp(getOperation(), result);
+    return mlir::success();
+  }
+
+  // General path: emit a runtime check for full vs. partial tile.
   mlir::Value is_full_size = TileIsFullSize(builder, *this);
   auto if_op = mlir::scf::IfOp::create(
       builder, is_full_size,
       [&](mlir::OpBuilder& builder, mlir::Location loc) {
         mlir::ImplicitLocOpBuilder then_builder(loc, builder);
-        auto buffer = GetFullTileSubView(then_builder, *this);
-        bool force_local = ShouldForceLocalBuffer(*this);
-        if (buffer.getType().getLayout().isIdentity() && !force_local) {
-          // Fast path: the subview is contiguous and the downstream compute
-          // is simple element-wise with a small tile. Allow the one-shot
-          // bufferizer to fold through this tensor without an extra copy.
-          auto to_tensor_op = mlir::bufferization::ToTensorOp::create(
-              then_builder, getType(), buffer);
-          mlir::scf::YieldOp::create(then_builder, {to_tensor_op});
-        } else {
-          // Slow path: either the layout is non-identity (strided subview)
-          // or the heuristic determined we need a local buffer because:
-          //   - A downstream op alters data layout (transpose, broadcast)
-          //     and would perform poorly on a strided/aliased subview, or
-          //   - The tile exceeds the vector register file threshold and
-          //     keeping it in a subview would cause register spill / SROA
-          //     failure.
-          // Allocate a contiguous local buffer and copy into it.
-          mlir::MemRefType default_buffer_type =
-              mlir::MemRefType::Builder(buffer.getType()).setLayout(nullptr);
-          auto default_buffer =
-              mlir::memref::AllocOp::create(then_builder, default_buffer_type);
-          mlir::memref::CopyOp::create(then_builder, buffer, default_buffer);
-          auto to_tensor_op = mlir::bufferization::ToTensorOp::create(
-              then_builder, getType(), default_buffer);
-          to_tensor_op.setWritable(true);
-          to_tensor_op.setRestrict(true);
-          mlir::scf::YieldOp::create(then_builder, {to_tensor_op});
-        }
+        mlir::Value result = EmitExtractFullTilePath(then_builder, *this);
+        mlir::scf::YieldOp::create(then_builder, {result});
       },
       [&](mlir::OpBuilder& builder, mlir::Location loc) {
         mlir::ImplicitLocOpBuilder else_builder(loc, builder);
@@ -436,16 +390,20 @@ llvm::LogicalResult InsertTileOp::bufferize(
     mlir::bufferization::BufferizationState& state) {
   mlir::ImplicitLocOpBuilder builder(getLoc(), rewriter);
 
+  // Fast path: statically full tile — skip the runtime bounds check.
+  if (IsStaticallyFullTile(*this)) {
+    EmitInsertFullTilePath(builder, *this);
+    rewriter.eraseOp(getOperation());
+    return mlir::success();
+  }
+
+  // General path: runtime check for full vs. partial tile.
   mlir::Value is_full_size = TileIsFullSize(builder, *this);
   mlir::scf::IfOp::create(
       builder, is_full_size,
       [&](mlir::OpBuilder& builder, mlir::Location loc) {
         mlir::ImplicitLocOpBuilder then_builder(loc, builder);
-        auto target_buffer_subview = GetFullTileSubView(then_builder, *this);
-        auto materialize_op =
-            mlir::bufferization::MaterializeInDestinationOp::create(
-                then_builder, getSource(), target_buffer_subview);
-        materialize_op.setWritable(true);
+        EmitInsertFullTilePath(then_builder, *this);
         mlir::scf::YieldOp::create(then_builder);
       },
       [&](mlir::OpBuilder& builder, mlir::Location loc) {
