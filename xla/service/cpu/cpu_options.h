@@ -73,16 +73,16 @@ bool FlattenAfterFusion(const HloModuleConfig& config);
 bool UseMultiOutputFusion(const HloModuleConfig& config);
 bool EnableTiledEmitter(const HloModuleConfig& config);
 
-// Returns the effective CPU optimization level from DebugOptions. Maps
-// CPU_OPTIMIZATION_LEVEL_DEFAULT to O2 (full optimization).
-DebugOptions::CpuOptimizationLevel GetCpuOptimizationLevel(
+// Returns the effective CPU optimization preset from DebugOptions. Maps
+// CPU_OPTIMIZATION_PRESET_DEFAULT to RUNTIME_PERFORMANCE.
+DebugOptions::CpuOptimizationPreset GetCpuOptimizationPreset(
     const HloModuleConfig& config);
 
-// Returns true if the effective optimization level is O1 (fast compile).
+// Returns true if the preset is FAST_COMPILE.
 bool IsFastCompileMode(const HloModuleConfig& config);
 
-// Returns true if the effective optimization level is O2 (full optimization).
-bool IsFullOptimizationMode(const HloModuleConfig& config);
+// Returns true if the preset is RUNTIME_PERFORMANCE.
+bool IsRuntimePerformanceMode(const HloModuleConfig& config);
 
 }  // namespace xla::cpu::options
 

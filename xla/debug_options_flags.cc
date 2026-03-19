@@ -223,8 +223,8 @@ DebugOptions DefaultDebugOptionsIgnoringFlags() {
   opts.set_xla_cpu_parallel_codegen_split_count(32);
   opts.set_xla_cpu_copy_insertion_use_region_analysis(false);
   opts.set_xla_cpu_scheduler_type(DebugOptions::CPU_SCHEDULER_TYPE_DEFAULT);
-  opts.set_xla_cpu_optimization_level(
-      DebugOptions::CPU_OPTIMIZATION_LEVEL_DEFAULT);
+  opts.set_xla_cpu_optimization_preset(
+      DebugOptions::CPU_OPTIMIZATION_PRESET_DEFAULT);
   opts.set_xla_cpu_prefer_vector_width(256);
   opts.set_xla_cpu_max_isa(DefaultMaxIsa());
   opts.set_xla_cpu_generate_unique_c_style_kernel_entry_points(false);
@@ -844,13 +844,13 @@ void MakeDebugOptionsFlags(std::vector<tsl::Flag>* flag_list,
         return true;
       };
 
-  auto setter_for_xla_cpu_optimization_level =
+  auto setter_for_xla_cpu_optimization_preset =
       [debug_options](const std::string& value) {
-        DebugOptions::CpuOptimizationLevel level;
-        if (!DebugOptions::CpuOptimizationLevel_Parse(value, &level)) {
+        DebugOptions::CpuOptimizationPreset preset;
+        if (!DebugOptions::CpuOptimizationPreset_Parse(value, &preset)) {
           return false;
         }
-        debug_options->set_xla_cpu_optimization_level(level);
+        debug_options->set_xla_cpu_optimization_preset(preset);
         return true;
       };
 
@@ -1302,15 +1302,16 @@ void MakeDebugOptionsFlags(std::vector<tsl::Flag>* flag_list,
                                      debug_options->xla_cpu_scheduler_type()),
                                  "XLA:CPU's scheduler type."));
   flag_list->push_back(tsl::Flag(
-      "xla_cpu_optimization_level", setter_for_xla_cpu_optimization_level,
-      DebugOptions::CpuOptimizationLevel_Name(
-          debug_options->xla_cpu_optimization_level()),
-      "XLA:CPU compilation optimization level. "
-      "CPU_OPTIMIZATION_LEVEL_O1: fast compile, each op lowered individually "
-      "through MLIR elemental emitter (no instruction fusion or tiling). "
-      "CPU_OPTIMIZATION_LEVEL_O2: full optimization with instruction fusion, "
-      "FusionWrapper, tiled emitter, and loop fusion via MLIR. "
-      "CPU_OPTIMIZATION_LEVEL_DEFAULT maps to O2."));
+      "xla_cpu_optimization_preset", setter_for_xla_cpu_optimization_preset,
+      DebugOptions::CpuOptimizationPreset_Name(
+          debug_options->xla_cpu_optimization_preset()),
+      "XLA:CPU compilation optimization preset. "
+      "CPU_OPTIMIZATION_PRESET_FAST_COMPILE: fast compilation with strict "
+      "numerics — mega-fusion, LLVM O1, no fast-math. "
+      "CPU_OPTIMIZATION_PRESET_RUNTIME_PERFORMANCE: full optimization for "
+      "max runtime speed — pairwise fusion, tiled emitter, LLVM O2, "
+      "fast-math enabled. "
+      "CPU_OPTIMIZATION_PRESET_DEFAULT maps to RUNTIME_PERFORMANCE."));
   flag_list->push_back(tsl::Flag(
       "xla_cpu_prefer_vector_width",
       int32_setter_for(&DebugOptions::set_xla_cpu_prefer_vector_width),

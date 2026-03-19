@@ -168,23 +168,23 @@ bool EnableTiledEmitter(const HloModuleConfig& config) {
   return extra_options_map.count(kDisableTiledEmitter) == 0;
 }
 
-DebugOptions::CpuOptimizationLevel GetCpuOptimizationLevel(
+DebugOptions::CpuOptimizationPreset GetCpuOptimizationPreset(
     const HloModuleConfig& config) {
-  auto level = config.debug_options().xla_cpu_optimization_level();
-  if (level == DebugOptions::CPU_OPTIMIZATION_LEVEL_DEFAULT) {
-    return DebugOptions::CPU_OPTIMIZATION_LEVEL_O2;
+  auto preset = config.debug_options().xla_cpu_optimization_preset();
+  if (preset == DebugOptions::CPU_OPTIMIZATION_PRESET_DEFAULT) {
+    return DebugOptions::CPU_OPTIMIZATION_PRESET_RUNTIME_PERFORMANCE;
   }
-  return level;
+  return preset;
 }
 
 bool IsFastCompileMode(const HloModuleConfig& config) {
-  return GetCpuOptimizationLevel(config) ==
-         DebugOptions::CPU_OPTIMIZATION_LEVEL_O1;
+  return GetCpuOptimizationPreset(config) ==
+         DebugOptions::CPU_OPTIMIZATION_PRESET_FAST_COMPILE;
 }
 
-bool IsFullOptimizationMode(const HloModuleConfig& config) {
-  return GetCpuOptimizationLevel(config) ==
-         DebugOptions::CPU_OPTIMIZATION_LEVEL_O2;
+bool IsRuntimePerformanceMode(const HloModuleConfig& config) {
+  return GetCpuOptimizationPreset(config) ==
+         DebugOptions::CPU_OPTIMIZATION_PRESET_RUNTIME_PERFORMANCE;
 }
 
 }  // namespace xla::cpu::options

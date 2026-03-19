@@ -175,7 +175,7 @@ message DebugOptions {
   // XLA:CPU options.
   //--------------------------------------------------------------------------//
   // clang-format off
-  // go/keep-sorted start newline_separated=yes skip_lines=1 ignore_prefixes=["optional bool","optional int32","optional string", "optional XnnGraphFusionMode", "repeated LibraryFusionType", "optional CpuSchedulerType", "optional CpuOptimizationLevel"]
+  // go/keep-sorted start newline_separated=yes skip_lines=1 ignore_prefixes=["optional bool","optional int32","optional string", "optional XnnGraphFusionMode", "repeated LibraryFusionType", "optional CpuSchedulerType", "optional CpuOptimizationPreset"]
   // clang-format on
   enum CpuSchedulerType {
     // Balances memory consumption and concurrency.
@@ -195,26 +195,25 @@ message DebugOptions {
     LIBRARY_FUSION_TYPE_INDIVIDUAL_CONVOLUTION = 5;
   }
 
-  // Controls the XLA:CPU compilation optimization level. This is distinct from
-  // xla_backend_optimization_level, which only controls the LLVM CodeGen
+  // Controls the XLA:CPU compilation optimization preset. This is distinct
+  // from xla_backend_optimization_level, which only controls the LLVM CodeGen
   // optimization level. This flag controls the HLO pass pipeline including
-  // fusion strategy and emitter selection. Both levels use MLIR lowering
-  // (no elemental_ir_emitter) — the difference is how aggressively the HLO
-  // is fused and tiled before MLIR emission.
-  enum CpuOptimizationLevel {
-    // Default: equivalent to O2 (full optimization).
-    CPU_OPTIMIZATION_LEVEL_DEFAULT = 0;
-    // O1: Fast compilation with MLIR lowering. Skips instruction fusion,
-    // FusionWrapper, and multi-output fusion. Each op is lowered
-    // individually through the MLIR elemental emitter. Suitable for
-    // small models where compile time matters more than peak runtime
-    // performance.
-    CPU_OPTIMIZATION_LEVEL_O1 = 1;
-    // O2: Full optimization with MLIR lowering. Enables instruction
-    // fusion, FusionWrapper (with tiled emitter and loop fusion), and
-    // multi-output fusion. This is the forward-looking path toward full
-    // MLIR-based codegen.
-    CPU_OPTIMIZATION_LEVEL_O2 = 2;
+  // fusion strategy, emitter selection, and numerics mode. Both presets use
+  // MLIR lowering (no elemental_ir_emitter).
+  enum CpuOptimizationPreset {
+    // Default: equivalent to RUNTIME_PERFORMANCE.
+    CPU_OPTIMIZATION_PRESET_DEFAULT = 0;
+    // Fast compilation with strict numerics. Uses mega-fusion strategy,
+    // skips expensive HLO passes (instruction fusion, multi-output fusion,
+    // parallel task assignment), uses LLVM O1, and disables fast-math
+    // (no FP reassociation, no FMA contraction, no fast approximations).
+    // Suitable for interactive use, unit tests, and workloads where
+    // numerical accuracy matters more than peak runtime performance.
+    CPU_OPTIMIZATION_PRESET_FAST_COMPILE = 1;
+    // Full optimization for maximum runtime performance. Enables pairwise
+    // instruction fusion, tiled emitter, multi-output fusion, parallel
+    // task assignment, LLVM O2, and fast-math transformations.
+    CPU_OPTIMIZATION_PRESET_RUNTIME_PERFORMANCE = 2;
   }
 
   enum XnnGraphFusionMode {
@@ -317,8 +316,8 @@ message DebugOptions {
   // Controls the XLA:CPU compilation optimization level. Both levels use MLIR
   // lowering. O1 prioritizes fast compilation (no instruction fusion or
   // tiling), while O2 enables full optimization (fused, tiled MLIR emission).
-  // Default maps to O2.
-  optional CpuOptimizationLevel xla_cpu_optimization_level = 502;
+  // Default maps to RUNTIME_PERFORMANCE.
+  optional CpuOptimizationPreset xla_cpu_optimization_preset = 502;
 
   // The number of parts to split the LLVM module into before codegen. This
   // allows XLA to compile all parts in parallel, and resolve kernel symbols
