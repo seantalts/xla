@@ -6,22 +6,24 @@ XLA:CPU compiles HLO through a pipeline of fusion passes, MLIR lowering, and LLV
 
 We need a way to say "just emit this simply" without regressing the architecture toward the legacy `elemental_ir_emitter` LLVM path. Both optimization levels must use MLIR lowering exclusively.
 
-## Architecture Context: Emitter Paths
+### Prior Art in XLA
 
-Understanding the current emitter landscape is critical to this design:
+GPU has granular compile-time knobs (`xla_gpu_autotune_level` 0–4, `xla_gpu_disable_gpuasm_optimizations`, `xla_gpu_cudnn_gemm_fusion_level`) rather than a single optimization tier — autotuning is GPU's dominant compile-time cost. TPU uses the global `EffortLevel` in `ExecutionOptions` (O0–O3). The generic `xla_backend_optimization_level` controls only the LLVM CodeGen opt level across backends. CPU is the first backend with a **unified O1/O2 mode** that jointly controls HLO passes, fusion strategy, emitter selection, and LLVM options.
+
+## Architecture Context: Emitter Paths
 
 | Path | Entry Point | Lowering | Status |
 |------|-------------|----------|--------|
 | **MLIR fusion emitters** | `FusionWrapper` → `EmitFusionKernel` → `LoopFusionKernelEmitter` | HLO fusion → MLIR → LLVM IR | **Forward-looking path** |
 | **MLIR tiled emitters** | `FusionWrapper` → `EmitFusionKernel` → `TiledFusionEmitter` | HLO fusion → MLIR (tiled) → LLVM IR | Forward-looking (O2) |
-| **Elemental LLVM emitter** | `EmitElementalKernelThunk` → `ElementalKernelEmitter` | HLO op → `CpuElementalIrEmitter` → LLVM IR | **Legacy path** (despite the name, this uses `CpuElementalIrEmitter`) |
+| **Elemental LLVM emitter** | `EmitElementalKernelThunk` → `ElementalKernelEmitter` | HLO op → `CpuElementalIrEmitter` → LLVM IR | **Legacy path** |
 | **IrEmitter2 fusion fallback** | `EmitFusionHostKernel` → `IrEmitter::HandleFusion` | HLO fusion → `ElementalIrEmitter` → LLVM IR | **Legacy path** |
 
-**Key insight:** `ElementalKernelEmitter` (used for individual unfused ops) actually uses `CpuElementalIrEmitter` under the hood — it emits LLVM IR directly, not MLIR. The only true MLIR path is through the **fusion emitters** (`LoopFusionKernelEmitter`, `TiledFusionEmitter`, etc.). Therefore, to stay on the MLIR path, **all ops must go through fusions**.
+**Key insight:** `ElementalKernelEmitter` uses `CpuElementalIrEmitter` under the hood — LLVM IR, not MLIR. The only true MLIR path is through the **fusion emitters**. Therefore, to stay on the MLIR path, **all ops must go through fusions**.
 
 ## Design
 
-A new `CpuOptimizationLevel` enum in `DebugOptions` with three values:
+A `CpuOptimizationLevel` enum in `DebugOptions` (`xla.proto` field 502):
 
 | Value | Meaning |
 |-------|---------|
@@ -38,36 +40,40 @@ The core idea: wrap as many ops as possible into a **single large fusion** (or a
 3. **Register intermediates** — values between fused ops stay in registers, no buffer round-trips
 4. **Fast LLVM compile** — one function instead of N functions means less LLVM work
 
-**Fusion strategy:** A greedy mega-fusion pass that:
-- Merges all fusible ops (elementwise, broadcast, reshape, reduce, gather, scatter, slice, pad, iota, etc.) into one big `kLoop` fusion
-- Leaves non-fusible ops as separate thunks: `kDot` (→ Eigen), `kConvolution` (→ library), `kCustomCall`, `kCollective*`, `kWhile`, `kConditional`, `kFft`, `kSort`, `kInfeed`/`kOutfeed`
-- Uses `FusionWrapper` on remaining individual fusible ops that couldn't join the mega-fusion (e.g. due to data dependencies on non-fusible ops creating barriers)
+### MegaFusionPass Implementation
 
-**What the compilation pipeline looks like in O1:**
+**Files:** `mega_fusion_pass.{h,cc}` — an `HloModulePass` that runs in O1 mode before `FusionWrapper`.
+
+**Algorithm:**
+1. For each (non-fusion) computation, iterate in reverse post-order (consumers before producers)
+2. For each unprocessed fusible instruction, create a seed `kLoop` fusion via `HloInstruction::CreateFusion()`
+3. Repeatedly scan the fusion's operands: if an operand (a) passes `CanFuse()` and (b) has exactly **one user** (this fusion), absorb it via `fusion->FuseInstruction(operand)`
+4. Repeat step 3 until no more operands qualify, then move to the next unprocessed instruction
+5. `FusionWrapper` runs afterward to wrap any remaining single fusible ops
+
+The **single-user constraint** is critical — it prevents duplicating an instruction's computation across multiple fusions. If an op feeds two consumers, it stays outside both fusions as a shared operand.
+
+**Fusible ops** (mirrors `CanBeLoopFused` + the MLIR elemental emitter's supported set): all elementwise ops, plus bitcast, broadcast, concatenate, dynamic_slice, dynamic_update_slice, gather, iota, pad, reduce, reduce_window, reshape, reverse, scatter, slice, transpose. **Not fusible:** dot, convolution, custom_call, collectives, control flow, fft, sort, tuple/GTE, parameter, constant, existing fusions.
+
+**Constraints:** No nested fusions (MLIR emitter rejects `kFusion` inside a fusion). If the fusion root is scatter, `ThunkEmitter` routes through `CpuScatterFusion` instead of `LoopFusionKernelEmitter`. Dot as root falls back to the legacy emitter. Both `xla_cpu_use_fusion_emitters` and `UseExperimentalLoopFusion` flags must be enabled.
+
+### O1 Pipeline (`cpu_compiler.cc`)
 
 ```
-HLO passes (no CpuInstructionFusion) → MegaFusionWrapper → ThunkEmitter
+HLO passes (no CpuInstructionFusion) → MegaFusionPass → FusionWrapper → ThunkEmitter
   ├─ mega-fusion → LoopFusionKernelEmitter (MLIR) → FusionCompiler → single LLVM kernel
   ├─ dot → DotThunk (Eigen library call)
   ├─ custom_call → CustomCallThunk
   └─ remaining fusible op → FusionWrapper → LoopFusionKernelEmitter (MLIR)
 ```
 
-**HLO passes skipped:**
-- `CpuInstructionFusion` — replaced by mega-fusion strategy
-- `CpuMultiOutputFusion` — not needed
-- `ParallelTaskAssigner` — overhead exceeds benefit for small ops
+**HLO passes skipped:** `CpuInstructionFusion`, `CpuMultiOutputFusion`, `ParallelTaskAssigner`.
 
-**LLVM options forced on:**
-- `optimize_for_size` — smaller code
-- `disable_expensive_passes` — skip costly LLVM passes
-- `disable_slp_vectorizer` — skip SLP auto-vectorization
-- `disable_loop_unrolling` — skip loop unrolling
-- `disable_platform_dependent_math` — portable math
+**LLVM options forced on:** `optimize_for_size`, `disable_expensive_passes`, `disable_slp_vectorizer`, `disable_loop_unrolling`, `disable_platform_dependent_math`.
 
 ### O2: Full Optimization (Default)
 
-Current behavior. `CpuInstructionFusion` → `FusionWrapper` (tiled emitter + loop fusion) → multi-output fusion → parallel task assignment → full LLVM optimization.
+Current behavior. `CpuInstructionFusion` (pairwise producer-consumer fusion with profitability heuristics) → `FusionWrapper` (tiled emitter + loop fusion) → multi-output fusion → parallel task assignment → full LLVM optimization.
 
 ## Non-Fusible Ops (Thunk Barriers)
 
