@@ -50,7 +50,7 @@ These are set in `cpu_compiler.cc` lines ~2108-2124 (JIT) and ~2252-2268 (AOT):
 
 | Flag | `RUNTIME_PERFORMANCE` | `FAST_COMPILE` | Source |
 |------|----------------------|----------------|--------|
-| `optimization_level` (LLVM CodeGen) | From `xla_backend_optimization_level` (default 3 → `CodeGenOptLevel::Aggressive`) | From `xla_backend_optimization_level` (default 3) — **should be O1** | `ir_compiler.cc:497` |
+| `optimization_level` (LLVM CodeGen) | From `xla_backend_optimization_level` (default 3 → `CodeGenOptLevel::Aggressive`) | **Forced to O1** (`CodeGenOptLevel::Less`), overrides global flag | `cpu_compiler.cc:2111` |
 | `optimize_for_size` | `false` (unless `xla_cpu_optimize_for_size` extra option set) | **`true`** | `cpu_compiler.cc:2111` |
 | `disable_expensive_passes` | `false` (unless `xla_llvm_disable_expensive_passes`) | **`true`** | `cpu_compiler.cc:2116` |
 | `slp_vectorizer_disabled` | `false` (unless `xla_cpu_disable_slp_vectorizer` extra option) | **`true`** | `cpu_compiler.cc:2118` |
@@ -115,7 +115,7 @@ From `cpu_compiler.cc`, when `IsFastCompileMode()` returns true:
 3. **Line 1050**: Disable tiled emitter
 4. **Line 1027**: Disable multi-output fusion
 5. **Line 1098**: Skip `ParallelTaskAssigner`
-6. **Lines 2111-2123**: Force LLVM options (optimize_for_size, disable_expensive_passes, disable_slp_vectorizer, disable_loop_unrolling, disable_platform_dependent_math)
+6. **Lines 2111-2123**: Force LLVM options (CodeGen O1, optimize_for_size, disable_expensive_passes, disable_slp_vectorizer, disable_loop_unrolling, disable_platform_dependent_math)
 
 ### Summary: Phase 0 Changes for `FAST_COMPILE`
 
@@ -125,6 +125,7 @@ From `cpu_compiler.cc`, when `IsFastCompileMode()` returns true:
 | HLO fusion | Skip `CpuMultiOutputFusion` | Less fusion overhead |
 | Tiled emitter | Disabled | Simpler MLIR lowering |
 | Parallel tasks | Skip `ParallelTaskAssigner` | Less analysis time |
+| LLVM | CodeGen optimization level forced to **O1** (`CodeGenOptLevel::Less`) | Faster instruction selection and register allocation |
 | LLVM | `optimize_for_size = true` | Smaller code, faster LLVM passes |
 | LLVM | `disable_expensive_passes = true` | Skip costly LLVM analyses |
 | LLVM | `disable_slp_vectorizer = true` | Skip SLP vectorization |
@@ -133,13 +134,13 @@ From `cpu_compiler.cc`, when `IsFastCompileMode()` returns true:
 
 **No change** to `RUNTIME_PERFORMANCE` — it is the current default behavior.
 
-### Open Questions (Phase 0)
+### Resolved Design Decisions
 
-1. **`xla_backend_optimization_level` override**: Should `FAST_COMPILE` force LLVM CodeGen to O1 (instead of the global default of 3)? Currently `GetCodeGenOptLevel()` reads the global flag directly. We could have the preset override this.
+1. **LLVM CodeGen O1**: `FAST_COMPILE` forces `llvm::CodeGenOptLevel::Less` (O1), overriding the global `xla_backend_optimization_level` (default 3). This applies to both JIT and AOT paths in `cpu_compiler.cc`.
 
-2. **`xla_cpu_enable_fast_math`**: Should `RUNTIME_PERFORMANCE` enable this by default? Currently `false` for all modes. Enabling it for `runtime_performance` would give actual fast-math LLVM flags (reassociation, reciprocal math, etc.) — a bigger semantic change but consistent with the preset's philosophy.
+2. **`xla_cpu_enable_fast_math`**: Left as `false` for both presets. Enabling it for `RUNTIME_PERFORMANCE` would be a semantic change affecting existing users — this can be discussed with affected teams case by case if needed.
 
-3. **`xla_cpu_enable_fast_min_max`**: Should `FAST_COMPILE` set this to `false`? Currently `true` by default (suppresses NaN propagation in min/max). Setting to `false` for strict numerics would be more consistent.
+3. **`xla_cpu_enable_fast_min_max`**: Left as `true` (default) for both presets. No change needed.
 
 ## Usage
 

@@ -2107,7 +2107,9 @@ absl::StatusOr<std::unique_ptr<Executable>> CpuCompiler::RunBackend(
   // Options for compiling LLVM IR to machine code.
   const bool is_fast_compile = options::IsFastCompileMode(module->config());
   IrCompiler::Options ir_compiler_options{
-      /*optimization_level=*/IrCompiler::GetCodeGenOptLevel(module->config()),
+      /*optimization_level=*/is_fast_compile
+          ? llvm::CodeGenOptLevel::Less
+          : IrCompiler::GetCodeGenOptLevel(module->config()),
       /*optimize_for_size=*/is_fast_compile ||
           options::OptimizeForSizeRequested(module->config()),
       /*target_machine_options=*/
@@ -2252,7 +2254,9 @@ CpuCompiler::CompileAheadOfTimeThunks(
   const bool is_fast_compile_aot =
       options::IsFastCompileMode(module->config());
   IrCompiler::Options ir_compiler_options = {
-      /*optimization_level=*/target_machine->getOptLevel(),
+      /*optimization_level=*/is_fast_compile_aot
+          ? llvm::CodeGenOptLevel::Less
+          : target_machine->getOptLevel(),
       /*optimize_for_size=*/is_fast_compile_aot ||
           options::OptimizeForSizeRequested(module->config()),
       /*target_machine_options=*/target_machine_options,
