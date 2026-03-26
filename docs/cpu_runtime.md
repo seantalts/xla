@@ -100,56 +100,72 @@ backwards-compatible (old artifacts don't use them). Changing or removing
 fields in existing protos is a breaking change. The `BufferAssignmentProto`
 and `BufferAllocationSliceProto` formats are also part of this contract.
 
-## Runtime Libraries Required at Execution Time
+## Runtime Library Dependencies
 
-When an AOT-compiled binary runs, the thunks dispatch to external libraries.
-These are the libraries that must be **linked into (or shipped with) the
-runtime**, and whose versions must be compatible.
+An important distinction: most of what thunks call is **compiled into the XLA
+runtime binary itself**, not dynamically linked at runtime. The AOT artifact
+(the `CompilationResultProto`) contains compiled `.o` files with kernel code,
+and the *runtime* binary contains compiled thunk implementations. The
+question is what external shared libraries the runtime binary itself needs.
 
-### Core (always required)
+### Compiled into the runtime (no separate runtime dependency)
 
-| Library | Bazel target | Called by | Versioning concern |
+These are header-only or statically-compiled libraries. Their code is baked
+into the XLA runtime binary at build time. There is no separate `.so` to
+ship, but the version compiled into the runtime determines behavior:
+
+| Library | How it's compiled in | Used by |
+|---|---|---|
+| **Eigen** | Header-only. Templates are instantiated in `dot_lib_*.cc` and `convolution_lib_*.cc` via `extern template`. | `DotThunk` (GEMM), `ConvolutionThunk` (spatial convolutions), `Eigen::ThreadPoolDevice` (intra-op threading) |
+| **DUCC** | Header/source compiled into `fft_thunk.cc`. | `FftThunk` |
+| **C++ STL** | Standard library, always present. | `SortThunk` (`std::sort`), `TopKThunk` (`std::partial_sort`) |
+| **Abseil** | Statically linked into the runtime binary. | Everywhere (status, containers, synchronization) |
+| **TSL** | Statically linked into the runtime binary. | `ThunkExecutor` (async values), task runners, tracing |
+
+The Eigen case is worth highlighting: `Eigen::ThreadPoolDevice*` is passed
+into thunks at execution time as a pointer, but the ThreadPoolDevice
+implementation is all inlined/compiled into the runtime. The *caller* must
+provide a compatible `ThreadPoolDevice` instance (i.e., one built against
+the same Eigen headers), but there is no Eigen shared library to link.
+
+### Actual runtime linking dependencies
+
+These are libraries that may exist as separate shared objects (`.so`) that
+the runtime binary dynamically links against:
+
+| Library | Bazel target | When needed | Versioning concern |
 |---|---|---|---|
-| **Eigen** | `@eigen_archive//:eigen3` | `DotThunk`, `ConvolutionThunk`, `Eigen::ThreadPoolDevice` | ABI: Eigen tensor contraction interface, thread pool device API. Changes to GEMM dispatch or tensor layout break compatibility. |
-| **DUCC** | `@ducc` | `FftThunk` | ABI: FFT function signatures. Relatively stable. |
-| **Abseil** | `@com_google_absl//...` | Everywhere (status, containers, sync) | ABI: Abseil has inline namespaces for ABI versioning. Must match between compile-time and runtime. |
-| **TSL** | `@tsl//...` | `ThunkExecutor` (async values), task runners, tracing | ABI: `AsyncValueRef`, thread pool interfaces. |
-| **Protobuf** | `@com_google_protobuf` | Deserialization of `CompilationResultProto`, all thunk protos | ABI: Proto wire format is stable, but generated C++ code has ABI tied to protobuf version. |
+| **Protobuf** | `@com_google_protobuf` | Always (deserializing `CompilationResultProto`) | Proto wire format is stable, but C++ generated code ABI is tied to protobuf major version. If protobuf is dynamically linked, versions must match. |
+| **oneDNN** | `@tsl//tsl/mkl:onednn` | When `OneDnnFusionThunk` is used (currently disabled for AOT) | `dnnl_graph.hpp` graph API version must match |
+| **XNNPACK/YNNPACK** | `@XNNPACK//ynnpack` | When `YnnFusionThunk` is used | XNNPACK subgraph/runtime API version must match |
+| **ARM Compute Library** | ACL | ARM builds with ACL-accelerated matmul/conv | ACL API version must match |
+| **MPI** | system `libmpi.so` | Multi-node with MPI collectives | MPI ABI (typically stable across minor versions) |
+| **Gloo** | `@gloo` | Multi-node with Gloo collectives | Gloo API version |
+| **Slinky ThreadPool** | `@slinky//slinky/base:thread_pool` | When XNNPACK is used | Thread pool interface version |
 
-Note: **LLVM is NOT required at runtime** for AOT binaries. LLVM is only used
-at compile time. The object files in the artifact contain fully compiled
-native code.
-
-### Conditional (depends on what ops the model uses)
-
-| Library | Bazel target | Called by | When needed |
-|---|---|---|---|
-| **oneDNN** | `@tsl//tsl/mkl:onednn` | `OneDnnFusionThunk` (fused matmul, conv, layernorm, softmax) | When compiler emits oneDNN fusions (currently disabled for AOT) |
-| **XNNPACK/YNNPACK** | `@XNNPACK//ynnpack` | `YnnFusionThunk` | When compiler emits XNNPACK fusions |
-| **ARM Compute Library** | ACL | `DotThunk`, `ConvolutionThunk` (ARM path) | ARM builds only |
-| **MPI** | system MPI | `CollectiveThunks` via `MpiCommunicator` | Multi-node with MPI collectives |
-| **Gloo** | `@gloo` | `CollectiveThunks` via `GlooCommunicator` | Multi-node with Gloo collectives |
-| **Slinky ThreadPool** | `@slinky//slinky/base:thread_pool` | `YnnFusionThunk` | When XNNPACK is used |
+Note: **LLVM is NOT required at runtime**. It is only used at compile time.
+The object files in the AOT artifact contain fully compiled native code that
+is loaded by the runtime's `FunctionLibrary` without any LLVM involvement.
 
 ### What each thunk type calls at runtime
 
-| Thunk | External library call |
-|---|---|
-| `KernelThunk` | **None** -- calls into the compiled object file via `FunctionLibrary` |
-| `DotThunk` | **Eigen** -- `dot_lib_{f16,f32,f64,c64,c128,s32,s8}.cc` via Eigen tensor contraction |
-| `ConvolutionThunk` | **Eigen** -- `convolution_lib_{f16,f32}_{2d,3d}.cc` via `eigen_spatial_convolutions.h` |
-| `FftThunk` | **DUCC** -- `ducc/google/fft.h` |
-| `SortThunk` | **C++ STL** -- `std::sort` / `std::stable_sort` + compiled comparator from `FunctionLibrary` |
-| `TopKThunk` | **C++ STL** -- `std::partial_sort` |
-| `CopyThunk` | **None** -- `memcpy` |
-| `CustomCallThunk` | **User code** -- registered custom call targets or FFI handlers |
-| `CollectiveThunks` | **Collectives backend** -- in-process, Gloo, or MPI |
-| `OneDnnFusionThunk` | **oneDNN** -- `dnnl_graph.hpp` |
-| `YnnFusionThunk` | **XNNPACK** -- via `ynn_interop.h` |
-| `InfeedThunk`/`OutfeedThunk` | **XfeedManager** -- internal queue implementation |
-| `WhileThunk`/`CallThunk`/`ConditionalThunk` | **None** -- control flow over nested thunk sequences |
-| `RngGetAndUpdateStateThunk` | **None** -- internal state update |
-| `ReplicaIdThunk`/`PartitionIdThunk` | **None** -- reads from execution context |
+| Thunk | What it calls | Compiled-in or external? |
+|---|---|---|
+| `KernelThunk` | Compiled kernel from `.o` file via `FunctionLibrary` | Compiled into artifact |
+| `DotThunk` | Eigen tensor contraction via `dot_lib_*.cc` | Compiled into runtime |
+| `ConvolutionThunk` | Eigen spatial convolution via `convolution_lib_*.cc` | Compiled into runtime |
+| `FftThunk` | DUCC FFT via `fft_thunk.cc` | Compiled into runtime |
+| `SortThunk` | `std::sort`/`std::stable_sort` + comparator from `FunctionLibrary` | STL + compiled into artifact |
+| `TopKThunk` | `std::partial_sort` | STL (compiled into runtime) |
+| `CopyThunk` | `memcpy` | libc |
+| `CustomCallThunk` | Registered custom call targets or FFI handlers | User-provided (external) |
+| `CollectiveThunks` | In-process collectives, or Gloo/MPI | In-process: compiled in. Gloo/MPI: external `.so` |
+| `OneDnnFusionThunk` | oneDNN graph API | External (oneDNN `.so`) |
+| `YnnFusionThunk` | XNNPACK runtime | External (XNNPACK) |
+| `InfeedThunk`/`OutfeedThunk` | `XfeedManager` | Compiled into runtime |
+| `WhileThunk`/`CallThunk`/`ConditionalThunk` | Nested thunk sequences | N/A (control flow) |
+| `RngGetAndUpdateStateThunk` | Internal state update | Compiled into runtime |
+| `ReplicaIdThunk`/`PartitionIdThunk` | Reads from execution context | Compiled into runtime |
 
 ## Execution Context (Runtime-Provided State)
 
@@ -255,21 +271,30 @@ must also match.
 
 ### 6. External library ABIs
 
-| Library | What could break |
-|---|---|
-| **Eigen** | Tensor contraction ABI, `ThreadPoolDevice` API, GEMM dispatch changes |
-| **DUCC** | FFT function signatures |
-| **oneDNN** | Graph API (`dnnl_graph.hpp`) version |
-| **XNNPACK** | Subgraph/runtime API version |
-| **Protobuf** | C++ generated code ABI (inline namespace changes between major versions) |
+Only libraries that are **dynamically linked** create a true runtime linking
+concern. Libraries compiled into the runtime (Eigen, DUCC, STL) are pinned
+at runtime build time and don't need separate versioning -- but the runtime
+version itself implicitly pins them.
+
+| Library | Linking | What could break |
+|---|---|---|
+| **Protobuf** | Often dynamic | C++ generated code ABI (inline namespace changes between major versions) |
+| **oneDNN** | Dynamic `.so` | Graph API (`dnnl_graph.hpp`) version |
+| **XNNPACK** | Dynamic or static | Subgraph/runtime API version |
+| **MPI** | Dynamic `libmpi.so` | MPI ABI (usually stable across minor versions) |
+| **Gloo** | Dynamic or static | Transport/algorithm API version |
+
+Eigen, DUCC, and STL are header-only or statically compiled into the runtime
+binary. They don't create a separate versioning surface -- their behavior is
+determined by which version was compiled into the runtime build.
 
 ### Summary: versioning priority
 
-1. **`kernel_c_api.h` structs** -- Highest priority. Baked into compiled code. Must be versioned or frozen.
+1. **`kernel_c_api.h` structs** -- Highest priority. Baked into compiled `.o` files in the artifact. Must be versioned or frozen.
 2. **`ThunkSequenceProto` schema** -- Proto evolution rules help, but need explicit version tracking.
 3. **`CompilationResultProto` schema** -- Container format, same concerns as thunk protos.
-4. **Thunk semantic contracts** -- Harder to version. Requires integration testing.
-5. **External library versions** -- Eigen, DUCC, oneDNN, XNNPACK must be pinned or compatibility-tested.
+4. **Thunk semantic contracts** -- Harder to version. Requires integration testing. The runtime's compiled-in Eigen/DUCC version determines matmul/conv/FFT behavior.
+5. **Dynamically-linked library versions** -- oneDNN, XNNPACK, Protobuf, MPI/Gloo must be compatible if present.
 6. **`BufferAllocations` addressing** -- Index scheme and alignment must match.
 
 ## Key Source Locations
