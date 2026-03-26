@@ -26,10 +26,10 @@ introduces disproportionate overhead:
 
 ## Goal
 
-Introduce a **MegaFusion** HLO pass that merges multiple small fusion
-instructions (and other small ops) into a single large fused computation,
-so that the entire model (or a large subgraph) is compiled into **one LLVM
-function** and executed as **one thunk**.
+Introduce a **MegaFusion** HLO pass that merges multiple small HLO
+instructions into a single large fused computation, so that the entire
+model (or a large subgraph) is compiled into **one LLVM function** and
+executed as **one thunk**.
 
 Primary goals:
 - **Reduce compile time** by compiling fewer, simpler LLVM functions and
@@ -50,12 +50,13 @@ Non-goals:
 
 ```
 HLO Module
-  → RunHloPassesThroughLayoutAssn (fusion passes run here)
+  → RunHloPassesAfterLayoutAssn
+    → LibraryRewriter (oneDNN/YNNPACK fusion)
     → CpuInstructionFusion: merges elementwise/broadcast/reduce chains
     → FusionWrapper: wraps for emitter dispatch
     → CpuMultiOutputFusion: merges ops with shared inputs
-  → RunHloPassesAfterLayoutAssn
-    → ParallelTaskAssigner, CopyInsertion, etc.
+    → ParallelTaskAssigner: outlines large ops for parallel execution
+    → CopyInsertion
   → CompileCpuExecutable
     → ThunkEmitter: HLO → ThunkSequence
       → IrEmitter2: emits LLVM IR functions per kernel
@@ -64,10 +65,31 @@ HLO Module
     → JitCompiler/ORC: link into executable
 ```
 
+### CpuInstructionFusion Behavior
+
+`CpuInstructionFusion` fuses producer ops into consumer ops using
+careful heuristics:
+
+- Only fuses ops from `CanBeLoopFused()`: elementwise, bitcast,
+  broadcast, concatenate, gather, iota, pad, reduce, reshape, reverse,
+  slice, transpose
+- Caps reductions at 5 per fusion (`kMaxReductionsInFusion`) because
+  fused reductions cause `X86TargetLowering::PerformDAGCombine` to
+  spend minutes combining load ops after loop unrolling
+- Tracks code duplication via `FusionNodeIndexingEvaluation` to prevent
+  fusion blowup
+- Avoids minor-dimension concatenation fusion (leads to branchy inner
+  loops)
+- Refuses to fuse fusion-into-fusion ("producer is itself a fusion node")
+
+These guards exist primarily to control LLVM compile time. They are
+unnecessary when loop unrolling and SLP vectorization are disabled.
+
 ### Thunk Execution
 
 ```
 ThunkExecutor::Execute()
+  → Build DAG from buffer uses (O(N²) in thunk count)
   → For each ready thunk in DAG order:
     → KernelThunk::ExecuteInternal()
       → Resolve kernel function pointer from FunctionLibrary
@@ -76,322 +98,363 @@ ThunkExecutor::Execute()
       → Signal completion → wake dependent thunks
 ```
 
+Even the sequential fast path (triggered for ≤8 thunks or ≤512B buffers)
+has per-thunk overhead: buffer address resolution, kernel dispatch,
+AsyncValueRef bookkeeping.
+
 ### Key Observation
 
-For a small model with 100 elementwise fusions, each touching <1KB of data:
+For a small model with 100 elementwise ops, each touching <1KB of data:
 - **Compile**: 100 LLVM functions × full O2 pipeline = seconds of compile time
 - **Execute**: 100 thunk dispatches × ~500ns each = 50μs overhead on what
   should be <10μs of actual compute
 
 ## Proposed Design
 
-### Phase 1: HLO-Level MegaFusion Pass
+### Core Idea: MegaFusion Runs Before CpuInstructionFusion
 
-A new HLO pass `CpuMegaFusionPass` runs **after** all existing fusion passes
-and **before** `CompileCpuExecutable`. It operates on the entry computation's
-scheduled instruction sequence.
+MegaFusion operates on **raw, unfused HLO ops** — not on existing fusion
+instructions. It runs early in the pipeline, aggressively grabbing small
+eligible ops. `CpuInstructionFusion` then runs on whatever MegaFusion
+leaves behind, applying its careful heuristics to the remaining (larger)
+ops.
 
-#### Eligibility Criteria
+This is simpler and cleaner than running after CIF because:
 
-An HLO instruction is eligible for mega-fusion if ALL of the following hold:
+1. **No fusion-body inlining.** Merging raw HLO ops is straightforward
+   cloning and wiring. Merging two existing fusions would require
+   inlining both fusion computations, remapping parameters, and handling
+   shared intermediates — significantly more complex.
 
-1. **Is a fusion or simple elementwise op**: The instruction is either a
-   `kFusion` instruction or a simple elementwise/copy/broadcast/reshape/
-   bitcast/slice/concatenate op that would become a `KernelThunk`.
+2. **CIF's compile-time guards are irrelevant.** The `kMaxReductionsInFusion`
+   cap, the `CodeDuplicationTooHigh` check, the concat heuristics — these
+   exist to prevent LLVM compile blowup from loop unrolling and DAG
+   combine. Mega-fusions disable loop unrolling, so the root cause is gone.
 
-2. **No library calls**: The instruction does not lower to a library thunk
-   (oneDNN, YNNPACK, Eigen dot, convolution). These have opaque
-   implementations that cannot be inlined.
+3. **CIF naturally skips mega-fused ops.** CIF refuses to fuse into or
+   out of existing fusion instructions. Mega-fusions show up as `kCustom`
+   fusions, which CIF explicitly skips. Zero code changes needed in CIF.
 
-3. **No side effects**: The instruction is not a collective, infeed, outfeed,
-   send, recv, custom-call with side effects, or RNG.
+4. **Less wasted work.** CIF's O(N²) producer-consumer analysis only
+   runs on ops MegaFusion didn't touch — typically just the large ops
+   that actually benefit from CIF's careful heuristics.
 
-4. **No control flow**: The instruction is not a while loop, conditional,
-   or call to a sub-computation (other than a fusion body).
-
-5. **Small enough**: The total bytes touched by the instruction (sum of
-   operand and output buffer sizes) is below a configurable threshold
-   (default: 256KB). This ensures we only mega-fuse operations where
-   per-thunk overhead dominates.
-
-6. **Single thread**: The instruction is not marked for parallel execution
-   by `ParallelTaskAssigner` (i.e., it has `BlockDim{1}` and `ThreadDim{1}`
-   or is small enough that parallelism provides no benefit).
-
-#### Fusion Algorithm
+### Pipeline Placement
 
 ```
-MegaFusionPass(HloModule* module):
-  entry = module->entry_computation()
-  schedule = module->schedule().sequence(entry)
+RunHloPassesAfterLayoutAssn:
+  ...
+  LibraryRewriter (oneDNN/YNNPACK)     ← creates kCustom fusions, runs first
+  CpuMegaFusionPass                    ← NEW: grab small eligible raw ops
+  CpuInstructionFusion                 ← handles remaining ops normally
+  FusionWrapper
+  CpuMultiOutputFusion
+  ...
+  ParallelTaskAssigner                 ← skips kCustom mega-fusions
+  CopyInsertion
+  ...
+```
 
-  // Partition the schedule into maximal runs of eligible instructions
+MegaFusion runs after `LibraryRewriter` so that oneDNN/YNNPACK ops are
+already marked as custom fusions and will be excluded from mega-fusion
+eligibility.
+
+### Eligibility Criteria
+
+An HLO instruction is eligible for mega-fusion if ALL of the following
+hold:
+
+1. **Fusible op kind**: The instruction is one of the ops that
+   `CanBeLoopFused()` would accept — elementwise, bitcast, broadcast,
+   concatenate, dynamic-slice, dynamic-update-slice, gather, iota, pad,
+   reduce, reshape, reverse, slice, transpose — or a copy.
+
+2. **Not already fused**: The instruction is not already inside a fusion
+   (i.e., it's in the entry computation, not a fusion body). It is not
+   a `kFusion` instruction itself (those were created by LibraryRewriter
+   or earlier passes).
+
+3. **No library calls**: The instruction is not a dot (Eigen), convolution,
+   custom-call, FFT, or any op that lowers to a library thunk.
+
+4. **No side effects**: The instruction is not a collective, infeed,
+   outfeed, send, recv, RNG, or any op with side effects.
+
+5. **No control flow**: The instruction is not while, conditional, or call.
+
+6. **Small enough**: The output shape byte size is below a configurable
+   threshold (default: 256KB). This matches `ParallelTaskAssigner`'s
+   `min_cost_per_thread = 256KB` — ops below this threshold wouldn't
+   benefit from parallelism anyway.
+
+### Fusion Algorithm
+
+```
+CpuMegaFusionPass::Run(HloModule* module):
+  computation = module->entry_computation()
+  instructions = computation->MakeInstructionPostOrder()
+
+  // Build groups: walk post-order, greedily merge eligible ops
+  // that form connected subgraphs
   mega_groups = []
   current_group = []
+  group_bytes = 0
 
-  for instr in schedule:
-    if IsEligibleForMegaFusion(instr):
-      current_group.append(instr)
-    else:
-      if len(current_group) > 1:
-        mega_groups.append(current_group)
-      current_group = []
+  for instr in instructions:
+    if not IsEligibleForMegaFusion(instr):
+      FlushGroup(current_group, mega_groups)
+      continue
 
-  if len(current_group) > 1:
-    mega_groups.append(current_group)
+    bytes = ShapeUtil::ByteSizeOfElements(instr->shape())
 
-  // For each group, merge into a single fusion instruction
+    // Check: does this instruction connect to the current group?
+    // (i.e., uses or is used by something in the group)
+    // Also check byte budget
+    if group_bytes + bytes > kMegaFusionByteThreshold:
+      FlushGroup(current_group, mega_groups)
+
+    current_group.append(instr)
+    group_bytes += bytes
+
+  FlushGroup(current_group, mega_groups)
+
+  // Merge each group into a single kCustom fusion
   for group in mega_groups:
-    if TotalBytesTouched(group) > kMegaFusionByteThreshold:
-      // Split into sub-groups under threshold
-      SplitAndMerge(group)
-    else:
-      MergeIntoSingleFusion(group)
+    if len(group) < kMinGroupSize:   // default: 2
+      continue
+    MergeIntoMegaFusion(computation, group)
 ```
 
-#### MergeIntoSingleFusion
+### MergeIntoMegaFusion
 
-Given a group of N instructions `[i_0, i_1, ..., i_{N-1}]` in schedule
-order:
+Given a group of N instructions `[i_0, i_1, ..., i_{N-1}]` in
+post-order:
 
-1. Create a new `HloComputation` (the mega-fusion body) that contains
-   cloned versions of all N instructions' computations, inlined and
-   connected.
+1. **Identify external inputs**: operands of group instructions that
+   are NOT themselves in the group. These become parameters of the
+   mega-fusion computation.
 
-2. For each instruction in the group:
-   - If it's a fusion: inline its fused computation into the mega body
-   - If it's a simple op: clone it into the mega body
+2. **Identify external outputs**: group instructions whose values are
+   used by instructions outside the group, or that are the root of
+   the entry computation. These become outputs of the mega-fusion.
 
-3. Wire up data dependencies: if `i_j` produces a value consumed by
-   `i_k` (where j < k), connect them directly inside the mega body
-   (no intermediate buffer allocation needed).
+3. **Build the fusion body**: Create a new `HloComputation`. For each
+   instruction in the group (in post-order):
+   - Clone it into the fusion body
+   - Remap operands: if the operand is another group member, point to
+     its clone; if it's external, point to the corresponding parameter
 
-4. External operands (produced outside the group) become parameters of
-   the mega-fusion.
+4. **Create root**: If there's a single external output, it's the root.
+   If multiple, create a tuple as the root.
 
-5. Results consumed outside the group become outputs (via tuple if
-   multiple).
+5. **Create the fusion instruction**:
+   ```cpp
+   auto* mega = computation->AddInstruction(
+       HloInstruction::CreateFusion(
+           output_shape,
+           HloInstruction::FusionKind::kCustom,
+           external_input_operands,
+           fusion_computation));
+   ```
 
-6. Create a new `HloInstruction::CreateFusion(...)` with kind
-   `kMegaFusion` (new fusion kind) and replace all merged instructions.
+6. **Replace uses**: For each external output, replace all uses of the
+   original instruction with the corresponding element of the
+   mega-fusion output (via `GetTupleElement` if multi-output).
 
-7. Tag the fusion with backend config indicating:
-   - `is_mega_fusion: true`
-   - `disable_slp_vectorizer: true`
-   - `disable_loop_unrolling: true`
-   - `optimize_for_size: true`
+7. **Set backend config**: Tag with `backend_extra_options`:
+   `optimize_for_size=true,disable_slp_vectorizer=true,disable_loop_unrolling=true`
 
-### Phase 2: Emitter Support
+8. **Clean up**: Remove the original instructions from the computation.
 
-#### IrEmitter2 Changes
+### Why kCustom Fusion Kind
 
-When `IrEmitter2::EmitFusionHostKernel` encounters a mega-fusion:
+Using `FusionKind::kCustom` gives us automatic compatibility with the
+rest of the pipeline:
 
-1. Emit all sub-computations as a single LLVM function (the normal fusion
-   emitter path handles this since the mega-fusion body is just a
-   computation graph).
+- **CpuInstructionFusion**: Explicitly skips custom fusions in
+  `ComputeInstructionsToSkip()` and refuses to fuse producers that are
+  fusion nodes. No changes needed.
 
-2. Attach LLVM function attributes to hint the backend:
-   - `"optimize-for-size"` — triggers `-Os`-like behavior
-   - `"no-slp-vectorize"` — disables SLP vectorizer
-   - `"no-unroll-loops"` — disables loop unrolling
+- **ParallelTaskAssigner**: Explicitly returns task count 1 for custom
+  fusions (`parallel_task_assignment.cc` lines 172-178). This is correct —
+  mega-fused ops are too small for parallelism overhead.
 
-3. Since all sub-ops are element-wise or simple indexed operations, the
-   existing `ElementalIrEmitter` can handle the fused body directly.
+- **FusionWrapper**: Needs to recognize mega-fusions and route them to
+  the appropriate emitter. We tag via backend config so the wrapper can
+  check.
 
-#### ThunkEmitter Changes
+- **ThunkEmitter**: Emits a single `KernelThunk` for the mega-fusion,
+  same as any other fusion. The kernel name includes "mega" for
+  debuggability.
 
-The `ThunkEmitter` emits a single `KernelThunk` for the mega-fusion,
-exactly as it would for any fusion. No changes needed here — the mega-
-fusion is just a (large) fusion instruction from the thunk emitter's
-perspective.
+### LLVM Compilation: Reduced Optimization
 
-### Phase 3: LLVM Compilation Pipeline Changes
+Mega-fusion kernels are compiled with reduced LLVM optimization via the
+existing `backend_extra_options` infrastructure:
 
-#### Per-Function Optimization Control
+1. **IrEmitter2** sets `backend_extra_options` on the kernel:
+   ```
+   optimize_for_size=true
+   disable_slp_vectorizer=true
+   disable_loop_unrolling=true
+   ```
 
-Modify `IrCompiler::RunIrPasses` to respect per-function attributes:
+2. **ExtractKernelsFromModule** (in `cpu_compiler.cc`) automatically
+   extracts kernels with non-default backend options into separate
+   LLVM modules.
 
-Currently, SLP vectorizer and loop unrolling are controlled at the module
-level via `PipelineTuningOptions`. For mega-fused kernels, we want to
-skip these passes entirely.
+3. **IrCompiler** reads module flags via `GetXlaBackendExtraOptions()`
+   and configures `PipelineTuningOptions` accordingly:
+   ```
+   pto.LoopVectorization = false
+   pto.SLPVectorization = false
+   pto.LoopUnrolling = false
+   ```
 
-**Option A (Preferred)**: Use the existing `backend_extra_options`
-mechanism. The mega-fusion's kernel gets compiled into a separate LLVM
-module with `optimize_for_size=true`, `disable_slp_vectorizer=true`,
-`disable_loop_unrolling=true` set as module flags. The existing
-`ExtractKernelsFromModule` + `GetXlaBackendExtraOptions` infrastructure
-already supports this — mega-fusion kernels automatically get their own
-compilation unit with reduced optimization.
+4. The mega-fusion module compiles at **O1 instead of O2** — sufficient
+   for simple elementwise code, significantly faster.
 
-**Option B**: Set LLVM function attributes (`optnone`, `optsize`,
-`"no-slp-vectorize"`) on mega-fusion kernel functions and rely on
-LLVM's per-function optimization behavior. This avoids module splitting
-but has less reliable behavior across LLVM versions.
+No new LLVM infrastructure needed. This all works today.
 
-#### Reduced Optimization Pipeline
+### Module-Level Compilation Optimization
 
-For mega-fusion modules, the `IrCompiler` uses:
+For small models where MegaFusion merges everything into one or two
+kernels:
 
-```
-PipelineTuningOptions pto;
-pto.LoopVectorization = false;  // Tiny loops, not worth it
-pto.SLPVectorization = false;   // Already disabled due to LLVM bug
-pto.LoopUnrolling = false;      // Save compile time
-// Use O1 instead of O2 — sufficient for simple elementwise code
-opt_level = CodeGenOptLevel::Less;  // -O1
-```
+1. **Skip module splitting**: If there are ≤2 compiled functions after
+   mega-fusion, set `num_default_parts = 1` and skip `SplitModule`.
+   Avoids cloning overhead.
 
-This alone can cut LLVM compile time by 2-5x for small functions.
-
-### Phase 4: Module-Level Compilation Optimization
-
-For small models where MegaFusion merges everything into a single kernel:
-
-1. **Skip module splitting**: If there's only 1 compiled function after
-   mega-fusion, set `num_default_parts = 1` and skip `SplitModule`
-   entirely. This avoids the overhead of cloning and splitting.
-
-2. **Single dylib**: Use a single `JITDylib` instead of
+2. **Single dylib**: Use one `JITDylib` instead of
    `parallel_codegen_split_count` dylibs, reducing ORC JIT overhead.
 
-3. **Eager compilation**: For tiny modules, compile synchronously instead
-   of dispatching to a thread pool (thread pool dispatch + synchronization
-   overhead exceeds compile time for trivial functions).
+3. **Eager compilation**: For tiny modules, compile synchronously
+   instead of dispatching to a thread pool (dispatch + sync overhead
+   exceeds compile time for trivial functions).
 
 ## Implementation Plan
 
-### Step 1: Add MegaFusion HLO Pass (new files)
+### Step 1: Add MegaFusion HLO Pass
 
+New files:
 ```
 xla/service/cpu/cpu_mega_fusion_pass.h
 xla/service/cpu/cpu_mega_fusion_pass.cc
 xla/service/cpu/cpu_mega_fusion_pass_test.cc
 ```
 
-- Implement `CpuMegaFusionPass : public HloModulePass`
-- Add eligibility checking logic
-- Implement schedule-order grouping algorithm
-- Implement `MergeIntoSingleFusion` using existing HLO cloning/inlining
-  utilities (`HloInstruction::CreateFusion`, `FuseInstruction`,
-  `CloneWithNewOperands`)
-- Unit tests with small model HLO graphs
+- `CpuMegaFusionPass : public HloModulePass`
+- Eligibility checking (mirrors `CanBeLoopFused()` list plus size check)
+- Post-order grouping algorithm
+- `MergeIntoMegaFusion` using `HloInstruction::CreateFusion()` with
+  `kCustom` kind
+- Backend config tagging
+- Unit tests: small HLO graphs, verify fusion structure
 
-### Step 2: Backend Config for Mega-Fusion
+### Step 2: Integrate Into Pipeline
 
-Extend `xla/service/cpu/backend_config.proto`:
-
-```protobuf
-message CpuBackendConfig {
-  // ... existing fields ...
-  bool is_mega_fusion = N;
-}
-```
-
-Or alternatively, use `backend_extra_options` string to pass
-`optimize_for_size=true,disable_slp_vectorizer=true,disable_loop_unrolling=true`.
-This is simpler and works with existing infrastructure.
-
-### Step 3: Integrate into CPU Compiler Pipeline
-
-In `cpu_compiler.cc`, `RunHloPassesAfterLayoutAssn`:
+In `cpu_compiler.cc`, `RunHloPassesAfterLayoutAssn`, insert MegaFusion
+between LibraryRewriter and CpuInstructionFusion:
 
 ```cpp
-// After all existing fusion passes and before ParallelTaskAssigner:
+// After library rewriting, before standard fusion passes:
 if (debug_options.xla_cpu_enable_mega_fusion()) {
   pipeline.AddPass<CpuMegaFusionPass>(CpuMegaFusionPass::Options{
       .byte_threshold = debug_options.xla_cpu_mega_fusion_byte_threshold(),
       .min_group_size = 2,
   });
 }
+
+// Existing fusion passes — operate on what MegaFusion left behind
+pipeline.AddPass<CpuInstructionFusion>(...);
 ```
 
-The pass should run:
-- **After** `CpuInstructionFusion` and `CpuMultiOutputFusion` (so we
-  merge already-fused ops)
-- **After** `FusionWrapper` (so fusion emitter dispatch is set)
-- **Before** `ParallelTaskAssigner` (so we don't mega-fuse ops that
-  should be parallelized — though for small ops this shouldn't happen)
-- **Before** `CopyInsertion` (so the copy analysis sees the mega-fused
-  graph)
+### Step 3: Emitter Support
 
-### Step 4: Wire Up Backend Extra Options
+In `FusionWrapper` or `ThunkEmitter`, recognize mega-fusions (check
+backend config) and route to the standard elemental fusion emitter.
+The fusion body is just normal HLO ops — the existing
+`ElementalIrEmitter` handles it.
 
-In `IrEmitter2::EmitFusionHostKernel`, when the fusion is a mega-fusion:
+In `IrEmitter2`, set `backend_extra_options` on the emitted kernel
+when the source fusion is a mega-fusion.
 
-```cpp
-if (IsMegaFusion(fusion_instruction)) {
-  kernel_info.backend_extra_options =
-      "optimize_for_size=true,"
-      "disable_slp_vectorizer=true,"
-      "disable_loop_unrolling=true";
-}
-```
+### Step 4: Debug Option Flags
 
-This causes `ExtractKernelsFromModule` to compile the mega-fusion kernel
-with reduced optimization, using the existing infrastructure.
-
-### Step 5: Add Debug Option Flags
-
-In `xla_flags.proto` / `DebugOptions`:
+Add to `DebugOptions` proto:
 
 ```protobuf
 bool xla_cpu_enable_mega_fusion = N [default = false];
-int64 xla_cpu_mega_fusion_byte_threshold = M [default = 262144]; // 256KB
+int64 xla_cpu_mega_fusion_byte_threshold = M [default = 262144];  // 256KB
 ```
 
-### Step 6: Testing & Benchmarking
+### Step 5: Testing & Benchmarking
 
 1. **Unit tests**: Verify fusion correctness on small HLO graphs
 2. **End-to-end tests**: Compile + run small models, verify numerics
 3. **Compile-time benchmarks**: Measure LLVM compile time with/without
 4. **Runtime benchmarks**: Measure inference latency for small models
-5. **Regression tests**: Ensure large models are unaffected (mega-fusion
-   should be a no-op when all ops exceed byte threshold)
+5. **Regression tests**: Ensure large models are unaffected (all ops
+   above byte threshold → MegaFusion is a no-op → CIF runs as before)
 
 ## Risks and Mitigations
 
-### Risk: Increased code size for mega-fused kernels
+### Risk: Mega-fusion body too large for elemental emitter
 
-The mega-fused LLVM function will be larger than any individual kernel.
-However, since we're disabling loop unrolling and optimizing for size,
-the generated code should still be compact.
+The elemental emitter generates code by recursively walking the fusion
+body. A mega-fusion with 100+ ops could produce a very large LLVM
+function.
 
-**Mitigation**: Set `optimize_for_size = true` and cap the mega-fusion
-at 256KB total data touched (which bounds the computation complexity).
+**Mitigation**: The byte threshold (256KB) bounds the data size, which
+correlates with computation complexity. Also, with loop unrolling and
+SLP vectorizer disabled, LLVM won't explode the IR further. The
+`kMaxReductionsInFusion` problem specifically comes from loop unrolling
+interacting with `X86TargetLowering::PerformDAGCombine` — without
+unrolling, this doesn't happen.
 
-### Risk: Breaking existing fusion invariants
+### Risk: Multi-output fusion complexity
 
-The HLO fusion infrastructure assumes certain properties about fusion
-bodies (e.g., single root, specific op patterns). Mega-fusion creates
-unusual multi-output fusions.
+When a mega-fusion has multiple external outputs, the root is a tuple.
+The emitter needs to handle multi-output fusions correctly.
 
-**Mitigation**: Use `kOutput` fusion kind with a tuple root, which is
-already supported by `CpuMultiOutputFusion`. Alternatively, introduce
-a new `kMegaFusion` kind that the emitter handles explicitly.
+**Mitigation**: Multi-output fusion is already supported by
+`CpuMultiOutputFusion` and the fusion emitters. Use the same
+infrastructure.
 
-### Risk: Buffer assignment complexity
+### Risk: Buffer assignment for intermediates
 
-Merging many ops changes buffer lifetimes. Some intermediate buffers
-that were previously allocated separately may now overlap.
+Intermediate values between ops that are now inside the mega-fusion
+become internal to the fusion body — they don't need separate buffer
+allocations.
 
-**Mitigation**: Run mega-fusion before `CopyInsertion` and
-`BufferAssignment` so they see the final graph. Intermediate values
-within the mega-fusion body are virtual — they don't need buffer
-allocation (they're computed inline in the fused kernel).
+**Mitigation**: This is the normal behavior for fusion. Buffer
+assignment only allocates buffers for fusion inputs and outputs, not
+for intermediate values inside the fusion body. This is actually a
+benefit — fewer buffers to allocate.
 
 ### Risk: Interaction with oneDNN/YNNPACK fusions
 
-Library-backed fusions must not be merged into mega-fusions.
+Library-backed fusions must not be absorbed into mega-fusions.
 
-**Mitigation**: The eligibility check explicitly excludes instructions
-that lower to library thunks. Check for `kCustomCall` with
-`onednn`/`ynn` targets, and any instruction where
-`ThunkEmitter::EmitHloInstruction` would produce a non-kernel thunk.
+**Mitigation**: LibraryRewriter runs before MegaFusion. It creates
+`kCustom` fusions for library ops. MegaFusion's eligibility check
+excludes `kFusion` instructions entirely — it only operates on raw
+unfused HLO ops. Library fusions are invisible to MegaFusion.
+
+### Risk: CpuInstructionFusion gets confused by mega-fusions
+
+CIF might try to fuse ops into a mega-fusion or vice versa.
+
+**Mitigation**: CIF already handles this correctly with zero changes:
+- `ShouldFuse()` returns "Not fusing: producer is itself a fusion node"
+  for any fusion producer (line 421 of `cpu_instruction_fusion.cc`)
+- `ComputeInstructionsToSkip()` skips instructions inside custom
+  fusions
+- CIF simply ignores mega-fusions and fuses the remaining ops normally
 
 ## Performance Expectations
 
-For a small MLP (5 dense layers, ~100 fused ops, <1MB total data):
+For a small MLP (5 dense layers, ~100 small ops, <1MB total data):
 
 | Metric | Before | After (est.) |
 |--------|--------|-------------|
@@ -400,25 +463,32 @@ For a small MLP (5 dense layers, ~100 fused ops, <1MB total data):
 | Per-inference overhead | ~50μs | ~5μs |
 | Inference latency | ~80μs | ~35μs |
 
-The compile time improvement comes primarily from:
-1. Fewer LLVM functions to optimize (100 → 5)
-2. Skipping SLP vectorizer and loop unrolling
-3. Using O1 instead of O2
-4. No module splitting overhead
+The compile time improvement comes from:
+1. Fewer LLVM functions to optimize (100 → ~5)
+2. Mega-fusion kernels skip SLP vectorizer and loop unrolling
+3. O1 instead of O2 for mega-fusion kernels
+4. Fewer module splits / dylibs
 
 The runtime improvement comes from:
-1. Fewer thunk dispatches (100 → 5)
+1. Fewer thunk dispatches (100 → ~5)
 2. No intermediate buffer loads/stores between adjacent ops
 3. Better register allocation across the fused computation
+4. Simpler ThunkExecutor DAG (fewer nodes → cheaper O(N²) construction)
+
+For large models (all ops > 256KB), MegaFusion is a no-op — the byte
+threshold check rejects everything, CIF runs exactly as before, zero
+performance impact.
 
 ## Future Work
 
 - **Adaptive thresholds**: Use a cost model to decide byte threshold
   based on target architecture and model characteristics
-- **Partial mega-fusion**: Allow mega-fusing subsets of eligible ops
-  even when interrupted by ineligible ops (by splitting the schedule
-  into multiple mega-groups)
+- **Cross-barrier mega-fusion**: Allow mega-fusing ops separated by
+  ineligible ops, creating multiple mega-groups per computation
 - **Integration with tiled emitter**: For medium-sized ops, combine
   mega-fusion with tiling for better cache behavior
 - **Profile-guided mega-fusion**: Use runtime profiling data to decide
   which ops to merge (e.g., ops that always execute sequentially anyway)
+- **Whole-model fusion**: For truly tiny models, consider fusing
+  everything (including small dots via elemental emission) into a
+  single kernel
