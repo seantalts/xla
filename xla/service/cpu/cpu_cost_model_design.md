@@ -65,6 +65,119 @@ understanding the work breakdown), and the primary consumer always needs both.
 If a third dimension is needed later, we can evolve `CpuCost` to a small
 struct with named fields - that's a minor, mechanical refactor.
 
+## Comparison with existing cost models
+
+### Base `HloCostAnalysis` (all backends)
+
+`HloCostAnalysis` (`xla/service/hlo_cost_analysis.h`) is a DFS visitor that
+computes raw metrics per instruction: FLOPs, transcendental count, bytes
+accessed, and an "optimal seconds" estimate. Time is computed via a
+**bottleneck model**:
+
+```
+optimal_seconds = max(flops / flops_per_sec,
+                      bytes / bytes_per_sec,
+                      transcendentals / transcendentals_per_sec)
+```
+
+This assumes perfect overlap between compute and memory — whichever is slower
+dominates. It has no notion of parallelism or core count. The `Properties`
+class uses a hybrid fast-path / hash-map lookup that was documented as "the
+most impactful single optimization we were able to make to GPU compilation
+time", so any new model should avoid regressing cost-analysis overhead.
+
+**Relationship to this proposal:** We reuse `HloCostAnalysis` to extract raw
+FLOPs/bytes/transcendentals as inputs to our `serial_cost` formula. We do not
+replace it.
+
+### CPU `DefaultCostModel` (today)
+
+The current CPU cost model in `parallel_task_assignment.cc` computes a
+flops-to-bytes ratio and classifies instructions into two buckets:
+
+- **I/O-bound** (ratio ≤ 1.0): Uses `bytes_accessed` as cost, caps parallelism
+  at `sqrt(num_cores)`, and uses 256 KB (L2 cache size) as the minimum cost per
+  thread.
+- **Compute-bound** (ratio > 1.0): Uses `1*flops + 2*transcendentals +
+  10*bytes_accessed` as cost, allows full parallelism, and uses 100K cycles
+  (~50 µs at 2 GHz) as minimum cost per thread.
+
+This is essentially a hand-rolled Amdahl's law with only two discrete
+parallelism levels. The limitations:
+
+1. **Coupled concerns** — the model returns a thread count directly, so it
+   can't be reused by the scheduler or fusion heuristics without re-deriving
+   the cost.
+2. **Binary classification** — ops are either "I/O bound" or "compute bound"
+   with nothing in between. A matmul that's slightly memory-bound gets
+   sqrt-capped parallelism, while one that's slightly compute-bound gets full
+   parallelism.
+3. **Hard-coded constants** — the weights (1, 2, 10), the 256 KB threshold,
+   and the 100K cycle minimum are baked in with no per-target tuning.
+
+Our proposal replaces this with a continuous `parallel_fraction` and
+configurable weight parameters.
+
+### GPU `GpuHloCostAnalysis`
+
+`GpuHloCostAnalysis` (`xla/service/gpu/model/gpu_hlo_cost_analysis.h`)
+extends `HloCostAnalysis` with GPU-specific refinements:
+
+- **Element-type-aware FLOPs**: Uses precomputed `HloOpProfiles` mapping
+  `(opcode, element_type)` → FLOPs-per-element (e.g. `exp` on f32 costs more
+  than `add` on f32). Default is 3 FLOPs/element for unknown ops.
+- **Fusion utilization analysis**: Forward-traverses fused computations to track
+  how many times each sub-instruction is emitted and what fraction of each
+  operand is actually read. This prevents over-counting in large fusions.
+- **IR size tracking**: Estimates generated code size to prevent fusions that
+  would exceed ~10K IR instructions and blow up compile time.
+- **Collective operation costs**: Models ring/tree algorithms with
+  device-count-aware scaling ratios (e.g. `num_ranks / (2*(num_ranks-1))` for
+  ring all-reduce).
+
+**What we can learn from it:**
+- Per-element-type profiling is valuable. Our initial version uses uniform
+  weights, but we should plan for type-aware `serial_cost` refinements (e.g.
+  f64 div is much more expensive than f32 add on x86).
+- Fusion utilization analysis matters. Our multi-instruction `GetCost` should
+  eventually account for operand reuse rather than naively summing.
+
+### GPU Performance Model
+
+The GPU performance model (`gpu_performance_model_base.h`) goes a step further,
+converting costs into wall-clock time estimates using detailed hardware
+parameters:
+
+- **Cache hierarchy**: Models L1 (8× speedup) and L2 (2.5× speedup) relative
+  to DRAM bandwidth, with size-based tiering.
+- **Compute-memory overlap**: Uses an empirically-calibrated 95% overlap
+  constant (not 100%) to account for real-world synchronization overhead:
+  ```
+  exec_time = compute_time + memory_time
+            - min(compute_time, memory_time) × 0.95
+  ```
+- **Launch overhead**: Adds per-kernel launch cost (1 µs normal, 5 µs for NCCL
+  kernels).
+- **Occupancy-aware bandwidth**: Scales effective bandwidth based on the number
+  of active thread blocks vs. available SMs.
+
+This level of hardware modeling is appropriate for GPU where the execution model
+(warps, SMs, shared memory) is rigid and well-characterized. For CPU, the
+execution model is more flexible (out-of-order cores, OS scheduling, varying
+cache sizes), so we intentionally start simpler with abstract cycles and defer
+cache modeling.
+
+### Summary comparison
+
+| Aspect | Base `HloCostAnalysis` | CPU `DefaultCostModel` | GPU `GpuHloCostAnalysis` | GPU Perf Model | **This proposal** |
+|---|---|---|---|---|---|
+| **Output** | FLOPs, bytes, seconds | Thread count (int) | FLOPs, bytes, IR size | Wall-clock time | `(serial_cost, parallel_fraction)` |
+| **Parallelism model** | None | Binary (I/O vs compute) | None (handled by perf model) | Occupancy-based | Continuous fraction \[0,1\] |
+| **Hardware params** | Rates (FLOP/s, B/s) | Hard-coded constants | Element-type profiles | Cache sizes, bandwidth, core count, FPU count | Configurable weights |
+| **Time model** | Bottleneck (max) | N/A | N/A | Overlapped (95%) | Amdahl's law |
+| **Fusion support** | Sum of sub-ops | N/A | Utilization tracking, IR size limits | Runtime estimation | Weighted-average `parallel_fraction` |
+| **Cache modeling** | None | 256 KB L2 assumption | None | L1/L2 tiered | Deferred |
+
 ## Interface
 
 ```cpp
@@ -76,8 +189,8 @@ struct CpuCost {
   double serial_cost;       // Abstract cycles on one core.
   double parallel_fraction; // In [0, 1].
 
-  // Convenience: estimated wall-clock cost for `num_cores` cores.
-  double EstimatedCost(int num_cores) const {
+  // Estimated wall-clock cost for `num_cores` cores (Amdahl's law).
+  double WallClock(int num_cores) const {
     double p = std::clamp(parallel_fraction, 0.0, 1.0);
     return serial_cost * ((1.0 - p) + p / std::max(1, num_cores));
   }
@@ -173,7 +286,7 @@ accurate than taking the min.
    task_count = clamp(ideal_threads, 1, max_parallelism)
    ```
 
-2. **Instruction scheduling**: Use `EstimatedCost(num_cores)` to order
+2. **Instruction scheduling**: Use `WallClock(num_cores)` to order
    instructions on the critical path.
 
 3. **Fusion decisions**: Compare `GetCost(fused)` vs `sum(GetCost(unfused))` to
@@ -202,7 +315,7 @@ accurate than taking the min.
 
 - Should `serial_cost` be in abstract "cycles" or in seconds (requiring a
   target clock speed)? Abstract cycles are more portable; seconds are more
-  directly useful. Leaning toward abstract cycles, with `EstimatedCost`
+  directly useful. Leaning toward abstract cycles, with `WallClock`
   returning abstract cycles too, and letting the caller convert if needed.
 - Do we need per-operand cost breakdown (to support scheduling decisions about
   which operand to prefetch)?  Probably not in v1.
