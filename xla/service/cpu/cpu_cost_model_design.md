@@ -211,14 +211,21 @@ This is the Amdahl's law formulation: `serial_cost` is the total work,
 ### Why not just a scalar?
 
 A single scalar cost would be simpler (CockroachDB gets away with it, LLVM TTI
-is scalar). But our primary use case — parallel task assignment — needs to know
-not just "how much work" but "how much of the work parallelizes." Today's
-`DefaultCostModel` conflates these into a thread count; we want to separate
-them so the same cost model serves scheduling, fusion, *and* parallelization.
+is scalar). But fusion *and* parallelization both need to reason about
+parallelizability, not just total work:
 
-That said, the `parallel_fraction` is a lightweight addition — one extra double
-per instruction. If it turns out to be more trouble than it's worth, we can
-always ignore it and use `serial_cost` alone.
+- **Parallelization** obviously needs it: how many threads should run this op?
+- **Fusion** needs it because fusing changes the parallelizability profile, not
+  just the total work. Fusing two elementwise ops is pure win on both axes.
+  Fusing a reduce into an elementwise consumer can serialize work that was
+  previously parallel. A fusion that increases total work by 1.5× but doubles
+  the parallel fraction is a win on a many-core machine and a loss on a small
+  one. The right comparison is `WallClock(num_cores)` of the fused vs unfused
+  versions, which uses both fields.
+
+Today's `DefaultCostModel` conflates work and parallelism into a thread count,
+which means fusion can't reuse it. Splitting them into two fields gives us one
+cost model that serves scheduling, fusion, *and* parallelization.
 
 ### Input signals
 
@@ -235,20 +242,129 @@ concern (via `WallClock`).
 
 ### Producing `serial_cost`
 
-Re-use `HloCostAnalysis` to get raw FLOPs (`F`), transcendental count (`T`),
-and bytes accessed (`B`). Combine with a weighted linear model:
+We already have access to LLVM's `TargetMachine` (via
+`xla/backends/cpu/codegen/target_machine_features.h`), which means we have
+access to LLVM's `TargetTransformInfo` (TTI) — a target-calibrated cost model
+maintained by the LLVM community for every CPU we care about. TTI knows that
+`vfmadd` on Zen 4 has different throughput than on Skylake. We will not
+out-engineer that, and we shouldn't try.
 
+The catch is that TTI is keyed on LLVM IR, not HLO. We do **not** want to
+synthesize LLVM IR for cost queries — that's expensive and pollutes the cost
+path with codegen concerns.
+
+The trick: TTI's cost methods take `llvm::Type*` and opcode enums, not
+`Instruction*`. We can call them with synthesized type objects directly,
+no IR generation:
+
+```cpp
+auto* vec_f32 = FixedVectorType::get(Type::getFloatTy(ctx), native_vec_lanes);
+double cost = TTI.getArithmeticInstrCost(
+    Instruction::FAdd, vec_f32, TTI::TCK_RecipThroughput);
 ```
-serial_cost = w_f * F + w_t * T + w_b * B + w_0
+
+#### A lazy, memoized `(opcode, dtype)` table
+
+The TTI cost of "f32 add at native vector width" is the same for every
+elementwise add in the module, so we cache it. The cache is a simple
+memoizing function:
+
+```cpp
+double CostPerElement(HloOpcode opcode, PrimitiveType dtype) {
+  absl::MutexLock lock(&mu_);
+  auto [it, inserted] = cost_per_element_.try_emplace({opcode, dtype}, 0.0);
+  if (inserted) {
+    it->second = QueryTTI(opcode, dtype);  // hit LLVM once per key
+  }
+  return it->second;
+}
 ```
 
-Weights ship as a config struct, not hard-coded constants. The initial default
-weights are calibrated to roughly match `DefaultCostModel`'s existing formula
-(`1*F + 2*T + 10*B`) so we don't regress existing behavior.
+Properties:
 
-Like LLVM TTI's per-target cost tables, we can later provide
-microarchitecture-specific weight configs (e.g. different for AVX-512 vs. ARM
-NEON, or for machines with different memory bandwidth).
+- **Lazy.** A module that's all f32 elementwise ops never queries TTI for
+  f64 transcendentals. Pipelines that don't run the cost model (e.g. `-O0`)
+  pay nothing.
+- **Bounded.** A few hundred entries max even for a complex module. No
+  eviction needed; lifetime tied to the compilation.
+- **Cheap once warm.** Hot path is a hash lookup + multiply, fast enough for
+  fusion's inner loop.
+
+`serial_cost` for an elementwise op is then:
+
+```cpp
+serial_cost = CostPerElement(opcode, dtype) *
+              ShapeUtil::ElementsIn(instruction.shape());
+```
+
+For ops where work isn't proportional to output size (dot, conv, reduce), we
+have ~10 op-specific formulas that read from the same table:
+
+```cpp
+serial_cost(dot) = CostPerElement(kMultiply, dtype)
+                 * 2 * output_elements * contracting_dim;
+```
+
+Same data structure; different combinators.
+
+This is structurally similar to `GpuHloCostAnalysis::HloOpProfiles` (a
+hardcoded `(opcode, type) → flops_per_element` map), except we populate it
+from TTI instead of hand-tuning numbers.
+
+#### How much do we trust TTI?
+
+Moderately, and unevenly.
+
+**Where TTI is solid:**
+
+- Basic vector arithmetic on supported widths (`fadd`, `fmul`, `fma` on x86
+  AVX-512, AArch64 NEON). Cost tables are well-maintained and match real
+  microarchitectural throughput within ~20%.
+- Cast costs — TTI's `CastContextHint` mechanism is genuinely good.
+- **Relative ordering.** Even when absolute numbers are off, TTI almost
+  always gets ordering right: vector beats scalar, fma beats mul+add,
+  transcendentals are 10-20× slower than basic arithmetic. For fusion and
+  parallelization decisions, ordering is what matters.
+
+**Where TTI is weaker:**
+
+- Intrinsics / transcendentals: `getIntrinsicInstrCost` for `exp`/`log`/`pow`
+  is often a hardcoded "expensive" constant rather than precisely calibrated.
+- Less popular targets (RISC-V V, AArch64 SVE) have sparser tables than x86.
+- Memory ops: `getMemoryOpCost` assumes cache hits and doesn't model
+  bandwidth. For modeling steady-state inner-loop throughput this is
+  arguably correct, but it means we systematically under-count memory-bound
+  ops.
+- Gather/scatter and irregular access patterns are often pessimistic stubs.
+
+**What this means for the design:**
+
+We trust TTI for **relative comparisons within a microarchitecture**, which
+is exactly what fusion and parallelization need. We don't trust it for
+absolute wall-clock predictions, and we're not asking it to make those.
+`serial_cost` is in TTI's abstract reciprocal-throughput units, not seconds.
+`WallClock(N)` returns those same abstract units divided by an Amdahl factor.
+As long as both sides of every comparison use the same model, the units
+cancel out.
+
+Two concrete defenses we build in:
+
+1. **An additive memory-pressure term** to compensate for TTI's cache-hit
+   assumption:
+   ```
+   serial_cost = tti_compute_cost + w_mem * bytes_accessed
+   ```
+   `w_mem` is the one tunable knob we keep, defaulted per microarchitecture.
+   This is the one place we can't get rid of a hand-picked weight, because
+   TTI structurally won't give us memory bandwidth.
+
+2. **A fallback path.** If TTI returns `Invalid` (unsupported opcode/type/
+   target), fall back to a small hardcoded per-element cost table. This
+   keeps us from degrading to garbage on weird targets.
+
+The net effect: the *compute* term is now target-aware instead of a flat
+weight, while we keep one tunable for memory pressure. Strictly better than
+the current `1*F + 2*T + 10*B` formula.
 
 ### Producing `parallel_fraction`
 
@@ -294,7 +410,9 @@ whichever sub-instruction contributes the most cost.
 
 2. **Fusion decisions** (`cpu_instruction_fusion.cc`): Replace `IsExpensive`
    boolean with quantitative cost comparison. Instead of "is the producer
-   expensive?", ask "does fusing reduce total cost?"
+   expensive?", ask whether `WallClock(num_cores)` of the fused version is
+   lower than the unfused version. This naturally accounts for fusions that
+   trade total work for parallelizability.
 
 3. **Instruction scheduling**: Use `WallClock(num_cores)` to estimate critical
    path length.
@@ -305,7 +423,7 @@ whichever sub-instruction contributes the most cost.
 |---|---|---|---|---|---|
 | **Output** | FLOPs, bytes, seconds | Thread count (int) | FLOPs, bytes, IR size | Wall-clock time | `(serial_cost, parallel_fraction)` |
 | **Parallelism model** | None | Binary (I/O vs compute) | None (perf model handles it) | Occupancy-based | Continuous fraction \[0,1\] |
-| **Hardware params** | Rates (FLOP/s, B/s) | Hard-coded constants | Element-type profiles | Cache sizes, bandwidth, core count | Configurable weights |
+| **Hardware params** | Rates (FLOP/s, B/s) | Hard-coded constants | Element-type profiles | Cache sizes, bandwidth, core count | LLVM TTI per-target tables + one tunable mem weight |
 | **Time model** | Bottleneck (max) | N/A | N/A | Overlapped (95%) | Amdahl's law |
 | **Fusion support** | Sum of sub-ops | N/A | Utilization tracking, IR size limits | Runtime estimation | Weighted-average `parallel_fraction` |
 
@@ -324,13 +442,21 @@ whichever sub-instruction contributes the most cost.
 
 1. Add `CpuCost` struct and `CpuCostModel` interface in
    `xla/service/cpu/cpu_cost_model.h`.
-2. Implement `DefaultCpuCostModel` that wraps `HloCostAnalysis` and applies the
-   formulas above.
+2. Implement `DefaultCpuCostModel` with:
+   - The lazy `(opcode, dtype) → cost-per-element` table backed by TTI
+     queries (taking `TargetTransformInfo` from the existing
+     `TargetMachineFeatures` plumbing).
+   - Op-specific combinator formulas for dot/conv/reduce/etc.
+   - The additive `w_mem * bytes_accessed` term.
+   - The hardcoded fallback table for when TTI returns `Invalid`.
+   - The `parallel_fraction` tier classifier.
 3. Write unit tests with known-shape instructions and expected cost ranges.
+   Verify the table populates lazily and is bounded.
 4. Wire into `ParallelTaskAssignment` behind a flag, validate against existing
-   behavior.
+   behavior on benchmarks.
 5. Remove old `SimpleCostModel` / `DefaultCostModel` once validated.
-6. Migrate `IsExpensive` callsites in CPU fusion to use quantitative cost.
+6. Migrate `IsExpensive` callsites in `cpu_instruction_fusion.cc` to use
+   `WallClock(num_cores)` comparisons.
 
 ## Open questions
 
