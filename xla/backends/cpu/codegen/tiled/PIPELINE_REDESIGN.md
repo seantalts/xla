@@ -39,6 +39,10 @@ Pass 4 (`StablehloLowerToArithPass`, `xla/codegen/xtile/ir/transforms/lower_stab
 
 ## Why the allocations happen
 
+Allocations come from two interacting sources. Fixing the pipeline order only removes half of them directly; the other half stops firing as a side‑effect.
+
+### Source 1: `OneShotBufferize` on `linalg.generic` chains
+
 1. The xtile emitter (`xla/codegen/xtile/codegen/fusion_emitter.cc:1261`, via `EmitElementwise` at `xla/codegen/xtile/codegen/emitter_helpers.cc:364`) produces `stablehlo`/`arith`/`math` ops on *tile‑sized tensors* (e.g. `tensor<8x1024xf32>`).
 2. `StablehloLowerToArithPass` rewrites the `stablehlo` elementwise ops to `arith`/`math` on those same tensors.
 3. `ConvertElementwiseToLinalgPass` wraps each of those into a `linalg.generic` with a fresh `tensor.empty()` init operand.
@@ -46,7 +50,24 @@ Pass 4 (`StablehloLowerToArithPass`, `xla/codegen/xtile/ir/transforms/lower_stab
 5. `OneShotBufferize` then allocates a separate memref for every un‑fused `tensor.empty()` / `linalg.generic` result — one `memref.alloc` per intermediate tile.
 6. `LinalgElementwiseToVectorPass` finally rewrites each `linalg.generic` (now on memrefs) into an `scf.for` of `vector.transfer_read` → `arith.*` → `vector.transfer_write`. At this point the intermediate allocations are just a buffer ping‑pong that any downstream pass has to eliminate.
 
-There is no allocation coming from the tiling emitter itself. `xtile::ExtractTileOp::bufferize` in `xla/codegen/xtile/ir/xtile_bufferization.cc:246` only allocates for the edge‑tile (padded) case — which is legitimate. All the "ton of allocations" are from `OneShotBufferize` on `linalg.generic` tile chains.
+### Source 2: the `xtile` bufferization interface itself
+
+`ExtractTileOp` in `xla/codegen/xtile/ir/xtile_bufferization.cc` is conservative in several ways that all push `OneShotBufferize` toward inserting allocations:
+
+- `bufferizesToAllocation` returns `true` (`:221`) with the comment "we must be conservative." The analysis treats every `extract_tile` result as if it were a freshly‑allocated buffer.
+- `isWritable` returns `false` (`:241`). The tile tensor cannot be written through in place.
+- `bufferize` itself calls `memref::AllocOp::create` in two places:
+  - `:271`, the full‑tile path: whenever the subview has a non‑identity layout, it allocates a default‑layout memref and copies into it (there's a `TODO(willfroom)` to remove this).
+  - `:196`, `GetPaddedTileBuffer`, the edge‑tile path: allocates a padded buffer and copies the clamped subview in. This one is legitimate and unavoidable.
+- `InsertTileOp::bufferizesToAllocation` is also `true` (`:307`), with the same conservative comment.
+
+The `isWritable = false` + `bufferizesToAllocation = true` combination is what makes the current pipeline especially bad. `linalg.generic` with a `tensor.empty()` init operand is precisely the shape of op that writes *through* its output tensor — and the init in practice aliases or needs to be proven disjoint from the extract_tile result that feeds the chain. The analysis can't prove in‑place reuse against a not‑writable conservative allocation, so it inserts a fresh `memref.alloc` plus a copy at each boundary. Combined with source 1, every un‑fused `linalg.generic` in a tile chain ends up with its own `memref.alloc`, regardless of whether the chain could logically reuse one buffer.
+
+### Why the redesign still helps
+
+In vector‑SSA form, none of the chain in the middle is a tensor. The only tensors `OneShotBufferize` sees at the boundary are `xtile.extract_tile → vector.transfer_read` (which folds to a memref‑level transfer read of the subview) and `vector.transfer_write → xtile.insert_tile` (which folds to a memref transfer write into the destination subview). Nothing in the chain is writing *through* the extract_tile tensor, so `isWritable = false` and `bufferizesToAllocation = true` stop causing problems in practice even though the interface stays conservative.
+
+The non‑identity‑layout alloc at `:271` still fires when it has to, but it's rare and out of scope for this redesign — it's a separate `TODO(willfroom)` already noted in the source. The padded edge‑tile alloc at `:196` stays and is correct.
 
 ## GPU loop pipeline (reference)
 
@@ -145,6 +166,7 @@ After step 5 the pipeline no longer depends on `linalg` for tiled fusion. `linal
 - **Multi‑use tensors**: the current `FuseElementwisePass` bails on multi‑use. The new path handles multi‑use trivially because a shared vector SSA value just has multiple consumers — CSE and canonicalization keep it as a single value. Verify this with a fusion test that has a diamond.
 - **Dynamic shapes / runtime‑sized tiles**: decide whether to handle or punt. Current tilings are always static (`IsVectorizable` in `linalg_elementwise_to_vector_pass.cc:63` rejects dynamic), so punting is fine initially.
 - **Sub‑byte types**: `CreateUnpackSubByteVectorWritePass` runs in `AddTiledLoweringPasses`. `IsSupportedTilingType` in `tiled_fusion_emitter.cc:149` already excludes `<8`‑bit types, so this should be a no‑op for the tiled path. Double‑check.
+- **1‑D vector requirement of `LowerXlaIntrinsicLibPass`**: every pattern in `xla/codegen/emitters/transforms/lower_xla_intrinsic_lib.cc` bails on vectors of rank != 1 (`:94`, `:188`, `:221`) and emits a "Missed XLA intrinsic lowering as vector rank != 1" warning. Today this works out because `LinalgElementwiseToVectorPass` tiles the minor dim to `kMaxVectorDim = 8` and leaves only 1‑D vectors inside the generated `scf.for`. `ElementwiseToVectorPass` as proposed preserves the tile shape (e.g. `vector<8x1024xf32>`), so we need a `vector` unrolling pass (thin wrapper around `mlir::vector::populateVectorUnrollPatterns` with native shape from `FusionCompiler::Options::vector_width`) inserted at the top of `AddTiledLoweringPasses`, before `AddGenericLoweringPasses` runs the intrinsic library lowering. `createConvertVectorToSCFPass` doesn't do this — it unrolls transfer ops but leaves `arith.addf : vector<8x1024xf32>` alone.
 
 ## Files touched
 
@@ -167,85 +189,3 @@ After step 5 the pipeline no longer depends on `linalg` for tiled fusion. `linal
 3. Generated LLVM IR for the benchmark fusions in `xla/backends/cpu/benchmarks` is the same or better (no extra memmoves, no extra allocas).
 4. The tiled pass manager no longer registers `LinalgDialect` (checked via a compile‑time grep or a test).
 
-## Integration with `cc_to_llvm_ir` and future tiled microkernel emitters
-
-### The existing story
-
-XLA has a mechanism to compile a C++ source file to LLVM IR bitcode at build time (`xla/codegen/intrinsic/cpp/cc_to_llvm_ir.bzl`, the `cc_ir_header` macro). The bitcode is embedded into the compiler as a string constant (e.g. `kTanhIr`, `kEigenUnaryIr`), and at JIT time it's spliced into the user's LLVM module so the implementations of the intrinsics can be inlined by LLVM itself. The C++ sources use clang `ext_vector_type` attributes (`Vec4f`, `Vec8f`, `Vec16f` in `xla/codegen/intrinsic/cpp/vector_ops.h:31`) that map 1‑to‑1 onto LLVM's `<N x float>` types, which in turn is what MLIR's `vector` dialect lowers to.
-
-The pattern‑matching side lives in `xla/codegen/emitters/transforms/lower_xla_intrinsic_lib.cc`. `LowerXlaIntrinsicLibPass` walks `math.exp`, `math.erf`, `math.tanh`, `math.log1p`, `math.rsqrt`, and `arith.truncf` f32→bf16, and replaces each one with a `func.call` to the corresponding intrinsic function. It runs inside `AddGenericLoweringPasses` (`fusion_compiler.cc:237`), which is invoked at the end of both the scalar and tiled lowering pipelines.
-
-### The constraint that matters for this redesign
-
-**Every pattern in `LowerXlaIntrinsicLibPass` bails out on vectors of rank != 1** — see `lower_xla_intrinsic_lib.cc:94`, `:188`, `:221`. The patterns explicitly check:
-
-```cpp
-if (maybe_vector_type && maybe_vector_type.getRank() != 1) {
-  return rewriter.notifyMatchFailure(op, "Vector rank is not 1.");
-}
-```
-
-They even emit a warning — "Missed XLA intrinsic lowering as vector rank != 1" — because a multi‑dim vector `math.exp` will silently miss the embedded C++ lowering and fall through to whatever `createConvertMathToLLVMPass` or `createConvertMathToLibmPass` does instead (`fusion_compiler.cc:238`). That means today, if you write `math.exp : vector<8x1024xf32>` and hand it to `AddGenericLoweringPasses`, you'll get a libm call or an LLVM intrinsic with polynomial expansion — not the tuned Eigen‑based Vec8f path.
-
-In the current pipeline this accidentally works out: `LinalgElementwiseToVectorPass` tiles along the minor dim to `kMaxVectorDim = 8` (`linalg_elementwise_to_vector_pass.cc:58`), wraps the tile in an `scf.for` nest, and the inner body has only 1‑D vectors of the register width. By the time `LowerXlaIntrinsicLibPass` sees the IR, every `math.*` op is already `vector<8xf32>` (or similar). The linalg detour was quietly doing the vector unrolling that the intrinsic library depends on.
-
-The new `ElementwiseToVectorPass` proposed above does not do any tiling — it preserves the xtile tile shape (e.g. `tensor<8x1024xf32>` → `vector<8x1024xf32>`). If we wire it in without further changes, we'll lose the intrinsic library coverage for every multi‑dim fusion.
-
-### The fix
-
-Insert a vector unrolling pass between the new tiled optimization phase and the generic lowering phase, so that all elementwise `vector` ops are decomposed to 1‑D vectors of native register width before `LowerXlaIntrinsicLibPass` runs. MLIR already provides the machinery: `mlir::vector::populateVectorUnrollPatterns` with `UnrollVectorOptions().setNativeShape(...)` unrolls `arith.*`, `math.*`, `vector.transfer_read/write`, and friends to a given target shape.
-
-Concrete placement in `AddTiledLoweringPasses` (`fusion_compiler.cc:384`):
-
-```cpp
-static void AddTiledLoweringPasses(mlir::OpPassManager& pm, bool fast_min_max) {
-  pm.addPass(CreateVectorUnrollPass(/*native_vector_width=*/ ... ));   // NEW
-  pm.addPass(CreateVectorToScalarPass());
-  pm.addPass(cpu::CreateMemrefCopyToLoopsPass());
-  pm.addPass(cpu::createLowerToLLVMPass());
-  pm.addPass(mlir::createConvertVectorToSCFPass(...));
-  ...
-}
-```
-
-The new pass can be a thin wrapper around `populateVectorUnrollPatterns` — roughly 30 lines, mirroring the existing `VectorToScalarPass` file layout. The native shape comes from `FusionCompiler::Options::vector_width`, which is already plumbed in (`fusion_compiler.cc:299`).
-
-Note that `createConvertVectorToSCFPass` does *not* do this work for us. It unrolls multi‑dim `vector.transfer_read`/`transfer_write` ops into loops that read 1‑D slices, but it leaves the elementwise `arith.addf : vector<8x1024xf32>` alone (it stitches the 1‑D reads back into a multi‑dim SSA value via `vector.insert_strided_slice`). That's why the new unroll pass has to precede it.
-
-### Microkernel emitters in the new pipeline
-
-With `cc_to_llvm_ir` the pattern for a new tiled microkernel — say a hand‑tuned 16×16 f32 matmul, or a vectorized transpose, or a fused gelu — is:
-
-1. Write the C++ implementation against `Vec<N><T>` types in `xla/codegen/intrinsic/cpp/<name>.cc`.
-2. Add a `cc_ir_header` BUILD rule that compiles it to embeddable LLVM IR.
-3. Add a C++ class under `xla/codegen/intrinsic/` that knows the function signature and holds the embedded IR.
-4. Add a new `mlir::OpRewritePattern` in `LowerXlaIntrinsicLibPass` (or a sibling pass) that matches the specific vector op shape and replaces it with `func.call @<intrinsic_name>`.
-
-The vectorize‑first pipeline makes step 4 substantially simpler. Today the same work would need to pattern‑match:
-
-| Phase | What the IR looks like for a 16×16 matmul tile |
-|---|---|
-| After `ShloToVectorPass` | `vector.contract` with inputs produced by `vector.transfer_read` on tensors |
-| After `StablehloLegalizeToLinalg` + `ConvertElementwiseToLinalg` | `linalg.matmul` / `linalg.generic` with tensor operands |
-| After `OneShotBufferize` | `linalg.matmul` on memrefs + surrounding allocs |
-| After `LinalgElementwiseToVector` | `scf.for` nest with 1‑D `vector.transfer_read` + `vector.contract` of a smaller shape |
-
-Depending on when you run your microkernel pattern, the input IR has radically different structure. In the new pipeline it's always the same: a small number of `vector.*` and `arith.*`/`math.*` ops on tile‑shaped vectors, surrounded by `xtile.extract_tile`/`xtile.insert_tile` at the boundary. Pattern‑matching `vector.contract : vector<16x16xf32>` is trivial and doesn't care about bufferization state.
-
-There are two places a microkernel lowering could plug in:
-
-1. **Before unrolling (tile‑shape level)** — match `vector.contract` of the full tile shape (e.g. 16×16). This is where a tiled matmul microkernel belongs: the C++ implementation consumes entire tiles and the pattern fires before any sub‑tile unrolling. Requires the microkernel function signature to accept wide vectors (e.g. `Vec256f` for 16×16 f32, or a pair of vector pointers).
-2. **After unrolling (register‑width level)** — match `math.exp : vector<8xf32>` etc. This is where the *existing* intrinsic library plugs in. Unchanged by this redesign, except that it now runs after our new unrolling pass instead of after the linalg pipeline.
-
-If (1) fires, its output is either a `func.call` returning a wide vector (which the unrolling pass then leaves alone — unrolling elementwise ops doesn't unroll opaque calls) or a `func.call` returning a memref which reintroduces bufferization state. The first option is cleaner and fits naturally into the vector SSA flow.
-
-### What to change (and what not to)
-
-- **No changes to `cc_to_llvm_ir.bzl`**, the `cc_ir_header` macro, the embedding machinery, or any existing `.cc` intrinsic source. They're orthogonal.
-- **No changes to the existing 1‑D intrinsic patterns** in `lower_xla_intrinsic_lib.cc`. They continue to run unchanged in `AddGenericLoweringPasses`.
-- **Add** a `VectorUnrollPass` at the top of `AddTiledLoweringPasses`, parameterized by the native vector width from `FusionCompiler::Options`.
-- **Optionally add** (future work, not blocking this redesign): a tile‑shape microkernel lowering pass that runs after `ElementwiseToVectorPass`/`ShloToVectorPass` in `AddTiledOptimizationPasses`. This is where future 16×16 matmul or transpose microkernels written with `cc_to_llvm_ir` would be pattern‑matched. For the first landing of this redesign, leave this out — it's not needed to achieve the allocation‑elimination goal.
-
-### Summary
-
-The integration story is: **the redesign doesn't break the existing `cc_to_llvm_ir` intrinsic library as long as we add a vector unrolling pass between the tiled optimization phase and the generic lowering phase.** Beyond that, the vectorize‑first IR is a strictly better substrate for future tiled microkernel emitters because every potential insertion point sees the same flat vector/SSA structure instead of different dialect mixtures depending on pipeline stage.
