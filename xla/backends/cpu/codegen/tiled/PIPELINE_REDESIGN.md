@@ -148,31 +148,40 @@ For an elementwise chain of length N that the current pipeline bufferizes to N `
 
 **N allocs → 1 alloc, mechanically, for any chain shape.** That's the main win.
 
-### The remaining 1 alloc (depends on `SubsetInsertionOpInterface`)
+### The remaining 1 alloc (eliminated by giving `InsertTileOp` `SubsetInsertionOpInterface`)
 
-Whether that last `tensor.empty()` itself bufferizes to an allocation depends on whether `createEmptyTensorEliminationPass` (`fusion_compiler.cc:314`) can trace the chain `%empty → vector.transfer_write → xtile.insert_tile → %arg1_subview` and redirect `%empty`'s storage onto the destination subview.
+Whether that last `tensor.empty()` itself bufferizes to an allocation depends on whether `createEmptyTensorEliminationPass` (`fusion_compiler.cc:314`) can trace backward from a `SubsetInsertionOpInterface` op through the SSA chain and find the empty. The algorithm lives at `mlir/lib/Dialect/Bufferization/Transforms/EmptyTensorElimination.cpp:128‑188`: walk every `SubsetInsertionOpInterface` in the op, take `getSourceOperand()`, then `findValueInReverseUseDefChain` backward with `followEquivalentOnly = true` until a `tensor::EmptyOp` is found, then call `buildSubsetExtraction()` on the insertion op to produce a view of the destination and rewrite the empty's use.
 
-Empty tensor elimination uses `SubsetOpInterface` / `SubsetInsertionOpInterface` to walk the chain:
+For our chain `%empty → vector.transfer_write → xtile.insert_tile → %dest`, the relevant facts (verified against the MLIR source):
 
-- `vector.transfer_write` **does** implement `SubsetOpInterface` via `mlir::vector::registerSubsetOpInterfaceExternalModels`, registered at `fusion_compiler.cc:630`. The pass can trace through it.
-- `xtile.insert_tile` **does not** implement `SubsetOpInterface`. It only implements `TiledBufferInterface` (defined in `xtile_ops.td:36`, which extends `BufferizableOpInterface`), declared at `xtile_ops.td:196`.
+- **`vector.transfer_write` is a `DestinationStyleOpInterface` op** (`mlir/include/mlir/Dialect/Vector/IR/VectorOps.td:1500`) and its bufferization uses `DstBufferizableOpInterfaceExternalModel` (`mlir/lib/Dialect/Vector/Transforms/BufferizableOpInterfaceImpl.cpp:74`). That base class returns `{result, BufferRelation::Equivalent}` from `getAliasingValues` when queried about the DPS init operand (`mlir/include/mlir/Dialect/Bufferization/IR/DstBufferizableOpInterfaceImpl.h:39‑46`), so walking *backward* from the result via `defaultGetAliasingOpOperands` (`mlir/lib/Dialect/Bufferization/IR/BufferizableOpInterface.cpp:946`) produces `{dest_operand, Equivalent}`. The reverse use‑def walk with `followEquivalentOnly = true` therefore steps cleanly from the transfer_write result to its destination tensor operand.
+- **`vector.transfer_write` is also registered as a `SubsetInsertionOpInterface`** via `vector::registerSubsetOpInterfaceExternalModels` (`mlir/lib/Dialect/Vector/Transforms/SubsetOpInterfaceImpl.cpp:44‑66`, registered at `fusion_compiler.cc:630`), but its `buildSubsetExtraction` is a `TODO: Implement when needed` that returns `Value()`. Using `vector.transfer_write` directly as the elimination anchor therefore does nothing (`EmptyTensorElimination.cpp:168` skips on null replacement). That's fine for our case — we don't need it to be the anchor, only the pass-through step.
+- **`xtile.insert_tile` does not implement `SubsetInsertionOpInterface`.** It only implements `TiledBufferInterface` (`xtile_ops.td:36,196`), which extends `BufferizableOpInterface`. Empty tensor elimination never visits it, so the chain is not anchored anywhere for our final empty.
 
-So with the current `xtile` dialect, the trace walks `%empty → transfer_write` and then stops at `insert_tile` because there's no interface telling the pass that `insert_tile`'s source operand is a subset insertion into the destination. The `tensor.empty()` is not eliminated. `OneShotBufferize` allocates a fresh memref for it; `vector.transfer_write` writes into that memref; `InsertTileOp::bufferize` (`xtile_bufferization.cc:344`) emits a `bufferization.materialize_in_destination` which lowers to a `memref.copy` from the fresh alloc into the destination subview.
-
-End result: **one tile‑sized alloc + one tile‑sized copy per fusion.** `PromoteBuffersToStackPass` (`fusion_compiler.cc:334`, 4 KB cap) turns the alloc into an `alloca` for most tile sizes, and `BufferHoisting` (`:319`) hoists it out of any enclosing loop. But it's still a scratch buffer and a copy that shouldn't be there.
+With the dialect as it stands, `OneShotBufferize` allocates a fresh memref for the surviving `tensor.empty`, `vector.transfer_write` writes into that memref, and `InsertTileOp::bufferize` (`xtile_bufferization.cc:344`) emits a `bufferization::MaterializeInDestinationOp` that lowers (at `mlir/lib/Dialect/Bufferization/IR/BufferizationOps.cpp:604‑607`) to a `memref.copy` from the fresh alloc into the destination subview. `PromoteBuffersToStackPass` (`fusion_compiler.cc:334`, 4 KB cap) turns the alloc into an `alloca` for most tile sizes and `BufferHoisting` (`:319`) hoists it out of enclosing loops, but it's still a scratch buffer and a tile‑sized copy per fusion.
 
 ### Getting to zero: teach `InsertTileOp` `SubsetInsertionOpInterface`
 
-This is a small, localized change entirely separate from the pipeline redesign itself. Add `SubsetInsertionOpInterface` to the trait list at `xtile_ops.td:196` and implement its four methods in `xtile_bufferization.cc`:
+Add `SubsetInsertionOpInterface` to `xtile_ops.td:196` and implement its methods in `xtile_bufferization.cc`. The implementation is a direct copy of `InsertSliceLikeOpSubsetInsertionOpInterface` in `mlir/lib/Dialect/Tensor/Transforms/SubsetInsertionOpInterfaceImpl.cpp:47‑83`:
 
 - `getSourceOperand` → `getSourceMutable()`
 - `getDestinationOperand` → `getDestinationMutable()`
-- `buildSubsetExtraction(builder, loc)` → build a `tensor.extract_slice` (or equivalent) of the destination at the insert_tile's offsets/sizes/strides
-- `isEquivalentSubset(candidate)` → compare offsets/sizes/strides against another subset op
+- `buildSubsetExtraction(builder, loc)` → `tensor::ExtractSliceOp::create(builder, loc, sourceType, getDestination(), getMixedOffsets(), getMixedSizes(), getMixedStrides())`
+- `getValuesNeededToBuildSubsetExtraction` → the dynamic offsets, sizes, strides, plus the destination value
 
-With that interface in place, empty tensor elimination walks `%empty → transfer_write → insert_tile → %arg1_subview`, replaces `%empty` with a `tensor.extract_slice` of the destination, the transfer_write writes directly into that slice, and the subsequent `insert_tile` becomes a no‑op (or is folded away by canonicalization).
+With that interface in place, empty tensor elimination runs its walk, visits `xtile.insert_tile`, gets `%out` as the source operand, `findValueInReverseUseDefChain` follows the `Equivalent` edge from `%out` through `vector.transfer_write` to `%empty`, finds the `tensor::EmptyOp`, and rewrites the empty's use at the transfer_write's destination operand to a `tensor.extract_slice` of `%dest` at the insert_tile's offsets. After canonicalization the IR becomes:
 
-**N→1→0, composed from two orthogonal changes: the pipeline redesign gets us from N to 1, and the interface implementation gets us from 1 to 0.** The two changes can land independently; the redesign is the high‑value part and doesn't depend on the interface work. The interface work is useful on its own (it would also fix the same issue for any other pattern that writes into `insert_tile`).
+```mlir
+%slice = tensor.extract_slice %dest [off] [sz] [1] : ...
+%out   = vector.transfer_write %v, %slice[0,0] : ...
+xtile.insert_tile %out into %dest [off] [sz] [1]
+```
+
+`OneShotBufferize` now bufferizes `%slice` to a memref subview of `%dest` (no alloc), `vector.transfer_write` writes in place into the subview (no alloc), and the chain has zero scratch allocations in the middle.
+
+**One remaining subtlety**: `InsertTileOp::bufferize` still emits a `MaterializeInDestinationOp` whose source and target now both resolve to the same subview of `%dest`. `MaterializeInDestinationOp::bufferize` (`BufferizationOps.cpp:588‑612`) unconditionally calls `options.createMemCpy(rewriter, loc, srcBuffer, buffer)` — there's no `srcBuffer == buffer` short‑circuit. The resulting `memref.copy` with identical source and destination is a semantic no‑op and LLVM should fold it, but there's no MLIR‑level canonicalization that guarantees removal. Cleanest fix: have `InsertTileOp::bufferize` detect the in‑place case (the source's bufferized value is already the destination subview) and skip emitting the materialize entirely, which is a small conditional added to the existing `scf.if` branches at `xtile_bufferization.cc:339‑359`. Worth doing as part of step 8 but not strictly blocking — an unneeded `memref.copy` is not the same as a `memref.alloc`.
+
+**N→1→0, composed from two orthogonal changes: the pipeline redesign gets us from N to 1, and the `SubsetInsertionOpInterface` implementation gets us from 1 to 0.** The two changes can land independently; the redesign is the high‑value part and doesn't depend on the interface work. The interface work is useful on its own — any other future lowering that writes into `insert_tile` also benefits.
 
 The only allocations that remain after both changes are the legitimate ones: padded edge tiles in the `else` branch of `ExtractTileOp::bufferize` (`xtile_bufferization.cc:196`), non‑identity‑layout copies in the `then` branch (`:271`, already a `TODO(willfroom)`), and whatever the multi‑reduction lowering emits via `vectorized_reduce_emitter.cc:222` directly.
 
