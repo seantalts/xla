@@ -133,17 +133,48 @@ After the new pass, the IR at the boundary of `AddBufferizationPasses` looks lik
 %v1 = arith.addf %v0, %v0 : vector<8x1024xf32>
 %v2 = math.exp %v1 : vector<8x1024xf32>
 %v3 = arith.mulf %v2, %v0 : vector<8x1024xf32>
+%empty = tensor.empty() : tensor<8x1024xf32>
 %out = vector.transfer_write %v3, %empty[0,0] : vector<8x1024xf32>, tensor<8x1024xf32>
 xtile.insert_tile %out into %arg1 [...] : tensor<8x1024xf32>
 ```
 
-`OneShotBufferize` now sees:
-- `xtile.extract_tile` → bufferizes to a memref subview (with edge‑case padded alloc — unchanged).
-- `vector.transfer_read` of the resulting tensor → folds through `bufferization::ToTensorOp` to read directly from the memref (MLIR handles this).
-- The `arith`/`math`/`vector` chain in the middle → no tensors, nothing to bufferize, zero allocations.
-- `vector.transfer_write` + `xtile.insert_tile` → bufferizes to a `transfer_write` directly into the output memref subview.
+The middle of the chain — `%v0 → %v1 → %v2 → %v3` — is pure SSA vectors with no tensors. `OneShotBufferize` has literally nothing to bufferize for it, because none of its operands or results are tensors. That part is unambiguous.
 
-The only allocations left are the legitimate ones: padded edge tiles and whatever the multi‑reduction lowering needs.
+The `vector.transfer_read %tile` on the extract_tile result folds through `bufferization.to_tensor` to a direct memref‑level transfer read of the subview during bufferization. `vector.transfer_read` implements `BufferizableOpInterface` in upstream MLIR and doesn't need a tensor copy.
+
+### The N→1 claim (definite)
+
+For an elementwise chain of length N that the current pipeline bufferizes to N `memref.alloc`s (one per un‑fused `linalg.generic` with its own `tensor.empty()` init), the new pipeline produces exactly one remaining `tensor.empty()` — the one `WriteVectorToTensor` (`lowering_utils.cc:66`) creates at the very end of the chain, to hold the final vector before it hits `xtile.insert_tile`. Everything in between is vectors. This is true regardless of fusion shape: diamonds, multi‑use values, and non‑elementwise ops in the middle of the chain stop breaking things, because the SSA vector form has none of the tensor aliasing issues that `FuseElementwisePass` bails on.
+
+**N allocs → 1 alloc, mechanically, for any chain shape.** That's the main win.
+
+### The remaining 1 alloc (depends on `SubsetInsertionOpInterface`)
+
+Whether that last `tensor.empty()` itself bufferizes to an allocation depends on whether `createEmptyTensorEliminationPass` (`fusion_compiler.cc:314`) can trace the chain `%empty → vector.transfer_write → xtile.insert_tile → %arg1_subview` and redirect `%empty`'s storage onto the destination subview.
+
+Empty tensor elimination uses `SubsetOpInterface` / `SubsetInsertionOpInterface` to walk the chain:
+
+- `vector.transfer_write` **does** implement `SubsetOpInterface` via `mlir::vector::registerSubsetOpInterfaceExternalModels`, registered at `fusion_compiler.cc:630`. The pass can trace through it.
+- `xtile.insert_tile` **does not** implement `SubsetOpInterface`. It only implements `TiledBufferInterface` (defined in `xtile_ops.td:36`, which extends `BufferizableOpInterface`), declared at `xtile_ops.td:196`.
+
+So with the current `xtile` dialect, the trace walks `%empty → transfer_write` and then stops at `insert_tile` because there's no interface telling the pass that `insert_tile`'s source operand is a subset insertion into the destination. The `tensor.empty()` is not eliminated. `OneShotBufferize` allocates a fresh memref for it; `vector.transfer_write` writes into that memref; `InsertTileOp::bufferize` (`xtile_bufferization.cc:344`) emits a `bufferization.materialize_in_destination` which lowers to a `memref.copy` from the fresh alloc into the destination subview.
+
+End result: **one tile‑sized alloc + one tile‑sized copy per fusion.** `PromoteBuffersToStackPass` (`fusion_compiler.cc:334`, 4 KB cap) turns the alloc into an `alloca` for most tile sizes, and `BufferHoisting` (`:319`) hoists it out of any enclosing loop. But it's still a scratch buffer and a copy that shouldn't be there.
+
+### Getting to zero: teach `InsertTileOp` `SubsetInsertionOpInterface`
+
+This is a small, localized change entirely separate from the pipeline redesign itself. Add `SubsetInsertionOpInterface` to the trait list at `xtile_ops.td:196` and implement its four methods in `xtile_bufferization.cc`:
+
+- `getSourceOperand` → `getSourceMutable()`
+- `getDestinationOperand` → `getDestinationMutable()`
+- `buildSubsetExtraction(builder, loc)` → build a `tensor.extract_slice` (or equivalent) of the destination at the insert_tile's offsets/sizes/strides
+- `isEquivalentSubset(candidate)` → compare offsets/sizes/strides against another subset op
+
+With that interface in place, empty tensor elimination walks `%empty → transfer_write → insert_tile → %arg1_subview`, replaces `%empty` with a `tensor.extract_slice` of the destination, the transfer_write writes directly into that slice, and the subsequent `insert_tile` becomes a no‑op (or is folded away by canonicalization).
+
+**N→1→0, composed from two orthogonal changes: the pipeline redesign gets us from N to 1, and the interface implementation gets us from 1 to 0.** The two changes can land independently; the redesign is the high‑value part and doesn't depend on the interface work. The interface work is useful on its own (it would also fix the same issue for any other pattern that writes into `insert_tile`).
+
+The only allocations that remain after both changes are the legitimate ones: padded edge tiles in the `else` branch of `ExtractTileOp::bufferize` (`xtile_bufferization.cc:196`), non‑identity‑layout copies in the `then` branch (`:271`, already a `TODO(willfroom)`), and whatever the multi‑reduction lowering emits via `vectorized_reduce_emitter.cc:222` directly.
 
 ## Migration strategy
 
@@ -156,6 +187,7 @@ Do it in steps, each landable on its own:
 5. **Delete the linalg passes**: `StablehloLegalizeToLinalgPass`, `ConvertElementwiseToLinalgPass`, `FuseElementwisePass`, `LinalgElementwiseToVectorPass`. Also delete `FuseElementwisePass` and `LinalgElementwiseToVectorPass` source files and their tests, and drop the `mlir::linalg::registerBufferizableOpInterfaceExternalModels` registration and linalg‑related includes from `fusion_compiler.cc`. Measure allocation count reduction.
 6. **Move `AddBufferizationPasses`** as late as possible (it's already last in the new layout). Confirm no intermediate allocations.
 7. **Drop `TensorOpsToBufferizablePass`** if the `tensor.bitcast → arith.bitcast` rewrite it does is no longer needed once bitcasts arrive in vector form (it's likely already fine because `LowerBroadcastInDim` and friends don't produce `tensor.bitcast`, but verify).
+8. **Teach `InsertTileOp` `SubsetInsertionOpInterface`** so that the final `tensor.empty()` at the end of each vectorized chain gets eliminated by `createEmptyTensorEliminationPass`. This is the 1→0 step and is entirely orthogonal to the pipeline redesign — it can land before, during, or after the other steps. Implementation goes in `xla/codegen/xtile/ir/xtile_ops.td:196` (add the trait) and `xla/codegen/xtile/ir/xtile_bufferization.cc` (the four interface methods: `getSourceOperand`, `getDestinationOperand`, `buildSubsetExtraction`, `isEquivalentSubset`).
 
 After step 5 the pipeline no longer depends on `linalg` for tiled fusion. `linalg.h`/`Linalg.h` includes and the `LinalgDialect` registration in `CreateDialectRegistry` (`fusion_compiler.cc:611`) can be removed, reducing build time and the number of dialects the tiled context has to load.
 
@@ -181,10 +213,12 @@ After step 5 the pipeline no longer depends on `linalg` for tiled fusion. `linal
 | **Edit** | `xla/backends/cpu/codegen/fusion_compiler.cc` — drop linalg includes and dialect registration |
 | **Delete** | `xla/backends/cpu/codegen/tiled/transforms/fuse_elementwise_pass.cc` + test |
 | **Delete** | `xla/backends/cpu/codegen/tiled/transforms/linalg_elementwise_to_vector_pass.cc` + test |
+| **Edit** | `xla/codegen/xtile/ir/xtile_ops.td:196` — add `SubsetInsertionOpInterface` to `InsertTileOp` (step 8) |
+| **Edit** | `xla/codegen/xtile/ir/xtile_bufferization.cc` — implement the four `SubsetInsertionOpInterface` methods (step 8) |
 
 ## Success criteria
 
-1. A lit test that exercises a chain of ≥ 3 elementwise ops on a single tile produces zero `memref.alloc` / `memref.alloca` in the final MLIR output (outside of the edge‑tile path).
+1. A lit test that exercises a chain of ≥ 3 elementwise ops on a single tile produces at most one `memref.alloc` / `memref.alloca` in the final MLIR output after step 5, and zero after step 8 (outside of the edge‑tile path).
 2. `FusionCompiler::Compile` end‑to‑end tests for the tiled emitter still pass.
 3. Generated LLVM IR for the benchmark fusions in `xla/backends/cpu/benchmarks` is the same or better (no extra memmoves, no extra allocas).
 4. The tiled pass manager no longer registers `LinalgDialect` (checked via a compile‑time grep or a test).
