@@ -809,7 +809,122 @@ No changes to thunk types, executor, or runtime-side structures.
 
 ### 7.1 Example 1: 35-joint mass-matrix (pure forward)
 
+**Source:** `mock_mass_matrix(q)` from the linked JAX issue (35 joints,
+float64). After JAX tracing and the upstream XLA optimization passes,
+the entry computation contains roughly:
+
+- 35 iterations of: `cos`, `sin`, two `dynamic-update-slice`s, a small
+  3x3 `dot` (rotation composition), a small 4x4 `dot` (homogeneous
+  transform). (≈ 35 * ~10 = 350 small ops, all codegen-path.)
+- 35 iterations of inertia construction: skew-symmetric builds,
+  element-wise arithmetic, a few 3x3 `dot`s. (≈ 200 small ops.)
+- `block`ing reshapes/concatenates to build `Rs (35x6x6)`.
+- Two batched `einsum`s (`Ic = Rs @ I @ Rs.T`) — each is a batched
+  3x3 `dot` pattern, 35 batches, so 35 small dots (6x6 @ 6x6). Each
+  dot is ~2 * 6 * 6 * 6 ≈ 0.4 kflops.
+- A final `einsum` over mask × Ic → `composite_inertias`: a 35x35
+  mask × 35x6x6 tensor product. The largest single dot is roughly
+  35x35 @ 35x36 = ~90 kflops.
+- `M_part`, `M`, `M_lower`, symmetric completion — dozens more small ops.
+
+**Total estimated kflops** for the entire entry computation:
+well under 1,000 kflops (every individual op is small; the aggregate
+is dominated by the final `einsum`s, each a few tens of kflops).
+
+**Post-existing-fusion-pass shape.** `CpuInstructionFusion` +
+`FusionWrapper` collapse most of the per-iteration arithmetic into
+singleton or small multi-op `kFusion`s. We estimate ~300 kFusions,
+zero barriers (no while, no collective, no library dots — the small
+dots are below any library-rewrite threshold), and zero custom-calls.
+
+**MegaFusionPass walk (threshold = 50 kflops).**
+
+```
+region = []; total = 0.0
+i=0:   kFusion {cos,sin,DUS,DUS}   cost ~0.01 kflops   → push
+...
+i=N:   kFusion {small 6x6 dot}     cost ~0.0004 kflops → push
+...
+at some point total >= 50 → Close region (say, at i=K₁, ~80 fusions)
+region = []; total = 0.0; resume
+...
+end of walk → Close final region
+```
+
+**Expected outcome.** 3–6 mega-fusions covering the entire entry
+computation (exact count depends on where the 50 kflops boundary
+falls among ~1,000 total kflops). Each becomes one `KernelThunk`. No
+other thunks (no control flow, no collectives). **Thunk count drops
+from ~300 → ~5.**
+
+**Speedup mechanism.** Each eliminated thunk saves ~1–5 µs of dispatch
++ buffer-resolution overhead. 295 fewer thunks × ~2 µs ≈ 590 µs
+saved. Baseline is hundreds of µs/call; target is tens of µs/call.
+Well above the ≥2× bar.
+
+**Fallback check.** If the cost model under-estimates aggregate work
+and the threshold is tuned low (e.g., 10 kflops), regions become
+smaller and we get more mega-fusions — still a big win. If tuned
+high (e.g., 5,000 kflops), we get 1 mega-fusion for the whole
+program — also a big win. The example is robust to threshold tuning
+within a wide range; it only fails to benefit if the threshold is
+essentially 0 (disabled) or if a key op slips out of the
+fusion-emitter allow-list.
+
 ### 7.2 Example 2: Cholesky-like scan (while body)
+
+**Source:** `lax.scan(body, init, (d,p,q,a))` with N=2000 iterations
+and M=3, float64. `lax.scan` lowers to a `while` instruction whose
+body is:
+
+```
+body(carry, data):  # carry=fp (3x3), data=(dk, pk, qk, ak)
+  t0 = pk @ fp                              # 1x3 · 3x3 → 1x3   (dot)
+  t1 = t0 @ pk                              # 1x3 · 3   → scalar(dot/reduce)
+  ck = sqrt(dk - t1)                        # scalar elementwise
+  tmp = fp @ ak.T                           # 3x3 · 3x3 → 3x3   (dot)
+  w_num = qk - pk @ tmp                     # 1x3 elementwise
+  wk = w_num / ck                           # 1x3 elementwise
+  carry' = ak @ tmp + outer(wk, wk)         # 3x3 · 3x3 + 3x3   (dot + add)
+  return carry', (ck, wk)
+```
+
+**Post-existing-fusion-pass shape of the while body.** A handful of
+kFusion instructions: the three small 3x3 `dot`s (each ~0.054 kflops),
+and several elementwise/reduction kFusions around them. No
+collectives, no library dots (all dots are tiny). The while body is
+its own `HloComputation` reachable from `MakeNonfusionComputations`.
+
+**MegaFusionPass walk of the while body (threshold = 50 kflops).**
+
+Total work per iteration is well under 1 kflop. The entire while
+body fuses into **one** mega-kFusion.
+
+**Walk of the entry computation (caller of while).** The entry
+computation contains the `while` instruction itself. `IsBarrier`
+returns true for `kWhile`, so the while stays as-is and surrounding
+absorbable ops (`scan` prologue and epilogue reshapes) mega-fuse
+separately on either side. Typical outcome: 1 small mega-fusion
+before the while, `WhileInstruction`, 1 small mega-fusion after.
+
+**Expected outcome.** The `WhileThunk` still drives 2,000 iterations,
+but each iteration invokes a **single** `KernelThunk` (the mega-fused
+body) instead of ~10 thunks. **Thunks per iteration: ~10 → 1.**
+
+**Speedup mechanism.** 2,000 iterations × 9 fewer thunks × ~2 µs =
+36 ms saved per scan call. Baseline median is tens-to-hundreds of
+µs per scan (exact number depends on post-regression state); target
+is ≥2× improvement. This is achievable from the dispatch reduction
+alone, without any arithmetic-level changes.
+
+**Edge case: small_while_loop_hoisting.** XLA:CPU already has a
+`SmallWhileLoopHoistingPass` (`small_while_loop_hoisting_pass.cc`)
+that unrolls very small while loops at compile time. If the scan
+body is small enough to hoist, the hoisted form becomes a large
+straight-line entry computation and Example 2 collapses into an
+Example 1 shape. `MegaFusionPass` handles both cases symmetrically:
+whatever the hoister produces, the pass mega-fuses. No special
+casing.
 
 ## 8. File-by-File Change List
 
