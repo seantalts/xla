@@ -223,11 +223,207 @@ Executable
 
 ### 4.1 CPU Cost Model (kflops + parallelism)
 
+**New file:** `xla/service/cpu/cpu_cost_model.{h,cc}`
+
+**Purpose:** supply `MegaFusionPass` with a cheap, deterministic per-op
+estimate of (work, parallelism). Not a general-purpose cost model — just
+enough signal to gate absorption.
+
+**Public API:**
+
+```c++
+namespace xla::cpu {
+
+struct OpCost {
+  // Estimated floating-point (or equivalent integer) work, in kflops.
+  // 0 for bitcast-like ops (reshape, transpose that is a layout no-op,
+  // broadcast that lowers to a stride change).
+  double kflops = 0.0;
+
+  // Rough count of independent output work items. Higher => op benefits
+  // more from multi-threaded execution. For elementwise ops this is the
+  // output element count; for reductions it's the *output* (not input)
+  // count; for dots it's the output element count (M*K for MxN @ NxK).
+  int64_t parallelism_score = 0;
+};
+
+class CpuCostModel {
+ public:
+  // v1: stateless. Future versions may hold HloCostAnalysis or
+  // TargetMachineFeatures.
+  CpuCostModel() = default;
+
+  // Returns OpCost for a single HLO instruction. Never fails; returns
+  // a conservative {0 kflops, INT64_MAX parallelism} for instructions
+  // the model doesn't know how to estimate (so they stay *out* of
+  // mega-fusions by default — see §5.3).
+  OpCost Estimate(const HloInstruction* instr) const;
+
+  // Convenience: true iff `instr` is considered "highly parallelizable"
+  // for the purpose of absorption decisions.
+  bool IsParallelWin(const HloInstruction* instr) const;
+
+ private:
+  // Threshold above which parallelism_score counts as a "parallel win".
+  // v1 constant; later may become target-aware.
+  static constexpr int64_t kParallelWinThreshold = 4096;
+};
+
+}  // namespace xla::cpu
+```
+
+**Estimation rules (v1):**
+
+| HLO opcode                                | kflops formula                | parallelism_score |
+|-------------------------------------------|-------------------------------|-------------------|
+| elementwise unary / binary / ternary      | `out_elems * 1 / 1000`        | `out_elems`       |
+| `dot` (contraction `K`, output `M*N`)     | `2 * M * N * K / 1000`        | `M * N`           |
+| `reduce` (input `IE`, output `OE`)        | `IE / 1000`                   | `OE`              |
+| `convolution`                             | (reuse `HloCostAnalysis`)     | output_elems      |
+| `broadcast`, `reshape`, `transpose`, `bitcast` | `0`                      | `out_elems`       |
+| `dynamic-slice`, `dynamic-update-slice`   | `out_elems / 1000`            | `out_elems`       |
+| `concatenate`, `pad`                      | `out_elems / 1000`            | `out_elems`       |
+| `iota`, `constant`                        | `0`                           | `out_elems`       |
+| `tuple`, `get-tuple-element`              | `0`                           | `INT64_MAX` (free)|
+| unknown opcode                            | `0` kflops, `INT64_MAX` score | (treated as "parallel win" ⇒ not absorbed) |
+
+Rationale for unknowns: returning `INT64_MAX` parallelism means
+`IsParallelWin` is `true`, and §5.3's absorption predicate rejects
+unknowns unless an explicit allow-list check passes. The effect is
+fail-safe: new opcodes don't accidentally get absorbed.
+
+For `dot` specifically: after the library rewrite passes
+(`LibraryRewriter`, `onednn_contraction_rewriter`), any `dot` still
+present as a `dot` instruction is a codegen-path dot. Those are the ones
+we care about gating. Dots rewritten to `__onednn$…` custom-calls are
+barriers and never reach the predicate.
+
 ### 4.2 MegaFusionPass (HLO pass)
+
+**New file:** `xla/service/cpu/mega_fusion_pass.{h,cc}`
+
+**Class outline:**
+
+```c++
+namespace xla::cpu {
+
+class MegaFusionPass : public HloModulePass {
+ public:
+  struct Options {
+    // Close a region when its accumulated kflops exceeds this. 0 disables
+    // the pass entirely (the pass's Run() becomes a no-op).
+    double kflops_threshold = 0.0;
+
+    // Minimum region size to emit as a mega-fusion. Regions of 1
+    // absorbable op are skipped (they're already singleton kFusions
+    // from FusionWrapper).
+    int min_region_size = 2;
+  };
+
+  MegaFusionPass(Options options, const CpuCostModel* cost_model);
+
+  absl::string_view name() const override { return "mega-fusion"; }
+
+  absl::StatusOr<bool> Run(
+      HloModule* module,
+      const absl::flat_hash_set<absl::string_view>& execution_threads)
+      override;
+
+ private:
+  // Walks one computation; returns true if the computation was modified.
+  absl::StatusOr<bool> RewriteComputation(HloComputation* computation);
+
+  // Given a closed region (vector of instructions in schedule order),
+  // rewrite it into a single kFusion instruction, preserving all
+  // external uses via a tuple output. See §5.4.
+  absl::Status EmitRegionAsFusion(
+      HloComputation* computation,
+      absl::Span<HloInstruction* const> region);
+
+  const Options options_;
+  const CpuCostModel* cost_model_;  // not owned
+};
+
+}  // namespace xla::cpu
+```
+
+Semantics:
+
+- If `options_.kflops_threshold <= 0`, `Run` returns `false` immediately
+  (no-op). This is the **disable sentinel**.
+- Otherwise, iterates `module->MakeNonfusionComputations()` (so we walk
+  entry + while-bodies + conditional-branches + call-targets, but not
+  the insides of existing kFusions — those are leaves). See §5.1 for
+  the per-computation gate.
+- Deterministic: iteration order of computations and instructions is
+  stable; no hashing of pointers.
 
 ### 4.3 Flag plumbing
 
+**Files touched:**
+
+- `xla/service/cpu/cpu_options.h` — add constant + accessor.
+- `xla/service/cpu/cpu_options.cc` — accessor implementation.
+- `xla/xla.proto` (or wherever `DebugOptions` lives) — add field
+  `int64 xla_cpu_whole_program_kflops_threshold = N;` with a doc comment
+  explaining `0 = disabled` and the default.
+
+**Constant & accessor:**
+
+```c++
+// cpu_options.h
+inline constexpr absl::string_view kWholeProgramKflopsThreshold =
+    "xla_cpu_whole_program_kflops_threshold";
+
+// Returns the kflops threshold; 0 (the sentinel) disables MegaFusionPass.
+int64_t WholeProgramKflopsThreshold(const HloModuleConfig& config);
+```
+
+**Default:** `50` kflops (tentative; §11 open question). Small enough to
+cover both example models end-to-end, large enough that any dense
+BLAS-scale dot (say, 1024×1024 × 1024×1024 = ~2.1M kflops) blows past it
+and stays as a separate thunk.
+
+**Sentinel:** any value `<= 0` disables the pass. This is both the
+off-switch and the bisect knob. We document `0` as the canonical
+"disabled" value.
+
 ### 4.4 Pipeline integration
+
+**File touched:** `xla/service/cpu/cpu_compiler.cc` around line 1068 —
+immediately after the existing fusion stage (after `FusionWrapper` and
+the optional `CpuMultiOutputFusion`).
+
+```c++
+// cpu_compiler.cc, after the existing fusion block (~line 1068)
+const int64_t mega_kflops =
+    options::WholeProgramKflopsThreshold(module->config());
+if (mega_kflops > 0) {
+  pipeline.AddPass<MegaFusionPass>(
+      MegaFusionPass::Options{
+          /*kflops_threshold=*/static_cast<double>(mega_kflops),
+          /*min_region_size=*/2},
+      cost_model_.get());
+}
+```
+
+Notes on placement:
+
+- **After** `FusionWrapper`: guarantees that every codegennable op we
+  might absorb is already a `kFusion`, which makes the outlining logic
+  in §5.4 much simpler (we mostly splice existing fused computations
+  rather than extract scalars).
+- **Before** scheduling / buffer assignment: mega-fusions become single
+  schedule nodes, so they get coherent buffer allocation and sit on the
+  critical path naturally.
+- **Before** the collective-combiner and other late passes: those passes
+  walk collectives and don't interact with fusions, so ordering is
+  free; we pick "immediately after fusion" for locality of reasoning.
+
+The `cost_model_` owner: `CpuCompiler` gains a
+`std::unique_ptr<CpuCostModel> cost_model_` member, constructed once in
+`CompileCpuExecutable` and threaded into the pipeline. This matches the
+existing `AliasInfo` ownership pattern on the surrounding lines.
 
 ## 5. Detailed Algorithm: MegaFusionPass
 
