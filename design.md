@@ -1314,8 +1314,100 @@ If a user hits a regression after the default flip:
 
 ## 12. v2 Roadmap
 
+Each v2 item is a separate future change. They are not prerequisites
+for v1 shipping; they are specific improvements with known shapes.
+
 ### 12.1 While-loop inlining
+
+**Goal.** Collapse `WhileThunk` for very small, tightly bounded loops
+so that the loop body becomes part of an enclosing mega-fusion
+instead of a separate per-iteration kernel dispatch.
+
+**Approach sketch.**
+
+1. Extend `IsBarrier` to *conditionally* not treat `kWhile` as a
+   barrier when:
+   - the loop trip count is statically known and small (≤ K, say
+     K=64), **and**
+   - the body is already a single mega-fusion, **and**
+   - the body's total kflops × trip_count ≤ `kflops_threshold`.
+2. Inline the body by materializing `trip_count` copies of the
+   body-fusion's graph into the enclosing region, chaining
+   carry values.
+3. Alternative: emit a new `kFusion` whose fused computation
+   contains an MLIR-level loop (`scf.for`). Requires fusion-emitter
+   support for explicit loops; probably deferred further.
+
+**Benefit.** For Example B with N=2000 iterations this is *not* the
+right fix (2000 copies is too many). For N≤64 scans it replaces the
+`WhileThunk` dispatch entirely and composes with v1's body-fusing
+for bigger N.
+
+**Risk.** Compile-time blow-up if the heuristic is wrong. Gate
+conservatively.
 
 ### 12.2 Parallelism-aware region splitting
 
+**Goal.** When v1 absorbs ops that *individually* would have been
+good thunk candidates because parallelism makes them win on
+multi-core, v1 can lose performance on wide machines. v2 re-evaluates
+this decision at region-close time.
+
+**Approach sketch.**
+
+1. Compute `region.aggregate_parallelism_score` during growth (sum
+   or max of member scores).
+2. At close time, if `aggregate_parallelism_score > N_cores × C`
+   (some constant) and `region.kflops_total > some_second_threshold`,
+   **split** the region at the highest-parallelism boundary and
+   emit two mega-fusions (or leave the high-parallelism op as its
+   own thunk).
+3. Alternatively, tag the mega-fusion with a "parallelize me" hint
+   and lean on `parallel_task_assignment.cc` to split iteration
+   space across cores.
+
+**Benefit.** Keeps thread-level parallelism for hybrid programs
+(small core + one moderate parallel op) instead of an all-or-nothing
+absorption decision.
+
 ### 12.3 Cost model refinement
+
+**Goal.** Replace the v1 constant-per-opcode table with a model that
+matches measured CPU throughput more closely.
+
+**Approach sketch.**
+
+1. Reuse `HloCostAnalysis` for FLOPs instead of the hand-table;
+   divide by 1000 for kflops. This is a one-file change and
+   removes the table entirely for ops `HloCostAnalysis` knows.
+2. Factor in memory-bandwidth cost:
+   `cost = max(kflops / peak_gflops, bytes_accessed / peak_bw_GB)`.
+   Uses target-machine features already plumbed in XLA:CPU
+   (`llvm_target_machine_features.h`).
+3. Produce a *calibration* harness: auto-tune `kflops_threshold`
+   given a representative workload and hardware profile. Outputs
+   a recommended flag value.
+4. Reconsider the "parallel-win" test: a single int threshold is
+   blunt. A better signal is `parallelism_score / kflops > α`
+   (i.e., "per-flop parallelism density"), which captures that a
+   small elementwise op is more parallel-friendly than a small
+   contracted reduction of equal FLOPs.
+
+**Benefit.** Tighter threshold tuning, fewer regressions on
+unfamiliar workloads, and a clearer story for third-party consumers
+asking "how do I set the threshold for my hardware?"
+
+### 12.4 Cross-computation fusion (stretch)
+
+After v2.1 (while inlining), consider merging regions across
+computation boundaries where safe (e.g., fusing a while-body's
+final kFusion with the first post-while kFusion in the caller if
+the while is trivially unswitchable). Likely not worth the
+complexity; noted for completeness.
+
+### 12.5 GPU parity (non-goal for this doc)
+
+The whole-program-codegen idea has a GPU analogue but the constraints
+differ (launch overhead is smaller, memory model forces kernel
+boundaries). Explicitly out of scope for this document; pointer only.
+
