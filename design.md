@@ -427,17 +427,264 @@ existing `AliasInfo` ownership pattern on the surrounding lines.
 
 ## 5. Detailed Algorithm: MegaFusionPass
 
+The pass is one `Run` method. Everything below is inside its body (or
+helpers it calls). Pseudocode is kept close to the real C++ so a reader
+can map it line-by-line to the implementation.
+
 ### 5.1 Preconditions & per-computation gate
+
+```
+Run(module, execution_threads):
+  if options_.kflops_threshold <= 0:              # disable sentinel
+    return false
+  changed = false
+  for computation in module->MakeNonfusionComputations(execution_threads):
+    if !IsEligibleComputation(computation):
+      continue
+    changed |= RewriteComputation(computation)
+  return changed
+```
+
+**`IsEligibleComputation(c)` returns false when:**
+
+1. `c->IsFusionComputation()` — already a fusion body; treated as a leaf
+   by the outer walk. (Redundant with `MakeNonfusionComputations` but
+   makes the intent explicit.)
+2. `c->IsAsyncComputation()` — async-launched bodies stay as-is in v1.
+3. `c` is a `custom-call` target body — same reasoning.
+4. `c` has ≤ 1 non-parameter, non-root-tuple instructions — nothing to
+   merge.
+
+Note: while-bodies and conditional-branches **are** eligible (this is
+how Example B benefits in v1). The `WhileInstruction` /
+`ConditionalInstruction` in the *calling* computation stays a barrier;
+but the body's instructions are walked and mega-fused.
 
 ### 5.2 Schedule-order region growing
 
+Within one computation, the pass walks instructions in
+`computation->MakeInstructionPostOrder()` order (a stable topological
+order). It maintains a mutable `Region` struct:
+
+```c++
+struct Region {
+  std::vector<HloInstruction*> members;   // in topological order
+  double kflops_total = 0.0;
+};
+```
+
+Algorithm (pseudocode):
+
+```
+RewriteComputation(c):
+  changed = false
+  region = empty
+  for instr in c->MakeInstructionPostOrder():
+    if IsBarrier(instr):
+      changed |= Close(c, region)
+      region = empty
+      continue                                   # skip barrier itself
+    if !IsAbsorbable(instr):
+      changed |= Close(c, region)
+      region = empty
+      continue                                   # unknown/ineligible
+    cost = cost_model_->Estimate(instr)
+    # Would adding this op blow the threshold?
+    if !region.empty() and
+       region.kflops_total + cost.kflops > options_.kflops_threshold:
+      changed |= Close(c, region)
+      region = empty
+    region.members.push_back(instr)
+    region.kflops_total += cost.kflops
+  changed |= Close(c, region)                    # flush tail
+  return changed
+
+Close(c, region):
+  if region.members.size() < options_.min_region_size:
+    return false                                 # size 0 or 1: skip
+  EmitRegionAsFusion(c, region.members)
+  return true
+```
+
+**Why post-order / topological order is correct.** Regions are grown by
+appending only; they never re-enter after being closed. Because we
+process instructions in a topological order, every operand of an
+absorbable instruction `I` is produced either (a) before the current
+region began (external operand — becomes a kFusion parameter), or (b)
+inside the current region (internal dataflow). No edge can flow
+backwards into a closed region.
+
+**Cycle / ordering invariant.** After rewriting, the new kFusion sits
+in the computation where its last member used to sit. Every consumer
+of a former region output now consumes from the kFusion root (or a
+`get-tuple-element` of it). Because all those consumers were
+topologically *after* every region member, the new kFusion is still
+topologically valid.
+
+**Single-pass.** v1 runs one sweep per computation. A second sweep
+could merge mega-fusions across barriers that are now mergeable
+themselves, but in practice barriers are fixed (control flow,
+collectives, library dots) — a second sweep adds nothing for the
+shapes we care about. Mark as a v2 consideration (§12).
+
 ### 5.3 Absorption predicate (per-op)
+
+`IsBarrier(instr)` — **hard stops**. Any of these ends the region:
+
+- `kWhile`, `kConditional`, `kCall` — v1 non-goal (§2.1).
+- All collectives: `kAllReduce`, `kAllGather`, `kReduceScatter`,
+  `kAllToAll`, `kCollectivePermute`, `kAllReduceStart`/`kDone`, etc.
+- `kInfeed`, `kOutfeed`.
+- `kCustomCall` — includes library dots/convs rewritten by
+  `LibraryRewriter` and by `onednn_contraction_rewriter`.
+- `kSend`, `kRecv`, `kSendDone`, `kRecvDone`.
+- `kRngGetAndUpdateState`, `kPartitionId`, `kReplicaId`.
+- `kAfterAll`, `kAddDependency` (ordering-only; safest to be barriers).
+- `kTrace`.
+
+`IsAbsorbable(instr)` — must be **true** for inclusion:
+
+1. `instr->opcode() != kParameter && instr->opcode() != kConstant` —
+   parameters and constants don't need to be "absorbed"; they flow in
+   as operands of the fused region naturally. (Constants inside a
+   region become constants inside the fused computation per HLO's
+   fusion mechanics.)
+2. `instr != instr->parent()->root_instruction()` — the root is never
+   an independent absorption target; a region whose *last member* is
+   the root is fine (§5.4 handles this).
+3. `instr->opcode() == kFusion` — always absorbable (these are the
+   common case after `FusionWrapper`).
+4. Otherwise: `CpuFusionEmitterSupportsOpcode(instr->opcode())` — a
+   small allow-list matching what `cpu_fusion_emitter.cc` can lower
+   today. v1 list: all elementwise opcodes, `reduce`, `reshape`,
+   `transpose`, `broadcast`, `iota`, `dot`, `dynamic-slice`,
+   `dynamic-update-slice`, `concatenate`, `pad`, `slice`, `gather`
+   (only if already fusion-emitter-supported — double-check against
+   `cpu_fusion_emitter_test.cc` coverage).
+5. **Parallelism gate for expensive non-fusion ops.** If
+   `cost.kflops > options_.kflops_threshold / 4` (a quarter of the
+   region budget) **and** `cost_model_->IsParallelWin(instr)` is
+   `true`, the op is **not** absorbed. Rationale: a single expensive
+   parallelizable op (e.g., a medium-sized `dot`) is a better thunk —
+   the threaded library dispatch amortizes its own overhead. This is
+   the concrete realization of answer #4 from the spec Q&A.
+6. All operands of `instr` must be reachable without crossing a
+   barrier. With topological-order region growth, this is automatic
+   **except** when an operand's producer was skipped (barrier) and
+   the value was routed around. The check is: for every operand
+   `op`, `op` is either (a) outside the current region's `members`
+   set *and* produced before the region began, or (b) inside the
+   region. This is O(1) per operand with a small hash set.
+
+Any op that is neither a barrier nor absorbable (rule 4 fails, rule 5
+fails, etc.) is a **soft barrier**: it closes the current region but
+is itself left untouched in the HLO, and the next absorbable op
+starts a new region.
 
 ### 5.4 Emitting the kFusion instruction
 
+`EmitRegionAsFusion(c, members)` is where the rewrite happens.
+
+**Path A — all members are already `kFusion`s (common case after
+`FusionWrapper`).** Use XLA's existing fusion-merging primitive:
+
+```c++
+// Starting from the last member, repeatedly fuse predecessors into it.
+HloInstruction* accumulator = members.back();
+for (auto it = members.rbegin() + 1; it != members.rend(); ++it) {
+  HloInstruction* earlier = *it;
+  // MergeFusionInstructionIntoMultiOutput handles:
+  //   - inlining `earlier`'s fused computation into accumulator's
+  //   - rewiring earlier's users to accumulator's matching output
+  //   - deleting `earlier`
+  TF_RETURN_IF_ERROR(
+      accumulator->MergeFusionInstructionIntoMultiOutput(
+          Cast<HloFusionInstruction>(earlier)));
+}
+```
+
+This is the same primitive `CpuMultiOutputFusion` uses today; the
+difference is that we pick adjacency in **schedule order** rather than
+by shared-operand heuristics. Reuse means no new HLO-manipulation code.
+
+**Path B — region contains a non-fusion absorbable op** (e.g., a small
+`dot` we chose to absorb). Promote it to a singleton fusion first,
+then fall into Path A:
+
+```c++
+for (HloInstruction*& m : members) {
+  if (m->opcode() != HloOpcode::kFusion) {
+    TF_ASSIGN_OR_RETURN(
+        m, c->CreateFusionInstruction({m}, HloInstruction::FusionKind::kLoop));
+  }
+}
+// …then Path A.
+```
+
+`CreateFusionInstruction` rewires operands/users correctly. After this
+loop every `m` is a `kFusion` and Path A applies unchanged.
+
+**FusionKind.** The merged accumulator inherits its kind from its
+rightmost input (typically `kLoop`). If any member has
+`FusionKind::kInput` (reduction-style), promote the accumulator to
+`kInput`. v1 rule: `kInput` if any member is `kInput`, else `kLoop`.
+This matches existing CPU fusion-emitter expectations.
+
 ### 5.5 Tuple/multi-output handling
 
+After merging, the accumulator kFusion may have multiple outputs (one
+per original region output that is consumed outside the region). Two
+cases:
+
+1. **Single external consumer pattern.** All region outputs flow into
+   one successor op. `MergeFusionInstructionIntoMultiOutput` produces
+   a root `kTuple` and inserts `kGetTupleElement`s. XLA handles this
+   natively — no extra work.
+2. **Some region outputs are the computation root.** If the root of
+   `c` was inside the region, the region's mega-fusion becomes `c`'s
+   new root (possibly via a top-level `kTuple` if `c`'s original root
+   was a tuple). The merge primitive handles this as long as we keep
+   the root instruction up to date:
+   ```c++
+   if (c->root_instruction() == members.back_original) {
+     c->set_root_instruction(accumulator);
+   }
+   ```
+   In practice `MergeFusionInstructionIntoMultiOutput` already rewires
+   root-producing fusions when the replaced instruction had the root
+   as a user; we just call it after each merge and let it do its job.
+
+**Dead-output pruning.** After all merges, run
+`accumulator->DeduplicateFusionOperands()` and a tuple-output
+pruner (`HloDCE` is typically scheduled later and handles this, but we
+can also call `accumulator->fused_instructions_computation()->
+RemoveUnusedParametersAndElements()` defensively). v1: rely on the
+existing late `HloDCE` pass; only add a targeted call if tests show
+dead outputs surviving.
+
 ### 5.6 Buffer aliasing & layout constraints
+
+**In-place ops (`dynamic-update-slice`, `scatter`).** XLA's buffer
+assignment handles in-place aliasing via `AliasInfo` and per-op
+fusion-emitter metadata. A `dynamic-update-slice` inside a fusion is
+fully supported today. No special handling needed here.
+
+**Layout.** `MegaFusionPass` runs **before** layout assignment (which
+happens later in the pipeline). Fusions are layout-neutral at the HLO
+level; layout assignment propagates through fusion operands and roots.
+No new layout constraints are introduced.
+
+**Alias analysis.** The new mega-fusion is an ordinary kFusion from
+alias analysis's perspective. No changes to `AliasInfo` or to
+`HloAliasAnalysis` are required. (Verify with the existing
+`cpu_compiler_internals_test.cc` after implementation.)
+
+**Copy-insertion interactions.** Copy-insertion runs after fusion
+passes and inserts copies where aliasing would violate semantics.
+Growing fusions may increase pressure on copy-insertion in pathological
+cases. v1 mitigation: the `min_region_size = 2` guard plus the
+kflops threshold keeps mega-fusions bounded. Watch for copy-count
+regressions in the test plan (§9.3).
 
 ## 6. Data Structures
 
