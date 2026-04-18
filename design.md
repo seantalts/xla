@@ -688,6 +688,123 @@ regressions in the test plan (§9.3).
 
 ## 6. Data Structures
 
+Consolidated reference. All types are already specified in §4–§5; this
+section is a single place to eyeball them.
+
+**Public (new headers):**
+
+```c++
+// xla/service/cpu/cpu_cost_model.h
+namespace xla::cpu {
+
+struct OpCost {
+  double kflops = 0.0;            // 1e3 flop units; 0 for bitcast-like ops
+  int64_t parallelism_score = 0;  // rough independent-work count
+};
+
+class CpuCostModel {
+ public:
+  CpuCostModel() = default;
+  OpCost Estimate(const HloInstruction* instr) const;
+  bool IsParallelWin(const HloInstruction* instr) const;
+
+ private:
+  static constexpr int64_t kParallelWinThreshold = 4096;
+};
+
+}  // namespace xla::cpu
+```
+
+```c++
+// xla/service/cpu/mega_fusion_pass.h
+namespace xla::cpu {
+
+class MegaFusionPass : public HloModulePass {
+ public:
+  struct Options {
+    double kflops_threshold = 0.0;  // <= 0 disables the pass
+    int min_region_size = 2;
+  };
+
+  MegaFusionPass(Options options, const CpuCostModel* cost_model);
+  absl::string_view name() const override { return "mega-fusion"; }
+  absl::StatusOr<bool> Run(
+      HloModule* module,
+      const absl::flat_hash_set<absl::string_view>& execution_threads)
+      override;
+
+ private:
+  absl::StatusOr<bool> RewriteComputation(HloComputation* computation);
+  absl::Status EmitRegionAsFusion(
+      HloComputation* computation,
+      absl::Span<HloInstruction* const> region);
+
+  Options options_;
+  const CpuCostModel* cost_model_;  // not owned
+};
+
+}  // namespace xla::cpu
+```
+
+**Internal (inside `mega_fusion_pass.cc`, unit-of-translation only):**
+
+```c++
+namespace {
+
+// Growing region state. Lives on the stack of RewriteComputation.
+struct Region {
+  std::vector<HloInstruction*> members;  // topological order
+  double kflops_total = 0.0;
+  // Fast lookup for operand-locality checks in IsAbsorbable.
+  absl::flat_hash_set<const HloInstruction*> member_set;
+};
+
+// Allow-list of opcodes the CPU fusion emitter can lower today.
+// Single source of truth — §5.3 rule 4 consults this set. Updating
+// this set is the mechanism for enabling new opcodes to participate.
+const absl::flat_hash_set<HloOpcode>& FusionEmitterSupportedOpcodes();
+
+// Hard-stop opcodes per §5.3.
+bool IsBarrier(const HloInstruction* instr);
+
+// Combined predicate per §5.3.
+bool IsAbsorbable(const HloInstruction* instr,
+                  const Region& region,
+                  const MegaFusionPass::Options& options,
+                  const CpuCostModel& cost_model);
+
+}  // namespace
+```
+
+**Flag field (proto):**
+
+```proto
+// In xla.proto, DebugOptions message:
+int64 xla_cpu_whole_program_kflops_threshold = <next_unused_field_id>;
+// Docstring: "Merge contiguous HLO regions whose accumulated estimated
+// work stays below this many kflops into a single kFusion, producing
+// one KernelThunk per region. 0 disables the optimization entirely.
+// Default: 50."
+```
+
+**Flag accessor (existing header):**
+
+```c++
+// xla/service/cpu/cpu_options.h additions:
+inline constexpr absl::string_view kWholeProgramKflopsThreshold =
+    "xla_cpu_whole_program_kflops_threshold";
+int64_t WholeProgramKflopsThreshold(const HloModuleConfig& config);
+```
+
+**CpuCompiler member (existing header):**
+
+```c++
+// xla/service/cpu/cpu_compiler.h, inside class CpuCompiler:
+std::unique_ptr<CpuCostModel> cost_model_;  // constructed once per compile
+```
+
+No changes to thunk types, executor, or runtime-side structures.
+
 ## 7. Worked Examples
 
 ### 7.1 Example 1: 35-joint mass-matrix (pure forward)
