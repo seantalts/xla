@@ -67,6 +67,50 @@ instead be compiled into one LLVM function invoked by a single
 
 ## 2. Non-Goals (v1 Scope Fence)
 
+The following are explicitly **out of scope for v1**. Each has a v2 entry in
+§12 if relevant.
+
+1. **Inlining `while` / `conditional` / `call` into the mega-fusion.** v1
+   treats these as hard region boundaries: the pass merges inside each
+   computation (including called computations like while-bodies), but never
+   folds the control-flow instruction itself into a `kFusion`. This keeps
+   `WhileThunk` / `ConditionalThunk` driving iteration/selection — which is
+   enough to recover Example B because the scan *body* becomes one kernel.
+2. **Absorbing runtime-coordinated ops** of any kind: collectives
+   (`all-reduce`, `all-gather`, `reduce-scatter`, `all-to-all`,
+   `collective-permute`), `infeed`, `outfeed`, `custom-call`,
+   `rng-get-and-update-state`, `partition-id`, `replica-id`. These always stay
+   as their own thunks and act as region barriers.
+3. **Replacing existing fusion passes.** `CpuInstructionFusion`,
+   `FusionWrapper`, and (optionally) `CpuMultiOutputFusion`
+   (`cpu_compiler.cc:1053–1068`) keep running untouched. The new pass runs
+   **after** them and merges the `kFusion` instructions they produced — plus
+   a small set of non-fusion ops the cost model says are cheap enough to
+   absorb.
+4. **Library-path changes.** The dot/conv dispatch picker in
+   `dot_op_emitter.cc:1411` and the oneDNN/YNN rewriters are untouched. A
+   `dot` already rewritten to a library call (e.g., a `__onednn$matmul`
+   custom-call) is a barrier. Only dots that would otherwise be codegenned
+   are candidates for absorption, and the per-op cost model decides.
+5. **New cost model for parallelism.** v1 ships the simplest useful model
+   (kflops estimate + a coarse "parallelizable?" bit per op). No tiling
+   analysis, no hardware introspection, no learned model.
+6. **Changes to `ThunkExecutor` or to the thunk runtime itself.** The fix is
+   entirely at HLO-to-MLIR compile time. No changes to
+   `xla/backends/cpu/runtime/`.
+7. **Changes to `IrEmitter` / `IrEmitter2`.** The mega-fusion is emitted
+   through the MLIR fusion-emitter pipeline (`FusionCompiler`) exclusively.
+   If `FusionCompiler` cannot compile a particular op today, that op is not
+   eligible for absorption in v1.
+8. **Multi-threaded execution of a mega-fusion.** The emitted kernel runs on
+   one worker. The cost model must therefore decline to absorb ops whose
+   parallel thunk dispatch is a net win (high kflops + high parallelism).
+9. **GPU backend, TPU backend, or any non-CPU target.** Whole-program codegen
+   for GPU is a separate effort; this document is xla:cpu-only.
+10. **Ahead-of-time / serialized-executable path regressions.** The pass must
+    be idempotent and deterministic so AOT artifacts remain stable, but we
+    do not expand AOT-specific functionality in v1.
+
 ## 3. High-Level Architecture
 
 ## 4. Component Specs
