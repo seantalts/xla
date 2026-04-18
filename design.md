@@ -1170,6 +1170,75 @@ Benchmarks are the gate for flipping the default from `0` to `50`
 
 ## 10. Rollout & Flag Semantics
 
+### 10.1 The flag
+
+Single knob: `xla_cpu_whole_program_kflops_threshold` (int64, in
+`DebugOptions`). Semantics:
+
+| Value         | Behavior                                                        |
+|---------------|-----------------------------------------------------------------|
+| `0`           | **Disabled.** Canonical off-switch. Pass becomes no-op in Run.  |
+| negative      | Same as `0`. Accept defensively; don't crash.                   |
+| positive `T`  | Enable; close regions at `T` kflops accumulated.                |
+| very large    | Effectively unbounded — merges everything the predicate allows. |
+
+**Not** a boolean, not a multi-level enum — just a number. This lets
+users bisect performance by setting it between their own programs'
+kflops boundaries, and it's honest about what the pass actually does
+(merge until a budget is exceeded).
+
+### 10.2 Default over time
+
+| Phase                     | Default | Rationale                           |
+|---------------------------|---------|-------------------------------------|
+| Landed, behind flag       | `0`     | No behavior change; CI validates.   |
+| After §9.2 benchmarks pass| `50`    | Small-model wins; large-model no-op |
+| After multi-week soak     | keep    | Or retune based on field data.      |
+
+We deliberately do **not** plumb this to `HloModuleConfig` any earlier
+than the current `DebugOptions` pattern used by peer flags
+(`kDisableNewFusionEmitters` etc.) — one path, one source of truth.
+
+### 10.3 Interaction with existing flags
+
+- `xla_cpu_disable_new_fusion_emitters`: if set, the fusion-emitter
+  lowering path isn't available. `MegaFusionPass` must be a no-op in
+  this case. Implementation: `CpuCompiler` checks
+  `options::UseFusionEmitters(config)` and only adds the pass if
+  true. (Factor this into the §4.4 snippet: gate on
+  `mega_kflops > 0 && use_fusion_emitters`.)
+- `xla_cpu_use_multi_output_fusion`: compatible. Multi-output fusion
+  runs before mega-fusion and its output is just fed into the same
+  predicate.
+- `xla_cpu_flatten_after_fusion`: compatible; runs after.
+- `xla_cpu_small_while_loop_byte_threshold`: complementary. Hoisted
+  while loops become straight-line code that mega-fusion can
+  collapse (§7.2 edge case).
+
+### 10.4 Observability
+
+1. **VLOG.** At `VLOG(1)`: "MegaFusionPass: created N mega-fusions
+   from M regions in computation `<name>`, total_kflops=K". At
+   `VLOG(2)`: per-region member lists.
+2. **HLO dumps.** The pass is a named `HloModulePass`; it appears
+   in `hlo_pass_pipeline` dumps automatically. Users can
+   `xla_dump_to=/tmp/dump` and see the before/after HLO.
+3. **Metric.** Optional (stretch): bump a monitoring counter
+   `xla.cpu.mega_fusions_created` per compile. v1 can skip.
+
+### 10.5 Bisect / escape-hatch protocol
+
+If a user hits a regression after the default flip:
+
+1. Set `xla_cpu_whole_program_kflops_threshold=0`. Behavior returns
+   to today's pipeline, byte-identical except for the no-op pass
+   pass-through.
+2. File a bug with `xla_dump_to` output attached. The diff between
+   pre-pass and post-pass HLO is in the dump.
+3. If the bug is in `FusionCompiler` lowering a now-larger fusion,
+   the fix is usually narrowing the §5.3 allow-list for a specific
+   opcode (one-line change, landable in hours).
+
 ## 11. Risks & Open Questions
 
 ## 12. v2 Roadmap
