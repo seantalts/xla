@@ -928,6 +928,116 @@ casing.
 
 ## 8. File-by-File Change List
 
+Concrete checklist. "New" means create a new file; "edit" means modify
+existing.
+
+### New files
+
+| File                                               | Purpose                                   |
+|----------------------------------------------------|-------------------------------------------|
+| `xla/service/cpu/cpu_cost_model.h`                 | `OpCost`, `CpuCostModel` API (§4.1, §6)   |
+| `xla/service/cpu/cpu_cost_model.cc`                | Per-opcode estimation table (§4.1 table)  |
+| `xla/service/cpu/cpu_cost_model_test.cc`           | Unit tests for Estimate / IsParallelWin   |
+| `xla/service/cpu/mega_fusion_pass.h`               | `MegaFusionPass`, `Options` (§4.2, §6)    |
+| `xla/service/cpu/mega_fusion_pass.cc`              | Algorithm from §5                         |
+| `xla/service/cpu/mega_fusion_pass_test.cc`         | Pass-level HLO→HLO tests (§9.1)           |
+
+### Edited files
+
+| File                                          | Change                                                          |
+|-----------------------------------------------|-----------------------------------------------------------------|
+| `xla/service/cpu/cpu_options.h`               | Add `kWholeProgramKflopsThreshold` constant + accessor decl.    |
+| `xla/service/cpu/cpu_options.cc`              | Implement `WholeProgramKflopsThreshold` — read `DebugOptions`.  |
+| `xla/xla.proto` (or wherever `DebugOptions` lives) | Add `int64 xla_cpu_whole_program_kflops_threshold` field.  |
+| `xla/service/cpu/cpu_compiler.h`              | Add `std::unique_ptr<CpuCostModel> cost_model_` member.         |
+| `xla/service/cpu/cpu_compiler.cc`             | Construct `cost_model_`; add `MegaFusionPass` after `FusionWrapper` block (~line 1068); include headers. |
+| `xla/service/cpu/BUILD`                       | Add `cpu_cost_model` + `mega_fusion_pass` `cc_library` targets and their tests; add deps to `cpu_compiler` target. |
+
+### Bazel build dependencies (sketch)
+
+```starlark
+# xla/service/cpu/BUILD
+
+cc_library(
+    name = "cpu_cost_model",
+    srcs = ["cpu_cost_model.cc"],
+    hdrs = ["cpu_cost_model.h"],
+    deps = [
+        "//xla/hlo/ir:hlo",
+        "//xla/service:hlo_cost_analysis",
+        "//xla:shape_util",
+        "@com_google_absl//absl/container:flat_hash_set",
+    ],
+)
+
+cc_library(
+    name = "mega_fusion_pass",
+    srcs = ["mega_fusion_pass.cc"],
+    hdrs = ["mega_fusion_pass.h"],
+    deps = [
+        ":cpu_cost_model",
+        "//xla/hlo/ir:hlo",
+        "//xla/hlo/pass:hlo_pass",
+        "//xla/service:hlo_module_config",
+        "@com_google_absl//absl/container:flat_hash_set",
+        "@com_google_absl//absl/status",
+        "@com_google_absl//absl/status:statusor",
+        "@com_google_absl//absl/strings",
+    ],
+)
+
+xla_cc_test(
+    name = "cpu_cost_model_test",
+    srcs = ["cpu_cost_model_test.cc"],
+    deps = [
+        ":cpu_cost_model",
+        "//xla/hlo/ir:hlo",
+        "//xla/hlo/testlib:test",
+        "//xla/hlo/testlib:hlo_hardware_independent_test_base",
+    ],
+)
+
+xla_cc_test(
+    name = "mega_fusion_pass_test",
+    srcs = ["mega_fusion_pass_test.cc"],
+    deps = [
+        ":cpu_cost_model",
+        ":mega_fusion_pass",
+        "//xla/hlo/ir:hlo",
+        "//xla/hlo/testlib:test",
+        "//xla/hlo/testlib:hlo_hardware_independent_test_base",
+    ],
+)
+
+# Add to existing cpu_compiler cc_library:
+#   deps += [":cpu_cost_model", ":mega_fusion_pass"]
+```
+
+### Proto field reservation checklist
+
+1. Grep for next free field id under `DebugOptions` in `xla.proto`.
+2. Add the field with a proto-doc comment matching the flag docstring.
+3. Run `copybara` / proto-gen if applicable (follow existing
+   `kDisableNewFusionEmitters` / `kFlattenAfterFusion` precedent).
+4. Wire `WholeProgramKflopsThreshold` accessor in `cpu_options.cc` to
+   read `config.debug_options().xla_cpu_whole_program_kflops_threshold()`.
+
+### Ordering of work (suggested commits)
+
+1. **Commit 1:** Add `CpuCostModel` + its test. No pipeline integration
+   yet. Verifiable standalone.
+2. **Commit 2:** Add `MegaFusionPass` + its test. Not yet wired into
+   the pipeline (tests construct the pass directly and run it on
+   hand-written HLO). Verifiable standalone.
+3. **Commit 3:** Add the flag (proto + `cpu_options`) with default `0`
+   (disabled). No behavior change.
+4. **Commit 4:** Wire `MegaFusionPass` into `CpuCompiler`'s pipeline
+   behind the flag. Still default-disabled.
+5. **Commit 5:** Flip default to `50` (or chosen value) after
+   benchmark validation.
+
+Each commit is small and independently rolls back.
+
 ## 9. Test Plan
 
 ### 9.1 Unit tests
