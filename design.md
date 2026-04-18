@@ -113,6 +113,112 @@ The following are explicitly **out of scope for v1**. Each has a v2 entry in
 
 ## 3. High-Level Architecture
 
+The design adds **one new HLO pass** (`MegaFusionPass`) and **one small
+helper** (`CpuCostModel`), plus a flag to gate both. All other XLA:CPU code
+paths are unchanged.
+
+### 3.1 Where it sits in the pipeline
+
+`CpuCompiler::RunHloPasses` (`cpu_compiler.cc:~1050`) today ends its fusion
+stage with, in order:
+
+```
+CpuInstructionFusion         (forms kFusions from elementwise/reduce chains)
+FusionWrapper                (wraps stray codegennable ops as 1-op kFusions)
+CpuMultiOutputFusion?        (optional, merges fusions sharing operands)
+FlattenCallGraph? etc.
+```
+
+After this stage, every codegen-eligible instruction is already a
+`kFusion`. We insert `MegaFusionPass` **immediately after** this fusion
+stage and **before** scheduling / buffer assignment. By that point the HLO
+is in a clean "kFusions + library-call custom-calls + control flow +
+collectives" form, which is exactly the shape `MegaFusionPass` is designed
+to walk.
+
+```
+  … existing passes …
+  CpuInstructionFusion
+  FusionWrapper
+  [CpuMultiOutputFusion]
++ MegaFusionPass   ← new
+  … scheduling, buffer assignment, thunk emission …
+```
+
+### 3.2 What the pass does, in one paragraph
+
+For each computation in the module (entry computation **and** called
+computations such as while-bodies), `MegaFusionPass` walks instructions in
+a deterministic order and greedily grows contiguous **regions** of
+absorbable ops. An op is absorbable if the cost model says it is either
+(a) low-kflops or (b) high-kflops but poorly parallelizable, **and** it is
+not a runtime-coordinated op (§2 item 2), **and** it is not already a
+library call. When a region accumulates more than `kflops_threshold`
+kflops, or hits a barrier (control flow, collective, library call,
+infeed/outfeed, etc.), the region is closed. Each closed region containing
+≥ 2 absorbable ops is rewritten into a single `kFusion` instruction by
+outlining the region's ops into a fresh fused computation, with
+tuple-typed output covering every value the region produces that is
+consumed outside. Single-op regions are left alone (they are already
+kFusions from `FusionWrapper`).
+
+### 3.3 What the rest of the stack sees
+
+After `MegaFusionPass`, the HLO is a strictly valid XLA module: the new
+`kFusion`s are indistinguishable in kind from ones produced by
+`CpuInstructionFusion`. The scheduler schedules them normally, buffer
+assignment assigns buffers normally, and **the existing fusion-emitter
+path (`FusionCompiler`, `cpu_fusion_emitter.cc`) lowers them to LLVM
+normally.** `ThunkEmitter` emits one `KernelThunk` per mega-fusion, just
+as it would for any other fusion. No thunk-runtime changes are required.
+
+### 3.4 Why a kFusion (not a new instruction kind / new thunk type)
+
+Three reasons:
+
+1. **Reuse the lowering pipeline.** `FusionCompiler` already handles
+   tuple-output fusions, bufferization, tiling, and LLVM codegen. Anything
+   we express as a `kFusion` inherits all of it for free.
+2. **Reuse downstream infra.** Buffer assignment, alias analysis, liveness,
+   `ThunkEmitter::EmitFusionKernelThunk`, `KernelThunk` — none of these
+   need to know about "mega" vs "regular" fusions.
+3. **Fail-safe.** If `FusionCompiler` can't lower a specific mega-fusion
+   (e.g., an absorbed op uses an emitter feature not yet supported), the
+   absorption predicate's "FusionCompiler can lower this op?" check is the
+   single source of truth. A missed check produces a clean compile error
+   that a targeted test can catch — not silent wrong output.
+
+### 3.5 Cost-model role, in one paragraph
+
+`CpuCostModel` is a pure function from an `HloInstruction*` to
+`(kflops_estimate, parallelism_score)`. v1 implements it with small
+op-specific closed-form estimates (FLOPs from `HloCostAnalysis` or a tiny
+table; parallelism score from output-shape element count and op kind).
+`MegaFusionPass` calls it once per candidate op. The **flag threshold is
+expressed in kflops**, so the cost model's units are exposed directly to
+users. The parallelism score is only used internally to decide whether a
+high-kflops op should still be absorbed (unparallelizable) or left as its
+own thunk (parallelizable).
+
+### 3.6 Dataflow summary
+
+```
+HLO module
+   │
+   ▼  (existing passes, unchanged)
+HLO w/ kFusions + library custom-calls + control flow + collectives
+   │
+   ▼  MegaFusionPass       ← this design
+HLO w/ FEWER kFusions, each possibly much larger
+   │
+   ▼  scheduling, buffer assignment
+   ▼  ThunkEmitter
+Thunk sequence: fewer KernelThunks, same library/collective thunks
+   │
+   ▼  FusionCompiler lowers each kFusion to LLVM
+Executable
+```
+
 ## 4. Component Specs
 
 ### 4.1 CPU Cost Model (kflops + parallelism)
