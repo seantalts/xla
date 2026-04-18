@@ -1042,9 +1042,131 @@ Each commit is small and independently rolls back.
 
 ### 9.1 Unit tests
 
+**`cpu_cost_model_test.cc`** — each case is ~5 lines and asserts an
+exact `OpCost` for a hand-built HLO instruction:
+
+1. Elementwise `add` on shape `[128]` → `kflops ≈ 0.128`,
+   `parallelism_score == 128`.
+2. `dot` of `[16,32] × [32,8]` → `kflops ≈ 2*16*32*8 / 1000 = 8.192`,
+   `parallelism_score == 128`.
+3. `reduce` over axis of `[1024]` → `kflops ≈ 1.024`,
+   `parallelism_score == 1`.
+4. `reshape` (no-op layout) → `kflops == 0`, `parallelism_score ==
+   output_elems`.
+5. Unknown opcode (use a custom-call or a seldom-supported opcode) →
+   `kflops == 0`, `parallelism_score == INT64_MAX`,
+   `IsParallelWin == true`.
+6. Parallel-win threshold boundary: shape `[4095]` elementwise ⇒
+   `IsParallelWin == false`; shape `[4097]` ⇒ `true`.
+
+**`mega_fusion_pass_test.cc`** — HLO-in / HLO-out tests using
+`HloHardwareIndependentTestBase`:
+
+1. **MergesTwoAdjacentFusions.** Two kFusions, no barrier between →
+   one mega-kFusion after the pass. Assert `fusion_count == 1` and
+   that the merged computation contains both sets of instructions.
+2. **DoesNotMergeAcrossWhile.** kFusion → while → kFusion.
+   Assert `fusion_count` unchanged (2), `while` still present.
+3. **DoesNotMergeAcrossCollective.** kFusion → `all-reduce` →
+   kFusion. Assert unchanged.
+4. **DoesNotMergeAcrossLibraryCall.** kFusion → `__onednn$matmul`
+   custom-call → kFusion. Assert unchanged.
+5. **SingletonRegionNotEmitted.** Single kFusion between two
+   barriers. Assert no change (`min_region_size = 2`).
+6. **ClosesOnKflopsOverflow.** Four kFusions each of cost 20 kflops,
+   threshold = 50. Assert the pass produces two mega-fusions
+   (50 and 30 kflops) not one.
+7. **AbsorbsSmallDot.** kFusion → small `dot` (1 kflop, low
+   parallelism because output is 1x1) → kFusion. Assert one
+   mega-fusion.
+8. **DoesNotAbsorbParallelizableDot.** kFusion → `dot` with
+   `kflops > threshold/4` and `parallelism_score > 4096` → kFusion.
+   Assert unchanged. Demonstrates §5.3 rule 5.
+9. **AbsorbsLargeUnparallelizableOp.** Hand-construct an op whose
+   cost exceeds `threshold/4` but whose parallelism score is tiny
+   (e.g., a long reduction chain). Assert it is absorbed.
+10. **WalksIntoWhileBody.** Entry has only a `while`. Body has two
+    kFusions separated by nothing. Assert body gets a mega-fusion;
+    entry is unchanged.
+11. **PreservesComputationRoot.** Region's last member is the
+    computation's root tuple's producer. Assert the new mega-fusion
+    becomes the new root (or is properly wired under the root
+    tuple).
+12. **DisabledWhenThresholdIsZero.** `Options{0.0}`. Assert `Run`
+    returns `false` and HLO is byte-identical.
+13. **IdempotentOnSecondRun.** Run the pass twice; assert second
+    run returns `false` (no further changes).
+14. **DeterministicOutput.** Run on the same HLO twice (fresh
+    modules); assert resulting HLO text is identical.
+15. **MixedOpsInRegion.** Region contains mixed `kFusion` + small
+    non-fusion ops (per §5.4 Path B). Assert all are absorbed into
+    one mega-kFusion.
+
+Each test loads HLO from a text literal, constructs
+`CpuCostModel` + `MegaFusionPass`, runs once, and compares via
+`RunAndFilecheck` or direct structural inspection.
+
 ### 9.2 Integration / benchmarks
 
+**Integration tests** (`cpu_compiler_test.cc` or
+`cpu_compiler_internals_test.cc`):
+
+1. End-to-end compile a JAX-style HLO module matching Example A
+   skeleton (5–10 small ops in a chain). With threshold = 50,
+   assert the resulting thunk sequence has exactly 1 `KernelThunk`.
+   With threshold = 0, assert the count matches the baseline.
+2. End-to-end compile an HLO with a `while` body of small ops.
+   Assert: 1 `WhileThunk`, and its body executes 1 `KernelThunk`.
+
+**Benchmarks** — add to `xla/tools/hlo_runner_main` or the existing
+CPU microbenchmark harness:
+
+1. **bench_mass_matrix_35.** The Example A program, reduced to HLO
+   (capture once via JAX HLO dump). Runs N iterations, reports
+   median per-call µs. Pass if ≥ 2× faster with threshold = 50
+   vs. threshold = 0.
+2. **bench_scan_N2000_M3.** Example B. Same protocol, ≥ 2× bar.
+3. **bench_large_matmul.** A 2048×2048 @ 2048×2048 `dot`-heavy
+   program. Pass if the difference between threshold = 50 and
+   threshold = 0 is within noise (± 5%). This guards the
+   non-regression promise.
+
+Benchmarks are the gate for flipping the default from `0` to `50`
+(commit 5 in §8).
+
 ### 9.3 Regression guards
+
+**Structural guards** run on every CI invocation of the pass
+(via the existing `cpu_compiler_test.cc`):
+
+1. **Thunk count non-regression.** For each HLO in a small corpus
+   (`testdata/` fixtures), record baseline thunk counts and assert
+   the count with `MegaFusionPass` enabled is `≤ baseline + 0`.
+   (Mega-fusion can only reduce or preserve counts.)
+2. **Copy-count non-regression.** Measure `kCopy` instruction count
+   after copy-insertion; assert it does not grow by more than 5%
+   when the pass is enabled. Flag in §5.6 to watch.
+3. **Compile-time non-regression.** Time `CompileCpuExecutable` for
+   a moderate-sized module; assert the pass adds < 5% compile
+   time. The pass is O(instructions × avg_operand_count), so this
+   should be comfortably under the bar.
+4. **Determinism.** In a loop: compile the same HLO 10 times,
+   assert the final LLVM IR is byte-identical. Catches
+   pointer-hash iteration bugs.
+
+**Broader guards** (run via presubmit / nightly):
+
+5. **Existing xla:cpu test suite green** at both
+   `xla_cpu_whole_program_kflops_threshold=0` and `=50`. Failing
+   any test at the non-zero setting is a blocker for flipping
+   the default.
+6. **JAX smoketest suite** (if available in-repo) green at
+   default value.
+7. **Numerical regression.** For each benchmark in §9.2, compare
+   outputs (with tight tolerance) between threshold=0 and
+   threshold=50. Must be bit-identical for deterministic ops,
+   within `atol=1e-10` for reductions (fusion may reassociate
+   sums).
 
 ## 10. Rollout & Flag Semantics
 
