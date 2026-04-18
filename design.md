@@ -1411,3 +1411,197 @@ The whole-program-codegen idea has a GPU analogue but the constraints
 differ (launch overhead is smaller, memory model forces kernel
 boundaries). Explicitly out of scope for this document; pointer only.
 
+## Appendix A: Benchmark Models
+
+Reproduced verbatim from the upstream issues (whitespace restored).
+These are the two targets against which §1.4 success criteria and the
+§9.2 benchmarks are evaluated.
+
+### A.1 Example 1 — 35-joint mock mass matrix
+
+Source: <https://github.com/jax-ml/jax/issues/26021>
+
+```python
+import time
+import jax
+import jax.numpy as jnp
+import numpy as np
+
+jax.config.update("jax_enable_x64", True)
+jax.config.update("jax_platforms", "cpu")
+
+
+def skew(v):
+    return jnp.array([[0.0, -v[2], v[1]],
+                      [v[2], 0.0, -v[0]],
+                      [-v[1], v[0], 0.0]])
+
+
+def mock_mass_matrix(q):
+    """Mock mass matrix function
+
+    This does not actually compute a mass matrix! This is just for
+    reproducing the post-0.4.32 slowdown
+
+    Gemini wrote most of this test case, I don't care about actual accuracy
+    here other than that (1) it runs, and (2) the operations look approximately
+    similar to what I actually use in frax.
+    """
+
+    # Mock robot parameters
+    num_joints = 35
+    local_tfs = jnp.tile(jnp.eye(4), (num_joints, 1, 1))
+    parent_idxs = np.arange(-1, num_joints - 1).tolist()
+    mask = jnp.tril(jnp.ones((num_joints, num_joints)))
+    masses = jnp.ones(num_joints)
+    coms = jnp.zeros((num_joints, 3))
+    axes = jnp.tile(jnp.array([0.0, 0.0, 0.0, 0.0, 0.0, 1.0]),
+                    (num_joints, 1))
+
+    # Mock FK
+    world_tfs = jnp.zeros((num_joints, 4, 4))
+    for i in range(num_joints):
+        parent = parent_idxs[i]
+        parent_tf = world_tfs[parent] if parent != -1 else jnp.eye(4)
+        angle = q[i]
+        cos_a = jnp.cos(angle)
+        sin_a = jnp.sin(angle)
+        rot = jnp.array([[cos_a, -sin_a, 0.0],
+                         [sin_a, cos_a, 0.0],
+                         [0.0, 0.0, 1.0]])
+        local_tf = local_tfs[i].at[:3, :3].set(rot)
+        world_tfs = world_tfs.at[i].set(parent_tf @ local_tf)
+
+    # Mock spatial inertia construction
+    inertias = jnp.zeros((num_joints, 6, 6))
+    for i in range(num_joints):
+        m = masses[i]
+        c = coms[i]
+        S = skew(c)
+        inertias = inertias.at[i, :3, :3].set(jnp.eye(3) * m + m * S.T @ S)
+        inertias = inertias.at[i, :3, 3:].set(m * S)
+        inertias = inertias.at[i, 3:, :3].set(m * S.T)
+        inertias = inertias.at[i, 3:, 3:].set(jnp.eye(3) * m)
+    Rs_3x3 = world_tfs[:, :3, :3]
+    zeros = jnp.zeros((num_joints, 3, 3))
+    Rs = jnp.block([[Rs_3x3, zeros], [zeros, Rs_3x3]])
+    Ic = jnp.einsum("ijk,ikl,ilm->ijm", Rs, inertias, Rs.transpose(0, 2, 1))
+
+    # Mock CRBA
+    composite_inertias = jnp.einsum("ij,jkl->ikl", mask.T, Ic)
+    M_part = jnp.einsum("ij,ijk->ik", axes, composite_inertias)
+    M = jnp.einsum("ik,lk->il", M_part, axes)
+    M_lower = mask * M
+    return M_lower + jnp.tril(M_lower, k=-1).T
+
+
+def benchmark_function(func, args, n_calls=100000, n_warmup=10):
+    func_jit = jax.jit(func)
+
+    # JIT Compilation
+    start_time = time.perf_counter()
+    res = func_jit(*args)
+    jax.block_until_ready(res)
+    jit_time = time.perf_counter() - start_time
+
+    # Warmup
+    for _ in range(n_warmup):
+        res = func_jit(*args)
+        jax.block_until_ready(res)
+
+    # Benchmark
+    start = time.perf_counter()
+    for _ in range(n_calls):
+        res = func_jit(*args)
+        jax.block_until_ready(res)
+    elapsed = time.perf_counter() - start
+    avg_time = elapsed / n_calls
+
+    return avg_time, jit_time
+
+
+def main():
+    num_joints = 35
+    q = jnp.zeros(num_joints)
+
+    print(f"JAX version: {jax.__version__}")
+    print(f"Device: {jax.devices()[0]}")
+    print(f"Float precision: "
+          f"{'x64' if jax.config.read('jax_enable_x64') else 'x32'}")
+
+    avg, jit = benchmark_function(mock_mass_matrix, (q,))
+
+    print("\nMimic Structure Benchmark:")
+    print(f"Average time: {avg * 1e3:.4f} ms")
+    print(f"JIT time: {jit * 1e3:.4f} ms")
+
+
+if __name__ == "__main__":
+    main()
+```
+
+### A.2 Example 2 — Cholesky-like `lax.scan`
+
+Source: <https://github.com/jax-ml/jax/issues/36799#issuecomment-4270944098>
+
+```python
+"""Run on both JAX versions to reproduce the regression."""
+import statistics
+import time
+import jax
+import jax.numpy as jnp
+
+jax.config.update("jax_enable_x64", True)
+
+N, M, SAMPLES = 2000, 3, 200
+
+key = jax.random.PRNGKey(0)
+dtype = jnp.float64  # change to jnp.float32 to confirm it is unaffected
+
+d = jax.random.uniform(key, (N,), dtype=dtype, minval=1.0, maxval=2.0)
+p = jax.random.normal(key, (N, M), dtype=dtype) * 0.1
+q = jax.random.normal(key, (N, M), dtype=dtype) * 0.1
+a = jax.random.normal(key, (N, M, M), dtype=dtype) * 0.1
+init = jnp.zeros((M, M), dtype=dtype)
+
+
+def body(carry, data):
+    fp = carry
+    dk, pk, qk, ak = data
+    ck = jnp.sqrt(dk - pk @ fp @ pk)
+    tmp = fp @ ak.T
+    wk = (qk - pk @ tmp) / ck
+    return ak @ tmp + jnp.outer(wk, wk), (ck, wk)
+
+
+compiled = jax.jit(lambda: jax.lax.scan(body, init, (d, p, q, a))).lower().compile()
+jax.block_until_ready(compiled())  # warmup
+
+ts = []
+for _ in range(SAMPLES):
+    t0 = time.perf_counter()
+    jax.block_until_ready(compiled())
+    ts.append(time.perf_counter() - t0)
+
+print(f"JAX {jax.__version__} dtype={dtype} n={N} m={M} "
+      f"median={statistics.median(ts) * 1e6:.1f} µs")
+```
+
+### A.3 How to capture HLO for the §9.2 benchmark harness
+
+Both programs can be dumped to HLO text for reproducible in-repo
+benchmarking without depending on a JAX install in CI:
+
+```bash
+XLA_FLAGS="--xla_dump_to=/tmp/hlo --xla_dump_hlo_as_text" \
+  python example_a.py
+# → /tmp/hlo/module_0000.jit_mock_mass_matrix.before_optimizations.txt
+# → /tmp/hlo/module_0000.jit_mock_mass_matrix.after_optimizations.txt
+```
+
+Copy the `before_optimizations.txt` into `xla/service/cpu/testdata/`
+as `bench_mass_matrix_35.hlo` (and analogously for Example 2). The
+benchmark harness loads these with the standard HLO text parser.
+This keeps the benchmark hermetic, reproducible across JAX-version
+drift, and identical to what production `jax.jit` feeds xla:cpu.
+
