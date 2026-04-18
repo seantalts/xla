@@ -1241,6 +1241,77 @@ If a user hits a regression after the default flip:
 
 ## 11. Risks & Open Questions
 
+### 11.1 Risks
+
+1. **Fusion-emitter coverage gaps.** The §5.3 allow-list encodes what
+   we *think* `FusionCompiler` can lower. If the list is wrong, a
+   mega-fusion compile fails. Mitigation: allow-list is conservative
+   (elementwise + reduce + small set of shape ops + dot), and every
+   new opcode is added via a one-line change + a unit test (§9.1).
+2. **LLVM compile-time blow-up.** A mega-fusion containing hundreds
+   of ops produces a correspondingly larger LLVM function. Register
+   allocation and instruction selection are roughly
+   super-linear. If compile time regresses, we lower the kflops
+   threshold. (§9.3 guard 3 watches this.)
+3. **Register pressure / code size.** A single fat kernel may spill
+   to stack where several kernels wouldn't. This reduces the
+   speedup but should not cause correctness issues. Visible in
+   per-call benchmarks — if speedup is < target, investigate.
+4. **Numerical drift from reassociation.** Growing a fusion can
+   reorder a sum (e.g., reduction tree). Deterministic across
+   compiles but not bit-identical to today's output. Mitigation:
+   §9.3 guard 7 uses a small `atol`. If customers need bit-exact
+   outputs, they set the flag to `0`.
+5. **Interaction with parallel task assignment.**
+   `parallel_task_assignment.cc` decides which kernels get
+   parallelized. A mega-fusion presents as one big kernel —
+   parallel task assignment may over- or under-parallelize it.
+   v1 accepts this (§6 non-goal); track the effect in benchmarks.
+6. **AOT determinism.** AOT compilation relies on reproducible HLO
+   passes. The pass is deterministic (§9.3 guard 4) but we should
+   eyeball an AOT artifact once before flipping the default.
+7. **Increased live-ranges / buffer pressure.** Inside a mega-fusion,
+   every intermediate that's a `kFusion` output is now an internal
+   value. Bufferization inside `FusionCompiler` handles this, but
+   peak memory for a single kernel invocation may increase.
+   Unlikely to matter for the small-program use case (by
+   construction, these programs are small) but worth a smoketest.
+
+### 11.2 Open questions
+
+1. **Default `kflops_threshold` value.** §4.3 suggests `50`. Real
+   choice comes from running §9.2 benchmarks across a sweep (e.g.,
+   `{10, 25, 50, 100, 250, 1000}`) and picking the minimum value
+   that hits the 2× bar on both examples without regressing the
+   large-matmul benchmark. **Blocker for default flip (commit 5).**
+2. **Parallel-win threshold (`kParallelWinThreshold = 4096`).**
+   Tuned to "roughly one AVX2 float lane × cache line × a few
+   unrolls". Needs the same sweep as above; likely insensitive.
+3. **Should `CpuMultiOutputFusion` still run?** It overlaps with
+   `MegaFusionPass` but uses a different heuristic (shared
+   operands). Hypothesis: keep both; `MegaFusionPass` runs after
+   and subsumes whatever `CpuMultiOutputFusion` leaves. If
+   benchmarks show churn or redundancy, consider disabling
+   `CpuMultiOutputFusion` when `MegaFusionPass` is enabled.
+4. **Region size cap.** Should we also cap by *op count* (e.g.,
+   ≤ 500 ops) in addition to kflops? Protects against
+   pathological LLVM compile time. v1 answer: not yet; add if
+   §11.1 risk 2 materializes.
+5. **Instruction allow-list completeness.** Which opcodes are
+   *actually* safe? The §5.3 rule-4 list is my best guess from
+   surveying `cpu_fusion_emitter_test.cc`. The implementer should
+   cross-check against the real emitter source before shipping.
+6. **Where to put benchmarks.** The repo has multiple benchmark
+   harnesses (hlo_runner, microbench). Pick one and stick to it —
+   probably `xla/service/cpu/benchmarks/` if it exists.
+7. **Name.** "MegaFusionPass" is a placeholder. Alternatives:
+   `WholeProgramFusionPass`, `SmallProgramFusionPass`,
+   `RegionMergePass`. Reviewers' call.
+8. **Should the pass consider computation barriers (control
+   dependencies) explicitly?** `kAfterAll` / `kAddDependency` are
+   in the barrier list (§5.3) which is conservative. If a program
+   uses them heavily and regresses, revisit.
+
 ## 12. v2 Roadmap
 
 ### 12.1 While-loop inlining
