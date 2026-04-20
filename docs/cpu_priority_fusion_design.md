@@ -1,6 +1,6 @@
 # Sharing Priority Fusion Between XLA:GPU and XLA:CPU
 
-Status: Draft design (part 1 of 3 — motivation, current state, high-level shape)
+Status: Draft design (parts 1–2 of 3 — motivation, current state, high-level shape, interfaces)
 Owner: `claude/gpu-priority-fusion-shared-LWbBQ`
 Last updated: 2026-04-20
 
@@ -114,10 +114,224 @@ work-items-preservation rule.
    `xla/backends/cpu/transforms/priority_fusion.{h,cc}` constructs a
    `CpuFusionCostModel` + `CpuFusionPolicy` and runs the shared pass.
 
-Parts 2 and 3 (to follow) will cover:
+## Interfaces
 
-- Part 2 — Interfaces: full `FusionCostModel` and `BackendFusionPolicy`
-  signatures, `ComplexOpPolicy` and the kFLOPs / work-items refusal
-  rule, CPU cost model implementation sketch, CPU legality policy.
-- Part 3 — Rollout: pipeline integration for GPU and CPU, migration
-  plan, risks and open questions, citations appendix.
+### `FusionCostModel`
+
+```cpp
+// xla/hlo/analysis/fusion_cost_model.h
+namespace xla {
+
+struct FusionEstimate {
+  // Wall-clock predictions used to compute priority.
+  absl::Duration time_unfused;
+  absl::Duration time_fused;
+
+  // Total compute of the fused kernel, in thousands of FLOPs.
+  int64_t fused_kflops;
+
+  // Number of independent units the fused kernel can dispatch in
+  // parallel. On GPU this is thread-blocks or tiles. On CPU this is
+  // the product of outer_dimension_partitions (or the natural outer-dim
+  // work count when partitions are unset).
+  int64_t fused_independent_work_items;
+
+  // Same metric for the inputs before fusion. Used to detect
+  // "parallelism collapse" (fused < min(producer, consumer)).
+  int64_t producer_independent_work_items;
+  int64_t consumer_independent_work_items;
+};
+
+class FusionCostModel {
+ public:
+  virtual ~FusionCostModel() = default;
+
+  // Estimate the benefit of fusing `producer` into `consumer`. The
+  // implementation is allowed to cache internally.
+  virtual absl::StatusOr<FusionEstimate> EstimateFusion(
+      const HloInstruction* producer, const HloInstruction* consumer) = 0;
+
+  // Called by the shared pass whenever an instruction's shape/users
+  // change. Mirrors GpuHloCostAnalysis::RevisitInstruction.
+  virtual absl::Status RevisitInstruction(const HloInstruction* instr) = 0;
+
+  // Called when an instruction is removed from the module.
+  virtual void ForgetInstruction(const HloInstruction* instr) = 0;
+};
+
+}  // namespace xla
+```
+
+The shared pass computes `priority = time_unfused - time_fused` exactly
+as today; backends control the duration estimate.
+
+### `BackendFusionPolicy`
+
+```cpp
+// xla/hlo/analysis/fusion_cost_model.h
+namespace xla {
+
+class BackendFusionPolicy {
+ public:
+  virtual ~BackendFusionPolicy() = default;
+
+  // Backend-specific legality. Applied on top of the shared legality
+  // checks (root-crossing, fusibility, in-place, cycles, budget).
+  virtual FusionDecision CanFuse(const HloInstruction* producer,
+                                 const HloInstruction* consumer) = 0;
+
+  // FusionKind for the resulting fusion (kLoop, kInput, kCustom, ...).
+  // On CPU today this is always kLoop.
+  virtual HloInstruction::FusionKind ChooseKind(
+      const HloInstruction* producer, const HloInstruction* consumer) = 0;
+
+  // Is this op "expensive" for the purpose of duplication checks?
+  virtual bool IsExpensive(const HloInstruction& instr) = 0;
+};
+
+}  // namespace xla
+```
+
+### `ComplexOpPolicy` and the kFLOPs / work-items refusal rule
+
+The user flagged four ops that have crashed or generated pathological
+code on CPU when fused: `dynamic-update-slice`, `dynamic-slice`,
+`concatenate`, `pad`.
+
+We encode the observation as a `ComplexOpPolicy` configuration owned by
+the shared pass and consulted inside the drive loop after the cost
+model returns a `FusionEstimate`:
+
+```cpp
+// xla/hlo/transforms/fusion/priority_fusion.h
+namespace xla {
+
+struct ComplexOpPolicy {
+  // Opcodes that are "complex" enough that fusing them may hurt
+  // codegen. Default {} on GPU, {dynamic-update-slice, dynamic-slice,
+  // concatenate, pad} on CPU.
+  absl::flat_hash_set<HloOpcode> complex_ops;
+
+  // Refuse a fusion if BOTH of these hold:
+  //   (1) fused_kflops > max_kflops_when_collapsing_parallelism
+  //   (2) fused_independent_work_items < min_independent_work_items
+  //       AND max(producer_work_items, consumer_work_items)
+  //           >= min_independent_work_items
+  //
+  // In words: "don't allow a complex, expensive op to collapse a
+  // kernel below 32-way parallelism when either input had that much
+  // parallelism to begin with."
+  int64_t max_kflops_when_collapsing_parallelism = 1024;  // tuned per backend
+  int64_t min_independent_work_items = 32;
+};
+
+}  // namespace xla
+```
+
+The rule fires only when at least one of `producer` or `consumer` is in
+`complex_ops`. GPU defaults to an empty set, preserving today's
+behavior. The `max_kflops_when_collapsing_parallelism` threshold `X` is
+a tuning knob; `1024` kFLOPs (≈ 1 MFLOP of compute in the fused kernel)
+is a reasonable starting point — large enough to catch "heavy kernel
+gets serialized by a pad" but small enough that genuinely tiny ops can
+still fuse for memory-traffic savings.
+
+Pseudocode inside the shared pass, invoked after `CanFuse` succeeds and
+before the candidate is enqueued:
+
+```cpp
+FusionEstimate est =
+    TF_RETURN_IF_ERROR(cost_model->EstimateFusion(producer, consumer));
+
+const bool involves_complex =
+    policy_.complex_ops.contains(producer->opcode()) ||
+    policy_.complex_ops.contains(consumer->opcode());
+const int64_t before = std::max(est.producer_independent_work_items,
+                                est.consumer_independent_work_items);
+
+if (involves_complex
+    && est.fused_kflops > policy_.max_kflops_when_collapsing_parallelism
+    && est.fused_independent_work_items < policy_.min_independent_work_items
+    && before >= policy_.min_independent_work_items) {
+  return FusionDecision::Forbid(
+      "complex op would collapse parallelism below threshold");
+}
+```
+
+This is the principled refusal rule the user asked for: a single
+condition, parameterized on the two numbers every backend cost model
+must return.
+
+### CPU cost model sketch
+
+`xla/backends/cpu/transforms/cpu_fusion_cost_model.{h,cc}`:
+
+```cpp
+class CpuFusionCostModel : public FusionCostModel {
+ public:
+  CpuFusionCostModel(const se::DeviceDescription& cpu_device_info,
+                     HloCostAnalysis::ShapeSizeFunction shape_size);
+
+  absl::StatusOr<FusionEstimate> EstimateFusion(
+      const HloInstruction* producer,
+      const HloInstruction* consumer) override;
+  absl::Status RevisitInstruction(const HloInstruction* instr) override;
+  void ForgetInstruction(const HloInstruction* instr) override;
+
+ private:
+  int64_t IndependentWorkItems(const HloInstruction* instr) const;
+  absl::Duration ComputeTime(int64_t flops) const;
+  absl::Duration MemoryTime(int64_t bytes) const;
+
+  HloCostAnalysis cost_analysis_;  // base class is sufficient on CPU
+  double peak_flops_per_second_;
+  double peak_bw_bytes_per_sec_;
+  int vector_width_;               // e.g. 8 floats for AVX2
+  int num_threads_;
+};
+```
+
+**Runtime estimate.** `exec_time = max(compute_time, memory_time)` —
+the same roofline model GPU uses, with CPU constants.
+`compute_time = flops / (peak_flops_per_second * vector_width)`;
+`memory_time = bytes_accessed / peak_bw_bytes_per_sec`. This is crude
+but sufficient to rank fusion candidates; it is not a substitute for
+profiling.
+
+**Work items.** `IndependentWorkItems(instr)` returns, in order of
+preference:
+
+1. `Product(instr->backend_config().outer_dimension_partitions())` if
+   set and non-empty.
+2. Otherwise, product of the outermost dimensions of `instr->shape()`
+   that are `>= vector_width_` — the natural outer-loop parallelism the
+   tiled emitter would exploit.
+3. `1` for scalars / single-element shapes.
+
+For a fusion candidate we estimate
+`fused_independent_work_items = IndependentWorkItems(consumer)`, which
+captures the fact that fusion flattens the producer into the consumer's
+iteration space. Producer and consumer values are computed pre-fusion
+for the refusal rule.
+
+**kFLOPs.** `fused_kflops =
+(flops(producer) + flops(consumer) + 999) / 1000`, using the base
+`HloCostAnalysis`.
+
+### CPU legality policy
+
+`CpuFusionPolicy` encodes roughly what `CpuInstructionFusion::ShouldFuse`
+does today:
+
+- Reject non-loop-fusible ops (carry over `CanBeLoopFused` predicate).
+- Reject concat on minor dimension
+  (`cpu_instruction_fusion.cc:362-380`).
+- Reject >5 reductions per fusion (b/419635451).
+- Reject large (>10 KB) constants.
+- Reject when producer is expensive AND consumer reuses operand
+  elements.
+- **Do not** duplicate the complex-op refusal rule here — that lives in
+  the shared `ComplexOpPolicy` so GPU can enable it in the future.
+
+Part 3 (to follow) will cover pipeline integration for GPU and CPU, the
+migration plan, risks and open questions, and the citations appendix.
