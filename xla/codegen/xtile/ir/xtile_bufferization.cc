@@ -35,6 +35,7 @@ limitations under the License.
 #include "mlir/IR/BuiltinTypeInterfaces.h"
 #include "mlir/IR/BuiltinTypes.h"
 #include "mlir/IR/Location.h"
+#include "mlir/IR/Matchers.h"
 #include "mlir/IR/OpDefinition.h"
 #include "mlir/IR/OperationSupport.h"
 #include "mlir/IR/PatternMatch.h"
@@ -131,6 +132,30 @@ static mlir::TypedValue<mlir::MemRefType> GetFullTileSubView(
 
   return mlir::memref::SubViewOp::create(builder, subview_type, op.getBuffer(),
                                          offsets, tile_size, strides);
+}
+
+// Returns true if an aligned-tile op's bufferize method will take the
+// alloc+copy layout-fixup path (vs. the identity-layout fast path that
+// just emits a subview+to_tensor with no allocation).
+//
+// The fast path fires only when GetFullTileSubView produces an
+// identity-layout memref. That requires: no rank reduction, all offsets
+// statically zero, and all strides equal to 1. Anything else (dynamic
+// offsets, non-zero static offsets, non-unit strides, rank reduction)
+// yields a strided non-identity layout and triggers the fixup alloc.
+//
+// Conservative direction: if we cannot prove no-alloc, return true.
+static bool WillAllocateForLayoutFixup(TiledBufferInterface op) {
+  if (op.getTile().getType().getRank() != op.getBuffer().getType().getRank()) {
+    return true;
+  }
+  for (mlir::Value offset : op.getOffsets()) {
+    if (!mlir::matchPattern(offset, mlir::m_Zero())) return true;
+  }
+  for (int64_t stride : op.getStrides()) {
+    if (stride != 1) return true;
+  }
+  return false;
 }
 
 // Get the subview of the local buffer - i.e it has 0 offsets & unit strides.
@@ -369,27 +394,37 @@ bool ExtractAlignedTileOp::bufferizesToMemoryRead(
 
 bool ExtractAlignedTileOp::bufferizesToMemoryWrite(
     mlir::OpOperand& operand, const mlir::bufferization::AnalysisState& state) {
-  return true;
+  // Extract reads from `source`; it never writes to it.
+  return false;
 }
 
 bool ExtractAlignedTileOp::bufferizesToAllocation(mlir::Value value) {
-  // As we don't know if we will emit an allocation at compile time we must be
-  // conservative.
-  return true;
+  // Honest answer: depends on which bufferize path will fire. Identity-layout
+  // fast path returns a subview wrapped in to_tensor (no fresh alloc; aliases
+  // source). Layout-fixup path emits alloc + memref.copy (fresh memref).
+  return WillAllocateForLayoutFixup(*this);
 }
 
 mlir::bufferization::AliasingValueList ExtractAlignedTileOp::getAliasingValues(
     mlir::OpOperand& operand, const mlir::bufferization::AnalysisState& state) {
-  return {};
+  // On the identity-layout fast path, the result is a subview of source and
+  // aliases it Equivalently. On the layout-fixup path, the result is fresh
+  // memory independent of source.
+  if (WillAllocateForLayoutFixup(*this)) return {};
+  mlir::bufferization::AliasingValue result(
+      getResult(), mlir::bufferization::BufferRelation::Equivalent,
+      /*isDefinite=*/true);
+  return {result};
 }
 
 mlir::bufferization::AliasingOpOperandList
 ExtractAlignedTileOp::getAliasingOpOperands(
     mlir::Value value, const mlir::bufferization::AnalysisState& state) {
   DCHECK_EQ(value, getResult());
+  if (WillAllocateForLayoutFixup(*this)) return {};
   mlir::bufferization::AliasingOpOperand result(
       &getSourceMutable(), mlir::bufferization::BufferRelation::Equivalent,
-      false);
+      /*isDefinite=*/true);
   return {result};
 }
 
@@ -438,9 +473,9 @@ bool InsertAlignedTileOp::bufferizesToMemoryWrite(
 }
 
 bool InsertAlignedTileOp::bufferizesToAllocation(mlir::Value value) {
-  // As we don't know if we will emit an allocation at compile time we must be
-  // conservative.
-  return true;
+  // Insert materializes into an existing destination buffer; it never
+  // allocates a fresh memref of its own.
+  return false;
 }
 
 mlir::bufferization::AliasingValueList InsertAlignedTileOp::getAliasingValues(
