@@ -319,6 +319,42 @@ cc_library(
 )
 
 cc_library(
+    name = "remapped_call_thunk",
+    srcs = ["remapped_call_thunk.cc"],
+    hdrs = ["remapped_call_thunk.h"],
+    deps = [
+        ":buffer_allocations",
+        ":thunk",
+        ":thunk_executor",
+        "//xla/service:buffer_assignment",
+        "//xla/stream_executor:device_address",
+        "//xla/tsl/concurrency:async_value",
+        "//xla/tsl/platform:statusor",
+        "@com_google_absl//absl/memory",
+        "@com_google_absl//absl/status:statusor",
+        "@com_google_absl//absl/strings",
+    ],
+)
+
+cc_test(
+    name = "remapped_call_thunk_test",
+    srcs = ["remapped_call_thunk_test.cc"],
+    deps = [
+        ":buffer_allocations",
+        ":copy_thunk",
+        ":remapped_call_thunk",
+        ":thunk",
+        ":thunk_testlib",
+        "//xla:literal_util",
+        "//xla/service:buffer_assignment",
+        "//xla/tsl/concurrency:async_value",
+        "//xla/tsl/platform:statusor",
+        "//xla/tsl/platform:test",
+        "@com_google_googletest//:gtest_main",
+    ],
+)
+
+cc_library(
     name = "conditional_thunk",
     srcs = ["conditional_thunk.cc"],
     hdrs = ["conditional_thunk.h"],
