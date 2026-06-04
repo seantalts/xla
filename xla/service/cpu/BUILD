@@ -42,6 +42,38 @@ filegroup(
 )
 
 cc_library(
+    name = "compilation_unit_binding",
+    srcs = ["compilation_unit_binding.cc"],
+    hdrs = ["compilation_unit_binding.h"],
+    deps = [
+        "//xla/service:buffer_assignment",
+        "@com_google_absl//absl/status",
+        "@com_google_absl//absl/status:statusor",
+        "@com_google_absl//absl/strings",
+        "@com_google_absl//absl/types:span",
+    ],
+)
+
+cc_test(
+    name = "compilation_unit_binding_test",
+    srcs = ["compilation_unit_binding_test.cc"],
+    deps = [
+        ":compilation_unit_binding",
+        "//xla:shape_util",
+        "//xla/hlo/analysis:alias_info",
+        "//xla/hlo/analysis:hlo_ordering",
+        "//xla/hlo/ir:hlo",
+        "//xla/hlo/testlib:hlo_hardware_independent_test_base",
+        "//xla/service:buffer_assignment",
+        "//xla/service:buffer_value",
+        "//xla/service:logical_buffer",
+        "//xla/tsl/platform:statusor",
+        "@com_google_absl//absl/strings",
+        "@com_google_googletest//:gtest_main",
+    ],
+)
+
+cc_library(
     name = "test_header_helper",
     testonly = True,
     hdrs = ["test_target_triple_helper.h"],
