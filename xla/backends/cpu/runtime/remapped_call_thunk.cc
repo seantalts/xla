@@ -26,6 +26,7 @@ limitations under the License.
 #include "xla/backends/cpu/runtime/buffer_allocations.h"
 #include "xla/backends/cpu/runtime/thunk.h"
 #include "xla/backends/cpu/runtime/thunk_executor.h"
+#include "xla/runtime/buffer_use.h"
 #include "xla/service/buffer_assignment.h"
 #include "xla/stream_executor/device_address.h"
 #include "xla/tsl/concurrency/async_value_ref.h"
@@ -77,7 +78,22 @@ tsl::AsyncValueRef<Thunk::ExecuteEvent> RemappedCallThunk::Execute(
 }
 
 RemappedCallThunk::BufferUses RemappedCallThunk::buffer_uses() const {
-  return called_executor_.buffer_uses();
+  // The callee's thunks report uses in the callee's private index space. Map
+  // each one through the binding to the caller buffer it actually touches so the
+  // parent scheduler tracks the real dependencies. Offsets compose: a callee use
+  // at offset o within callee allocation i lands at caller_buffers_[i].offset()
+  // + o in the caller's buffer.
+  BufferUses uses;
+  for (const BufferUse& use : called_executor_.buffer_uses()) {
+    const BufferAllocation::Slice& callee_slice = use.slice();
+    const BufferAllocation::Slice& caller = caller_buffers_[callee_slice.index()];
+    BufferAllocation::Slice mapped(caller.allocation(),
+                                   caller.offset() + callee_slice.offset(),
+                                   callee_slice.size(), caller.element_type());
+    uses.push_back(BufferUse(mapped, use.access(), use.content_validity(),
+                             use.shape()));
+  }
+  return uses;
 }
 
 RemappedCallThunk::ResourceUses RemappedCallThunk::resource_uses() const {

@@ -23,6 +23,7 @@ limitations under the License.
 #include "xla/backends/cpu/runtime/thunk.h"
 #include "xla/backends/cpu/runtime/thunk_testlib.h"
 #include "xla/literal_util.h"
+#include "xla/runtime/buffer_use.h"
 #include "xla/service/buffer_assignment.h"
 #include "xla/tsl/concurrency/async_value_ref.h"
 #include "xla/tsl/platform/statusor.h"
@@ -88,6 +89,113 @@ TEST(RemappedCallThunkTest, RemapsCalleePrivateIndicesOntoCallerBuffers) {
 
   // The shared callee wrote through the remapped caller result buffer.
   EXPECT_EQ(output, input);
+}
+
+// Option 1 for callee internals: scratch is pre-assigned per call site in the
+// parent and passed as an ordinary caller binding, so the runtime path needs no
+// per-call allocation. A callee with an internal temp (private index 2) reads
+// param -> temp -> result, with all three indices caller-provided.
+TEST(RemappedCallThunkTest, CalleeInternalBufferIsCallerProvidedScratch) {
+  auto input = LiteralUtil::CreateR1<float>({1.0, 2.0, 3.0, 4.0});
+  auto scratch = LiteralUtil::CreateR1<float>({0.0, 0.0, 0.0, 0.0});
+  auto output = LiteralUtil::CreateR1<float>({0.0, 0.0, 0.0, 0.0});
+
+  // Caller buffer space: input@0, scratch@1, output@2.
+  BufferAllocations caller_allocations =
+      CreateBufferAllocations(input, scratch, output);
+  BufferAllocation caller_in = CreateBufferAllocation(0, input);
+  BufferAllocation caller_scratch = CreateBufferAllocation(1, scratch);
+  BufferAllocation caller_out = CreateBufferAllocation(2, output);
+
+  // Callee private space: param@0, result@1, temp@2. copy 0->2, then 2->1.
+  BufferAllocation callee_param = CreateBufferAllocation(0, input);
+  BufferAllocation callee_result = CreateBufferAllocation(1, output);
+  BufferAllocation callee_temp = CreateBufferAllocation(2, scratch);
+  TF_ASSERT_OK_AND_ASSIGN(
+      auto copy_in,
+      CopyThunk::Create({"copy_in"},
+                        CreateBufferAllocationSlice(callee_param), input.shape(),
+                        CreateBufferAllocationSlice(callee_temp),
+                        scratch.shape()));
+  TF_ASSERT_OK_AND_ASSIGN(
+      auto copy_out,
+      CopyThunk::Create({"copy_out"},
+                        CreateBufferAllocationSlice(callee_temp), scratch.shape(),
+                        CreateBufferAllocationSlice(callee_result),
+                        output.shape()));
+  ThunkSequence callee_sequence;
+  callee_sequence.push_back(std::move(copy_in));
+  callee_sequence.push_back(std::move(copy_out));
+
+  // Bindings indexed by callee allocation index: [0]=param, [1]=result,
+  // [2]=temp -- temp drawn from the caller's per-site scratch buffer.
+  std::vector<BufferAllocation::Slice> caller_buffers = {
+      CreateBufferAllocationSlice(caller_in),
+      CreateBufferAllocationSlice(caller_out),
+      CreateBufferAllocationSlice(caller_scratch)};
+
+  TF_ASSERT_OK_AND_ASSIGN(
+      auto thunk,
+      RemappedCallThunk::Create({"cu_call"}, std::move(callee_sequence),
+                                std::move(caller_buffers)));
+
+  Thunk::ExecuteParams params = {nullptr, &caller_allocations};
+  auto execute_event = thunk->Execute(params);
+  tsl::BlockUntilReady(execute_event);
+  ASSERT_FALSE(execute_event.IsError());
+
+  EXPECT_EQ(output, input);
+}
+
+// The thunk scheduler tracks dependencies through buffer_uses(); for a shared
+// callee those must be reported in the CALLER's buffer space, not the callee's
+// private index space, or the scheduler sees the wrong (private) buffers.
+TEST(RemappedCallThunkTest, BufferUsesAreReportedInCallerSpace) {
+  auto input = LiteralUtil::CreateR1<float>({1.0, 2.0, 3.0, 4.0});
+  auto output = LiteralUtil::CreateR1<float>({0.0, 0.0, 0.0, 0.0});
+
+  // Callee reads private index 0 and writes private index 1.
+  BufferAllocation callee_param = CreateBufferAllocation(0, input);
+  BufferAllocation callee_result = CreateBufferAllocation(1, output);
+  TF_ASSERT_OK_AND_ASSIGN(
+      auto copy, CopyThunk::Create({"copy"},
+                                   CreateBufferAllocationSlice(callee_param),
+                                   input.shape(),
+                                   CreateBufferAllocationSlice(callee_result),
+                                   output.shape()));
+  ThunkSequence callee_sequence;
+  callee_sequence.push_back(std::move(copy));
+
+  // Caller provides param at allocation index 2, result at index 3.
+  BufferAllocation caller_param = CreateBufferAllocation(2, input);
+  BufferAllocation caller_result = CreateBufferAllocation(3, output);
+  std::vector<BufferAllocation::Slice> caller_buffers = {
+      CreateBufferAllocationSlice(caller_param),
+      CreateBufferAllocationSlice(caller_result)};
+
+  TF_ASSERT_OK_AND_ASSIGN(
+      auto thunk,
+      RemappedCallThunk::Create({"cu_call"}, std::move(callee_sequence),
+                                std::move(caller_buffers)));
+
+  auto uses = thunk->buffer_uses();
+  ASSERT_EQ(uses.size(), 2);
+
+  // Exactly one read of caller index 2 and one write of caller index 3.
+  bool read_caller_param = false;
+  bool write_caller_result = false;
+  for (const BufferUse& use : uses) {
+    if (use.access() == BufferUse::MemoryAccess::kRead &&
+        use.slice().index() == 2) {
+      read_caller_param = true;
+    }
+    if (use.access() == BufferUse::MemoryAccess::kWrite &&
+        use.slice().index() == 3) {
+      write_caller_result = true;
+    }
+  }
+  EXPECT_TRUE(read_caller_param);
+  EXPECT_TRUE(write_caller_result);
 }
 
 }  // namespace
