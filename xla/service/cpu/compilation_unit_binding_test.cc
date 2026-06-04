@@ -77,7 +77,8 @@ TEST_F(CompilationUnitBindingTest, MapsParamsAndResultToCallerSlices) {
 
   TF_ASSERT_OK_AND_ASSIGN(
       std::vector<BufferAllocation::Slice> binding,
-      BuildCalleeBinding(*assignment, {p0_slice, p1_slice}, res_slice));
+      BuildCalleeBinding(*assignment, {p0_slice, p1_slice}, res_slice,
+                         /*caller_scratch_slices=*/{}));
 
   // One binding entry per callee private allocation.
   ASSERT_EQ(binding.size(), assignment->Allocations().size());
@@ -90,6 +91,65 @@ TEST_F(CompilationUnitBindingTest, MapsParamsAndResultToCallerSlices) {
     } else if (a.maybe_live_out()) {
       EXPECT_EQ(binding[a.index()], res_slice) << "result";
     }
+  }
+}
+
+// A callee with internal (scratch) allocations binds each one to the next
+// caller scratch slice, in order of increasing callee allocation index.
+TEST_F(CompilationUnitBindingTest, MapsInternalAllocationsToScratchSlices) {
+  // `a` and `b` are both live when `sub` runs, so at least one is a genuine
+  // internal allocation that is neither a parameter nor live-out.
+  constexpr absl::string_view kHlo = R"(
+    HloModule callee
+    ENTRY f {
+      p0 = f32[4] parameter(0)
+      p1 = f32[4] parameter(1)
+      a = f32[4] add(p0, p1)
+      b = f32[4] multiply(p0, p1)
+      ROOT sub = f32[4] subtract(a, b)
+    })";
+  TF_ASSERT_OK_AND_ASSIGN(auto module, ParseAndReturnVerifiedModule(kHlo));
+  std::unique_ptr<BufferAssignment> assignment =
+      RunBufferAssignment(module.get());
+
+  // Collect the internal allocations (neither parameter nor live-out), in
+  // ascending index order.
+  std::vector<int64_t> internal_indices;
+  for (const BufferAllocation& a : assignment->Allocations()) {
+    if (!a.is_entry_computation_parameter() && !a.maybe_live_out()) {
+      internal_indices.push_back(a.index());
+    }
+  }
+  ASSERT_FALSE(internal_indices.empty()) << "test needs >=1 internal allocation";
+
+  BufferAllocation caller_p0(10, 16, LogicalBuffer::Color(0));
+  BufferAllocation caller_p1(11, 16, LogicalBuffer::Color(0));
+  BufferAllocation caller_res(12, 16, LogicalBuffer::Color(0));
+  BufferAllocation::Slice p0_slice(&caller_p0, 0, 16);
+  BufferAllocation::Slice p1_slice(&caller_p1, 0, 16);
+  BufferAllocation::Slice res_slice(&caller_res, 0, 16);
+
+  // One fabricated scratch slice per internal allocation (indices 20, 21, ...).
+  std::vector<BufferAllocation> scratch_allocs;
+  scratch_allocs.reserve(internal_indices.size());
+  std::vector<BufferAllocation::Slice> scratch_slices;
+  for (size_t i = 0; i < internal_indices.size(); ++i) {
+    scratch_allocs.emplace_back(20 + i, 16, LogicalBuffer::Color(0));
+  }
+  for (BufferAllocation& alloc : scratch_allocs) {
+    scratch_slices.emplace_back(&alloc, 0, 16);
+  }
+
+  TF_ASSERT_OK_AND_ASSIGN(
+      std::vector<BufferAllocation::Slice> binding,
+      BuildCalleeBinding(*assignment, {p0_slice, p1_slice}, res_slice,
+                         scratch_slices));
+
+  ASSERT_EQ(binding.size(), assignment->Allocations().size());
+  // Internal allocations consume scratch slices in ascending index order.
+  for (size_t k = 0; k < internal_indices.size(); ++k) {
+    EXPECT_EQ(binding[internal_indices[k]], scratch_slices[k])
+        << "internal #" << k << " (allocation " << internal_indices[k] << ")";
   }
 }
 

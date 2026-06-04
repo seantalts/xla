@@ -15,6 +15,7 @@ limitations under the License.
 
 #include "xla/service/cpu/compilation_unit_binding.h"
 
+#include <cstddef>
 #include <cstdint>
 #include <vector>
 
@@ -29,11 +30,16 @@ namespace xla::cpu {
 absl::StatusOr<std::vector<BufferAllocation::Slice>> BuildCalleeBinding(
     const BufferAssignment& callee_assignment,
     absl::Span<const BufferAllocation::Slice> caller_param_slices,
-    const BufferAllocation::Slice& caller_result_slice) {
+    const BufferAllocation::Slice& caller_result_slice,
+    absl::Span<const BufferAllocation::Slice> caller_scratch_slices) {
   const std::vector<BufferAllocation>& allocations =
       callee_assignment.Allocations();
   std::vector<BufferAllocation::Slice> binding(allocations.size());
 
+  // Internal allocations consume scratch slices in iteration order, which is
+  // ascending allocation index (Allocations() is index-ordered). The producer
+  // that reserves the scratch tuple elements must use the same order.
+  size_t scratch_index = 0;
   for (const BufferAllocation& allocation : allocations) {
     // Check parameters before live-out so a parameter aliased with the output
     // binds to the caller's operand buffer. (TODO: revisit in/out aliasing and
@@ -50,9 +56,12 @@ absl::StatusOr<std::vector<BufferAllocation::Slice>> BuildCalleeBinding(
     } else if (allocation.maybe_live_out()) {
       binding[allocation.index()] = caller_result_slice;
     } else {
-      return absl::UnimplementedError(absl::StrCat(
-          "compilation_unit callee internal/scratch allocation #",
-          allocation.index(), " is not yet supported (see plan 3B)"));
+      if (scratch_index >= caller_scratch_slices.size()) {
+        return absl::InvalidArgumentError(absl::StrCat(
+            "Callee has more internal allocations than caller scratch slices (",
+            caller_scratch_slices.size(), " provided)"));
+      }
+      binding[allocation.index()] = caller_scratch_slices[scratch_index++];
     }
   }
   return binding;

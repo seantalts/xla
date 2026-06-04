@@ -33,11 +33,15 @@ namespace xla::cpu {
 // allocation at this call site:
 //   - a callee parameter allocation p  -> `caller_param_slices[p]`
 //   - the callee result allocation     -> `caller_result_slice`
-//   - an internal (scratch) allocation -> not yet supported (see plan 3B)
+//   - an internal (scratch) allocation -> the next `caller_scratch_slices`
+//     entry, consumed in order of increasing callee allocation index. These are
+//     the per-site scratch buffers the caller reserves (see plan 3B: tuple
+//     output `(result, scratch...)`).
 absl::StatusOr<std::vector<BufferAllocation::Slice>> BuildCalleeBinding(
     const BufferAssignment& callee_assignment,
     absl::Span<const BufferAllocation::Slice> caller_param_slices,
-    const BufferAllocation::Slice& caller_result_slice);
+    const BufferAllocation::Slice& caller_result_slice,
+    absl::Span<const BufferAllocation::Slice> caller_scratch_slices);
 
 }  // namespace xla::cpu
 
