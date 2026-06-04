@@ -174,5 +174,31 @@ ENTRY entry {
   EXPECT_TRUE(Run(std::move(module), /*run_hlo_passes=*/true));
 }
 
+TEST_F(MultiModuleDriverTest, CompileKeepingSubmodulesLeavesParentUnstitched) {
+  ASSERT_OK_AND_ASSIGN(std::unique_ptr<VerifiedHloModule> module,
+                       GetModuleWithCompilationUnit());
+
+  // Identity compile_fn: we are exercising split/no-stitch, not HLO passes.
+  MultiModuleDriver driver(
+      [](std::unique_ptr<HloModule> m, const Compiler::CompileOptions&) {
+        return absl::StatusOr<std::unique_ptr<HloModule>>(std::move(m));
+      });
+
+  ASSERT_OK_AND_ASSIGN(
+      MultiModuleDriver::SplitCompileResult result,
+      driver.CompileKeepingSubmodules(std::move(module), {nullptr},
+                                      Compiler::CompileOptions()));
+
+  // One deduplicated submodule (the callee).
+  EXPECT_EQ(result.submodules.size(), 1);
+
+  // Parent is left un-stitched: the call site is still a multi-module
+  // custom-call, not re-inlined back to a kCall.
+  ASSERT_OK_AND_ASSIGN(bool ok, RunFileCheck(result.module->ToString(), R"(
+// CHECK: _xla_multi_module_call
+)"));
+  EXPECT_TRUE(ok);
+}
+
 }  // namespace
 }  // namespace xla

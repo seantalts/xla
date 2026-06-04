@@ -58,6 +58,25 @@ class MultiModuleDriver {
       const std::vector<se::StreamExecutor*>& stream_execs,
       const Compiler::CompileOptions& options) const;
 
+  // An optimized parent module plus the optimized submodules extracted from it.
+  struct SplitCompileResult {
+    // Parent module. When `submodules` is non-empty it is left UN-stitched: the
+    // call sites remain `kMultiModuleCustomCallTarget` custom-calls referencing
+    // the submodules by name. (Empty `submodules` means nothing was split.)
+    std::unique_ptr<HloModule> module;
+    // Optimized, deduplicated submodules (one per unique compilation unit).
+    std::vector<std::unique_ptr<HloModule>> submodules;
+  };
+
+  // Like Compile, but does NOT stitch the optimized submodules back into the
+  // parent: returns the parent with custom-calls intact plus the submodules, so
+  // the backend can emit each submodule once and lower the custom-calls to
+  // shared calls. This is the entry point for shared compilation-unit emission.
+  absl::StatusOr<SplitCompileResult> CompileKeepingSubmodules(
+      std::unique_ptr<HloModule> module,
+      const std::vector<se::StreamExecutor*>& stream_execs,
+      const Compiler::CompileOptions& options) const;
+
   // Returns the number of times Compile() has been called. Used for testing
   // and debugging purposes.
   static int GetCompileCount();
@@ -66,6 +85,14 @@ class MultiModuleDriver {
   static void ResetCompileCount();
 
  private:
+  // Splits `module` and compiles the parent + each submodule via `compile_fn_`
+  // (in parallel when an executor is available). Returns the optimized parent
+  // and optimized submodules, UN-stitched. Empty `submodules` means the module
+  // had no compilation units to split.
+  absl::StatusOr<SplitCompileResult> SplitAndCompile(
+      std::unique_ptr<HloModule> module,
+      const Compiler::CompileOptions& options) const;
+
   CompileFn compile_fn_;
   tsl::Executor* executor_;
   static std::atomic<int> compile_count_;
