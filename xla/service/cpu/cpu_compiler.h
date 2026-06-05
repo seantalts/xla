@@ -20,8 +20,11 @@ limitations under the License.
 #include <string>
 #include <vector>
 
+#include "absl/base/thread_annotations.h"
+#include "absl/container/flat_hash_map.h"
 #include "absl/status/status.h"
 #include "absl/status/statusor.h"
+#include "absl/synchronization/mutex.h"
 #include "llvm/Support/CodeGen.h"
 #include "llvm/Target/TargetMachine.h"
 #include "llvm/TargetParser/Triple.h"
@@ -140,6 +143,16 @@ class CpuCompiler : public LLVMCompiler {
 
   CpuCompiler(const CpuCompiler&) = delete;
   CpuCompiler& operator=(const CpuCompiler&) = delete;
+
+  // Side channel carrying compilation-unit submodules from RunHloPasses to
+  // RunBackend when xla_cpu_compilation_unit_shared_emission is enabled. Keyed
+  // by the parent module's unique_id (stable across the RunHloPasses ->
+  // RunBackend boundary, distinct per concurrent compile). Populated with the
+  // optimized, un-stitched submodules in RunHloPasses; drained in RunBackend.
+  absl::Mutex compilation_unit_submodules_mu_;
+  absl::flat_hash_map<int, std::vector<std::unique_ptr<HloModule>>>
+      compilation_unit_submodules_
+          ABSL_GUARDED_BY(compilation_unit_submodules_mu_);
 };
 
 }  // namespace cpu

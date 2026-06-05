@@ -47,6 +47,7 @@ limitations under the License.
 #include "absl/strings/str_format.h"
 #include "absl/strings/str_join.h"
 #include "absl/strings/string_view.h"
+#include "absl/synchronization/mutex.h"
 #include "absl/types/span.h"
 #include "xla/tsl/platform/status_macros.h"
 #include "llvm/ADT/SmallVector.h"
@@ -1283,6 +1284,23 @@ absl::StatusOr<std::unique_ptr<HloModule>> CpuCompiler::RunHloPasses(
           return this->RunHloPasses(std::move(m), stream_exec, opts);
         },
         GetCpuCompilationThreadPool());
+    if (module->config()
+            .debug_options()
+            .xla_cpu_compilation_unit_shared_emission()) {
+      // Shared emission: leave the parent un-stitched and stash the optimized
+      // submodules for RunBackend to emit once and lower the call sites to
+      // shared RemappedCallThunks.
+      TF_ASSIGN_OR_RETURN(
+          MultiModuleDriver::SplitCompileResult result,
+          driver.CompileKeepingSubmodules(std::move(module), {stream_exec},
+                                          options));
+      const int parent_id = result.module->unique_id();
+      {
+        absl::MutexLock lock(&compilation_unit_submodules_mu_);
+        compilation_unit_submodules_[parent_id] = std::move(result.submodules);
+      }
+      return std::move(result.module);
+    }
     return driver.Compile(std::move(module), {stream_exec}, options);
   }
   auto& config = module->config();

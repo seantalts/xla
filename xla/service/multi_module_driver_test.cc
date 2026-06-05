@@ -200,5 +200,26 @@ TEST_F(MultiModuleDriverTest, CompileKeepingSubmodulesLeavesParentUnstitched) {
   EXPECT_TRUE(ok);
 }
 
+TEST_F(MultiModuleDriverTest, SharedEmissionFlagKeepsRunHloPassesUnstitched) {
+  ASSERT_OK_AND_ASSIGN(std::unique_ptr<VerifiedHloModule> module,
+                       GetModuleWithCompilationUnit());
+  module->mutable_config()
+      .mutable_debug_options()
+      .set_xla_cpu_compilation_unit_shared_emission(true);
+
+  cpu::CpuCompiler compiler;
+  ASSERT_OK_AND_ASSIGN(
+      std::unique_ptr<HloModule> optimized,
+      compiler.RunHloPasses(std::move(module), nullptr,
+                            Compiler::CompileOptions()));
+
+  // With shared emission on, RunHloPasses does NOT stitch: the call site stays
+  // a multi-module custom-call for the backend to lower to a shared call.
+  ASSERT_OK_AND_ASSIGN(bool ok, RunFileCheck(optimized->ToString(), R"(
+// CHECK: _xla_multi_module_call
+)"));
+  EXPECT_TRUE(ok);
+}
+
 }  // namespace
 }  // namespace xla
