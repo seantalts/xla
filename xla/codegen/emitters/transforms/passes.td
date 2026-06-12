@@ -47,6 +47,38 @@ def ConvertPureCallOpsPass
   let constructor = "CreateConvertPureCallOpsPass()";
 }
 
+def XlaInlinerPass : Pass<"xla-inliner", "mlir::ModuleOp"> {
+  let summary = "Inlines xla.pure_call ops according to a per-backend policy.";
+
+  let description = [{
+      Mirrors the upstream inline pass (SCC-driven, running an optimization
+      pipeline over callables between iterations), but takes the inlining
+      profitability decision from an explicitly chosen policy instead of the
+      xla dialect: the dialect is shared between backends, and which inlining
+      policy is profitable is a per-backend decision.
+
+      Policies:
+        conservative: inline a callee that has several callers only when the
+          caller and the callee call a common third function (the historical
+          xla emitter heuristic).
+  }];
+
+  let options = [
+    Option<"policy_", "policy", "std::string",
+           /*default=*/"\"conservative\"",
+           "Inlining profitability policy. One of: 'conservative'.">,
+    Option<"default_pipeline_", "default-pipeline", "std::string",
+           /*default=*/"\"canonicalize\"",
+           "The optimizer pipeline run over callables between inlining "
+           "iterations (mirrors the upstream inline pass option).">,
+    Option<"max_iterations_", "max-iterations", "unsigned",
+           /*default=*/"4",
+           "Maximum number of inlining iterations within an SCC.">,
+  ];
+
+  let constructor = "CreateXlaInlinerPass()";
+}
+
 def EraseDeadFunctionsPass : Pass<"xla-erase-dead-functions", "mlir::ModuleOp"> {
   let summary = "Deletes unused functions";
 

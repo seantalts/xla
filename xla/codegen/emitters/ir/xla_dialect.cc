@@ -13,10 +13,6 @@ See the License for the specific language governing permissions and
 limitations under the License.
 ==============================================================================*/
 
-#include <cstdint>
-
-#include "llvm/ADT/DenseSet.h"
-#include "llvm/ADT/StringRef.h"
 #include "llvm/ADT/TypeSwitch.h"  // IWYU pragma: keep
 #include "llvm/Support/Casting.h"
 #include "mlir/Dialect/Arith/IR/Arith.h"
@@ -39,10 +35,6 @@ limitations under the License.
 namespace xla {
 namespace {
 
-constexpr int64_t kMaxFuncSize = 4000;
-
-int64_t GetNumOps(mlir::Block& block) { return block.getOperations().size(); }
-
 struct XlaInlinerInterface : public mlir::DialectInlinerInterface {
   using DialectInlinerInterface::DialectInlinerInterface;
   // Returns true if the given operation 'callable', that implements the
@@ -56,50 +48,21 @@ struct XlaInlinerInterface : public mlir::DialectInlinerInterface {
                        bool wouldBeCloned) const final {
     if (call->hasAttr("noinline")) return false;
     if (callable->hasAttr(emitters::kHasNoCompute)) return true;
-    // Otherwise, inline only if the called function is small. We could
-    // theoretically also inline if there is no other caller in the function
-    // that contains the callee that has a call path to the callable, but that
-    // is more expensive to check.
     auto func_op = mlir::dyn_cast<mlir::func::FuncOp>(callable);
     if (!func_op) {
       return false;
     }
-    auto pure_call_op = mlir::dyn_cast<PureCallOp>(call);
-    if (!pure_call_op) {
+    if (!mlir::isa<PureCallOp>(call)) {
       return false;
     }
-    auto callable_region = func_op.getCallableRegion();
-    if (!callable_region) {
+    if (!func_op.getCallableRegion()) {
       return false;
     }
-
-    llvm::SmallDenseSet<llvm::StringRef> callee_calls;
-    for (auto callee_call : callable_region->getOps<PureCallOp>()) {
-      callee_calls.insert(callee_call.getCallee());
-    }
-
-    // If true, then the callee and the caller call the same third function.
-    bool contains_call_to_same_function = false;
-    // The number of calls to the callee in the caller.
-    int num_calls_in_caller = 0;
-    if (!wouldBeCloned) {
-      num_calls_in_caller = 1;
-    } else {
-      for (auto neighbor_call : call->getParentRegion()->getOps<PureCallOp>()) {
-        contains_call_to_same_function |=
-            callee_calls.contains(neighbor_call.getCallee());
-        if (neighbor_call.getCallee() == pure_call_op.getCallee()) {
-          ++num_calls_in_caller;
-        }
-      }
-    }
-    if (num_calls_in_caller > 1) return false;
-    // Don't inline functions, if after inlining the size of the function
-    // becomes too big.
-    int num_ops = num_calls_in_caller * GetNumOps(callable_region->front()) +
-                  GetNumOps(call->getParentRegion()->front());
-    if (num_ops > kMaxFuncSize) return false;
-    return !wouldBeCloned || contains_call_to_same_function;
+    // Inlining a pure call is always semantically legal. Whether it is
+    // beneficial is a per-backend decision, made by the profitability policy
+    // of the xla-inliner pass (see transforms/inliner.cc) rather than by this
+    // dialect, which is shared between backends.
+    return true;
   }
 
   // Returns true if the given operation 'op', that is registered to this

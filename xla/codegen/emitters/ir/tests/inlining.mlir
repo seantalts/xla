@@ -1,4 +1,4 @@
-// RUN: emitters_opt %s -split-input-file -xla-erase-dead-functions -inline | FileCheck %s
+// RUN: emitters_opt %s -split-input-file -xla-erase-dead-functions -xla-inliner | FileCheck %s
 
 module {
   func.func private @mul(%a: f32, %b: f32) -> f32 {

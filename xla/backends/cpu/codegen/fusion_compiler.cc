@@ -247,10 +247,12 @@ static void AddGenericLoweringPasses(mlir::OpPassManager& pm,
 static std::unique_ptr<::mlir::Pass> CreateInlinerAndCsePass() {
   return mlir::createCompositeFixedPointPass(
       "Inliner", [](mlir::OpPassManager& pm) {
-        pm.addPass(mlir::createInlinerPass({}, [](mlir::OpPassManager& pm) {
-          // CSE after inlining because inlining can introduce duplicates.
-          pm.addPass(mlir::createCSEPass());
-        }));
+        pm.addPass(emitters::CreateXlaInlinerPass(
+            emitters::InlinerPolicy::kConservative,
+            [](mlir::OpPassManager& pm) {
+              // CSE after inlining because inlining can introduce duplicates.
+              pm.addPass(mlir::createCSEPass());
+            }));
       });
 }
 

@@ -16,12 +16,14 @@ limitations under the License.
 #define XLA_CODEGEN_EMITTERS_TRANSFORMS_PASSES_H_
 
 #include <cstdint>
+#include <functional>
 #include <memory>
 #include <string>
 
 #include "mlir/Dialect/LLVMIR/NVVMDialect.h"  // IWYU pragma: keep
 #include "mlir/Dialect/LLVMIR/ROCDLDialect.h"  // IWYU pragma: keep
 #include "mlir/Pass/Pass.h"
+#include "mlir/Pass/PassManager.h"
 
 namespace stream_executor {
 class DeviceDescription;
@@ -33,6 +35,16 @@ namespace emitters {
 #define GEN_PASS_DECL
 #include "xla/codegen/emitters/transforms/passes.h.inc"
 
+// Which inlining profitability policy the xla-inliner pass applies to
+// xla.pure_call ops. See XlaInlinerPass in passes.td.
+enum class InlinerPolicy {
+  kConservative,
+};
+
+std::unique_ptr<mlir::Pass> CreateXlaInlinerPass();
+std::unique_ptr<mlir::Pass> CreateXlaInlinerPass(
+    InlinerPolicy policy,
+    std::function<void(mlir::OpPassManager&)> default_pipeline);
 std::unique_ptr<mlir::Pass> CreateLowerXlaIntrinsicLibPass();
 std::unique_ptr<mlir::Pass> CreateConvertPureCallOpsPass();
 std::unique_ptr<mlir::Pass> CreateEraseDeadFunctionsPass();
