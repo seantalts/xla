@@ -61,12 +61,20 @@ def XlaInlinerPass : Pass<"xla-inliner", "mlir::ModuleOp"> {
         conservative: inline a callee that has several callers only when the
           caller and the callee call a common third function (the historical
           xla emitter heuristic).
+        aggressive: inline whenever the caller has a single call site for the
+          callee and the result stays under the function size cap. A call
+          that is not inlined re-evaluates the callee's entire transitive
+          computation per use; across call chains whose consecutive levels
+          share no callees (e.g. rotation/quaternion chains emitted for
+          kinematic models) this recomputation compounds exponentially with
+          chain depth.
   }];
 
   let options = [
     Option<"policy_", "policy", "std::string",
            /*default=*/"\"conservative\"",
-           "Inlining profitability policy. One of: 'conservative'.">,
+           "Inlining profitability policy. One of: 'conservative', "
+           "'aggressive'.">,
     Option<"default_pipeline_", "default-pipeline", "std::string",
            /*default=*/"\"canonicalize\"",
            "The optimizer pipeline run over callables between inlining "

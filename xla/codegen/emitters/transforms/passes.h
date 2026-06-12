@@ -39,6 +39,7 @@ namespace emitters {
 // xla.pure_call ops. See XlaInlinerPass in passes.td.
 enum class InlinerPolicy {
   kConservative,
+  kAggressive,
 };
 
 std::unique_ptr<mlir::Pass> CreateXlaInlinerPass();

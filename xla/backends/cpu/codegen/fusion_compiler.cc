@@ -247,8 +247,13 @@ static void AddGenericLoweringPasses(mlir::OpPassManager& pm,
 static std::unique_ptr<::mlir::Pass> CreateInlinerAndCsePass() {
   return mlir::createCompositeFixedPointPass(
       "Inliner", [](mlir::OpPassManager& pm) {
+        // The aggressive policy eliminates the exponential recomputation
+        // that call-per-use emission causes on deep call chains (see
+        // IsProfitableToInlineAggressive); measured on mujoco MJX
+        // kinematics: execution 509ms -> 1.05ms per call, fusion compile
+        // time 592ms -> 686ms.
         pm.addPass(emitters::CreateXlaInlinerPass(
-            emitters::InlinerPolicy::kConservative,
+            emitters::InlinerPolicy::kAggressive,
             [](mlir::OpPassManager& pm) {
               // CSE after inlining because inlining can introduce duplicates.
               pm.addPass(mlir::createCSEPass());
