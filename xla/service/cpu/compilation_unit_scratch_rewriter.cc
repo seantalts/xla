@@ -87,6 +87,18 @@ absl::StatusOr<bool> RewriteCompilationUnitScratch(
         continue;
       }
 
+      // We move the original result into tuple index {0} of the new
+      // custom-call. Any output_to_operand_aliasing on the original instruction
+      // is expressed relative to the old (non-tuple) output shape and cannot be
+      // correctly remapped here, so refuse rather than silently produce wrong
+      // aliasing.
+      if (!cc->output_to_operand_aliasing().empty()) {
+        return absl::UnimplementedError(absl::StrCat(
+            "Cannot rewrite compilation-unit custom-call '", cc->name(),
+            "' with output_to_operand_aliasing: moving the result into a tuple "
+            "would invalidate the aliasing."));
+      }
+
       std::vector<Shape> tuple_shapes;
       tuple_shapes.reserve(1 + scratch.size());
       tuple_shapes.push_back(cc->shape());
@@ -96,14 +108,12 @@ absl::StatusOr<bool> RewriteCompilationUnitScratch(
       }
       Shape new_shape = ShapeUtil::MakeTupleShape(tuple_shapes);
 
+      // Clone so every attribute (metadata, backend config, api_version,
+      // side-effect flag, frontend attributes, sharding, ...) is carried over;
+      // only the shape changes. Building the custom-call by hand would silently
+      // drop anything not explicitly copied.
       HloInstruction* new_cc = comp->AddInstruction(
-          HloInstruction::CreateCustomCall(new_shape, cc->operands(),
-                                           kMultiModuleCustomCallTarget,
-                                           cc->raw_backend_config_string(),
-                                           cc->api_version()));
-      Cast<HloCustomCallInstruction>(new_cc)->set_custom_call_has_side_effect(
-          cc->custom_call_has_side_effect());
-      new_cc->set_frontend_attributes(cc->frontend_attributes());
+          cc->CloneWithNewOperands(new_shape, cc->operands()));
 
       HloInstruction* gte = comp->AddInstruction(
           HloInstruction::CreateGetTupleElement(cc->shape(), new_cc, 0));

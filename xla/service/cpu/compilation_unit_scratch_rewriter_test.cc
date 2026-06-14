@@ -169,6 +169,93 @@ TEST_F(CompilationUnitScratchRewriterTest, NoScratchNeededLeavesSiteAlone) {
                                ShapeUtil::MakeShape(F32, {64})));
 }
 
+TEST_F(CompilationUnitScratchRewriterTest, PreservesMetadata) {
+  constexpr absl::string_view kCallee = R"(
+    HloModule unit0
+    ENTRY e {
+      p0 = f32[64] parameter(0)
+      p1 = f32[64] parameter(1)
+      a = f32[64] add(p0, p1)
+      b = f32[64] multiply(p0, p1)
+      ROOT sub = f32[64] subtract(a, b)
+    })";
+  constexpr absl::string_view kParent = R"(
+    HloModule parent
+    ENTRY e {
+      p = f32[64] parameter(0)
+      q = f32[64] parameter(1)
+      cc = f32[64] custom-call(p, q),
+           custom_call_target="_xla_multi_module_call",
+           backend_config="unit0",
+           api_version=API_VERSION_STATUS_RETURNING_UNIFIED,
+           metadata={op_name="my_unit_call"}
+      ROOT r = f32[64] negate(cc)
+    })";
+
+  TF_ASSERT_OK_AND_ASSIGN(auto callee,
+                          ParseAndReturnUnverifiedModule(kCallee));
+  TF_ASSERT_OK_AND_ASSIGN(auto parent,
+                          ParseAndReturnUnverifiedModule(kParent));
+
+  std::unique_ptr<BufferAssignment> callee_assignment =
+      RunBufferAssignment(callee.get());
+  ASSERT_GE(GetCalleeScratchAllocations(*callee_assignment).size(), 1u);
+
+  absl::flat_hash_map<std::string, const BufferAssignment*> assignments{
+      {"unit0", callee_assignment.get()}};
+
+  TF_ASSERT_OK_AND_ASSIGN(
+      bool changed, RewriteCompilationUnitScratch(parent.get(), assignments));
+  EXPECT_TRUE(changed);
+
+  const HloInstruction* root = parent->entry_computation()->root_instruction();
+  ASSERT_EQ(root->opcode(), HloOpcode::kNegate);
+  const HloInstruction* gte = root->operand(0);
+  ASSERT_EQ(gte->opcode(), HloOpcode::kGetTupleElement);
+  const HloInstruction* cc = gte->operand(0);
+  ASSERT_EQ(cc->opcode(), HloOpcode::kCustomCall);
+  EXPECT_EQ(cc->metadata().op_name(), "my_unit_call");
+}
+
+TEST_F(CompilationUnitScratchRewriterTest, ForbidsOutputToOperandAliasing) {
+  constexpr absl::string_view kCallee = R"(
+    HloModule unit0
+    ENTRY e {
+      p0 = f32[64] parameter(0)
+      p1 = f32[64] parameter(1)
+      a = f32[64] add(p0, p1)
+      b = f32[64] multiply(p0, p1)
+      ROOT sub = f32[64] subtract(a, b)
+    })";
+  constexpr absl::string_view kParent = R"(
+    HloModule parent
+    ENTRY e {
+      p = f32[64] parameter(0)
+      q = f32[64] parameter(1)
+      cc = f32[64] custom-call(p, q),
+           custom_call_target="_xla_multi_module_call",
+           backend_config="unit0",
+           api_version=API_VERSION_STATUS_RETURNING_UNIFIED,
+           output_to_operand_aliasing={{}: (0, {})}
+      ROOT r = f32[64] negate(cc)
+    })";
+
+  TF_ASSERT_OK_AND_ASSIGN(auto callee,
+                          ParseAndReturnUnverifiedModule(kCallee));
+  TF_ASSERT_OK_AND_ASSIGN(auto parent,
+                          ParseAndReturnUnverifiedModule(kParent));
+
+  std::unique_ptr<BufferAssignment> callee_assignment =
+      RunBufferAssignment(callee.get());
+  ASSERT_GE(GetCalleeScratchAllocations(*callee_assignment).size(), 1u);
+
+  absl::flat_hash_map<std::string, const BufferAssignment*> assignments{
+      {"unit0", callee_assignment.get()}};
+
+  EXPECT_THAT(RewriteCompilationUnitScratch(parent.get(), assignments),
+              StatusIs(absl::StatusCode::kUnimplemented));
+}
+
 TEST_F(CompilationUnitScratchRewriterTest, ErrorsOnUnknownSubmodule) {
   constexpr absl::string_view kParent = R"(
     HloModule parent
