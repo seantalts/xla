@@ -52,6 +52,17 @@ absl::StatusOr<std::unique_ptr<RemappedCallThunk>> RemappedCallThunk::Create(
   absl::flat_hash_set<BufferAllocation::Index> constant_indices;
   if (constants != nullptr) {
     for (const ConstantAllocation& c : *constants) {
+      if (c.index < 0 ||
+          c.index >= static_cast<int64_t>(caller_buffers.size())) {
+        return absl::InvalidArgumentError(absl::StrFormat(
+            "Constant allocation index %d out of range [0, %d)", c.index,
+            caller_buffers.size()));
+      }
+      if (caller_buffers[c.index].allocation() != nullptr) {
+        return absl::InvalidArgumentError(absl::StrFormat(
+            "Constant allocation index %d also has a non-null caller binding",
+            c.index));
+      }
       constant_indices.insert(c.index);
     }
   }

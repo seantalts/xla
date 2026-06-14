@@ -362,5 +362,82 @@ TEST(RemappedCallThunkTest, RejectsNullBindingWithoutConstant) {
       StatusIs(absl::StatusCode::kInvalidArgument));
 }
 
+// A constant allocation index must name a real callee binding slot; an
+// out-of-range index would be an out-of-bounds write at execute time, so Create
+// must reject it.
+TEST(RemappedCallThunkTest, RejectsOutOfRangeConstantIndex) {
+  auto input = LiteralUtil::CreateR1<float>({1.0, 2.0, 3.0, 4.0});
+  auto output = LiteralUtil::CreateR1<float>({0.0, 0.0, 0.0, 0.0});
+
+  BufferAllocation callee_param = CreateBufferAllocation(0, input);
+  BufferAllocation callee_result = CreateBufferAllocation(1, output);
+  TF_ASSERT_OK_AND_ASSIGN(
+      auto copy, CopyThunk::Create({"copy"},
+                                   CreateBufferAllocationSlice(callee_param),
+                                   input.shape(),
+                                   CreateBufferAllocationSlice(callee_result),
+                                   output.shape()));
+  ThunkSequence callee_sequence;
+  callee_sequence.push_back(std::move(copy));
+
+  // Binding size 2, but the constant names index 5 (out of range).
+  BufferAllocation caller_in = CreateBufferAllocation(0, input);
+  BufferAllocation caller_out = CreateBufferAllocation(1, output);
+  std::vector<BufferAllocation::Slice> caller_buffers = {
+      CreateBufferAllocationSlice(caller_in),
+      CreateBufferAllocationSlice(caller_out)};
+
+  auto constants = std::make_shared<std::vector<ConstantAllocation>>();
+  constants->push_back(ConstantAllocation{
+      /*index=*/5, std::make_unique<Literal>(std::move(input))});
+
+  EXPECT_THAT(
+      RemappedCallThunk::Create({"cu_call"},
+                                MakeSharedExecutor(std::move(callee_sequence)),
+                                std::move(caller_buffers), constants)
+          .status(),
+      StatusIs(absl::StatusCode::kInvalidArgument,
+               ::testing::HasSubstr("out of range")));
+}
+
+// A constant allocation index must not also name a real (non-null) caller
+// binding -- that would be an ambiguous double-assignment of the same callee
+// index -- so Create must reject the overlap.
+TEST(RemappedCallThunkTest, RejectsConstantIndexOverlappingBinding) {
+  auto input = LiteralUtil::CreateR1<float>({1.0, 2.0, 3.0, 4.0});
+  auto output = LiteralUtil::CreateR1<float>({0.0, 0.0, 0.0, 0.0});
+
+  BufferAllocation callee_param = CreateBufferAllocation(0, input);
+  BufferAllocation callee_result = CreateBufferAllocation(1, output);
+  TF_ASSERT_OK_AND_ASSIGN(
+      auto copy, CopyThunk::Create({"copy"},
+                                   CreateBufferAllocationSlice(callee_param),
+                                   input.shape(),
+                                   CreateBufferAllocationSlice(callee_result),
+                                   output.shape()));
+  ThunkSequence callee_sequence;
+  callee_sequence.push_back(std::move(copy));
+
+  // Both binding entries are real, non-null slices.
+  BufferAllocation caller_in = CreateBufferAllocation(0, input);
+  BufferAllocation caller_out = CreateBufferAllocation(1, output);
+  std::vector<BufferAllocation::Slice> caller_buffers = {
+      CreateBufferAllocationSlice(caller_in),
+      CreateBufferAllocationSlice(caller_out)};
+
+  // Constant claims index 0, which already has a non-null caller binding.
+  auto constants = std::make_shared<std::vector<ConstantAllocation>>();
+  constants->push_back(ConstantAllocation{
+      /*index=*/0, std::make_unique<Literal>(std::move(input))});
+
+  EXPECT_THAT(
+      RemappedCallThunk::Create({"cu_call"},
+                                MakeSharedExecutor(std::move(callee_sequence)),
+                                std::move(caller_buffers), constants)
+          .status(),
+      StatusIs(absl::StatusCode::kInvalidArgument,
+               ::testing::HasSubstr("non-null caller binding")));
+}
+
 }  // namespace
 }  // namespace xla::cpu
