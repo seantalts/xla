@@ -20,9 +20,13 @@ limitations under the License.
 #include <utility>
 #include <vector>
 
+#include "absl/container/flat_hash_set.h"
 #include "absl/memory/memory.h"
+#include "absl/status/status.h"
 #include "absl/status/statusor.h"
 #include "absl/strings/str_cat.h"
+#include "absl/strings/str_format.h"
+#include "xla/backends/cpu/constant_allocation.h"
 #include "xla/backends/cpu/runtime/buffer_allocations.h"
 #include "xla/backends/cpu/runtime/thunk.h"
 #include "xla/backends/cpu/runtime/thunk_executor.h"
@@ -35,20 +39,43 @@ limitations under the License.
 namespace xla::cpu {
 
 absl::StatusOr<std::unique_ptr<RemappedCallThunk>> RemappedCallThunk::Create(
-    Info info, ThunkSequence called_sequence,
-    std::vector<BufferAllocation::Slice> caller_buffers) {
-  TF_ASSIGN_OR_RETURN(auto called_executor,
-                      ThunkExecutor::Create(std::move(called_sequence)));
+    Info info, std::shared_ptr<ThunkExecutor> called_executor,
+    std::vector<BufferAllocation::Slice> caller_buffers,
+    std::shared_ptr<const std::vector<ConstantAllocation>> constants) {
+  if (called_executor == nullptr) {
+    return absl::InvalidArgumentError(
+        "RemappedCallThunk requires a non-null called_executor");
+  }
+
+  // A null binding entry is only legal if a thunk-owned constant covers that
+  // callee index; otherwise the index is unresolvable at execute time.
+  absl::flat_hash_set<BufferAllocation::Index> constant_indices;
+  if (constants != nullptr) {
+    for (const ConstantAllocation& c : *constants) {
+      constant_indices.insert(c.index);
+    }
+  }
+  for (int64_t i = 0; i < static_cast<int64_t>(caller_buffers.size()); ++i) {
+    if (caller_buffers[i].allocation() == nullptr &&
+        !constant_indices.contains(i)) {
+      return absl::InvalidArgumentError(absl::StrFormat(
+          "Callee allocation %d has no caller binding and no constant", i));
+    }
+  }
+
   return absl::WrapUnique(new RemappedCallThunk(
-      std::move(info), std::move(called_executor), std::move(caller_buffers)));
+      std::move(info), std::move(called_executor), std::move(caller_buffers),
+      std::move(constants)));
 }
 
 RemappedCallThunk::RemappedCallThunk(
-    Info info, ThunkExecutor called_executor,
-    std::vector<BufferAllocation::Slice> caller_buffers)
+    Info info, std::shared_ptr<ThunkExecutor> called_executor,
+    std::vector<BufferAllocation::Slice> caller_buffers,
+    std::shared_ptr<const std::vector<ConstantAllocation>> constants)
     : Thunk(Kind::kCall, std::move(info)),
       called_executor_(std::move(called_executor)),
-      caller_buffers_(std::move(caller_buffers)) {}
+      caller_buffers_(std::move(caller_buffers)),
+      constants_(std::move(constants)) {}
 
 tsl::AsyncValueRef<Thunk::ExecuteEvent> RemappedCallThunk::Execute(
     const ExecuteParams& params) {
@@ -56,12 +83,20 @@ tsl::AsyncValueRef<Thunk::ExecuteEvent> RemappedCallThunk::Execute(
 
   // Resolve the callee's private allocation index space onto the caller's
   // buffers: callee index `i` reads/writes the caller buffer `caller_buffers_[i]`.
-  BufferAllocations::Buffers callee_buffers;
-  callee_buffers.reserve(caller_buffers_.size());
-  for (const BufferAllocation::Slice& slice : caller_buffers_) {
-    TF_ASSIGN_OR_RETURN(se::DeviceAddressBase address,
-                        caller->GetDeviceAddress(slice));
-    callee_buffers.push_back(address);
+  // Callee constant indices have no caller buffer; they are filled from the
+  // thunk-owned ConstantAllocations and skipped in the caller-binding pass.
+  BufferAllocations::Buffers callee_buffers(caller_buffers_.size());
+  if (constants_ != nullptr) {
+    for (const ConstantAllocation& c : *constants_) {
+      callee_buffers[c.index] = c.AsDeviceAddress();
+    }
+  }
+  for (int64_t i = 0; i < static_cast<int64_t>(caller_buffers_.size()); ++i) {
+    if (caller_buffers_[i].allocation() == nullptr) {
+      continue;  // Constant: already filled above.
+    }
+    TF_ASSIGN_OR_RETURN(callee_buffers[i],
+                        caller->GetDeviceAddress(caller_buffers_[i]));
   }
 
   // The callee-space allocations must outlive the (possibly async) nested
@@ -72,7 +107,7 @@ tsl::AsyncValueRef<Thunk::ExecuteEvent> RemappedCallThunk::Execute(
   ExecuteParams callee_params = params;
   callee_params.buffer_allocations = callee_allocations.get();
 
-  auto event = called_executor_.Execute(callee_params);
+  auto event = called_executor_->Execute(callee_params);
   event.AndThen([callee_allocations = std::move(callee_allocations)] {});
   return event;
 }
@@ -84,9 +119,13 @@ RemappedCallThunk::BufferUses RemappedCallThunk::buffer_uses() const {
   // at offset o within callee allocation i lands at caller_buffers_[i].offset()
   // + o in the caller's buffer.
   BufferUses uses;
-  for (const BufferUse& use : called_executor_.buffer_uses()) {
+  for (const BufferUse& use : called_executor_->buffer_uses()) {
     const BufferAllocation::Slice& callee_slice = use.slice();
     const BufferAllocation::Slice& caller = caller_buffers_[callee_slice.index()];
+    if (caller.allocation() == nullptr) {
+      // Callee constant: no caller buffer to map, so report no caller-space use.
+      continue;
+    }
     BufferAllocation::Slice mapped(caller.allocation(),
                                    caller.offset() + callee_slice.offset(),
                                    callee_slice.size(), caller.element_type());
@@ -97,13 +136,13 @@ RemappedCallThunk::BufferUses RemappedCallThunk::buffer_uses() const {
 }
 
 RemappedCallThunk::ResourceUses RemappedCallThunk::resource_uses() const {
-  return called_executor_.resource_uses();
+  return called_executor_->resource_uses();
 }
 
 std::vector<std::pair<std::string, const ThunkSequence*>>
 RemappedCallThunk::nested_thunks() const {
   return {{absl::StrCat(info().op_name, "-called_sequence"),
-           &called_executor_.thunk_sequence()}};
+           &called_executor_->thunk_sequence()}};
 }
 
 }  // namespace xla::cpu

@@ -15,13 +15,18 @@ limitations under the License.
 
 #include "xla/backends/cpu/runtime/remapped_call_thunk.h"
 
+#include <memory>
 #include <utility>
 #include <vector>
 
+#include "absl/status/status_matchers.h"
+#include "xla/backends/cpu/constant_allocation.h"
 #include "xla/backends/cpu/runtime/buffer_allocations.h"
 #include "xla/backends/cpu/runtime/copy_thunk.h"
 #include "xla/backends/cpu/runtime/thunk.h"
+#include "xla/backends/cpu/runtime/thunk_executor.h"
 #include "xla/backends/cpu/runtime/thunk_testlib.h"
+#include "xla/literal.h"
 #include "xla/literal_util.h"
 #include "xla/runtime/buffer_use.h"
 #include "xla/service/buffer_assignment.h"
@@ -31,6 +36,14 @@ limitations under the License.
 
 namespace xla::cpu {
 namespace {
+
+using ::absl_testing::StatusIs;
+
+// Wraps a callee ThunkSequence in a shared ThunkExecutor, as call sites share.
+std::shared_ptr<ThunkExecutor> MakeSharedExecutor(ThunkSequence seq) {
+  auto executor = ThunkExecutor::Create(std::move(seq)).value();
+  return std::make_shared<ThunkExecutor>(std::move(executor));
+}
 
 // A `compilation_unit` callee is emitted ONCE against its own private buffer
 // index space (params/result are the callee's own low indices). The same
@@ -78,9 +91,9 @@ TEST(RemappedCallThunkTest, RemapsCalleePrivateIndicesOntoCallerBuffers) {
                                                          caller_out_slice};
 
   TF_ASSERT_OK_AND_ASSIGN(
-      auto thunk, RemappedCallThunk::Create({"cu_call"},
-                                            std::move(callee_sequence),
-                                            std::move(caller_buffers)));
+      auto thunk, RemappedCallThunk::Create(
+                      {"cu_call"}, MakeSharedExecutor(std::move(callee_sequence)),
+                      std::move(caller_buffers), /*constants=*/nullptr));
 
   Thunk::ExecuteParams params = {nullptr, &caller_allocations};
   auto execute_event = thunk->Execute(params);
@@ -136,8 +149,9 @@ TEST(RemappedCallThunkTest, CalleeInternalBufferIsCallerProvidedScratch) {
 
   TF_ASSERT_OK_AND_ASSIGN(
       auto thunk,
-      RemappedCallThunk::Create({"cu_call"}, std::move(callee_sequence),
-                                std::move(caller_buffers)));
+      RemappedCallThunk::Create(
+          {"cu_call"}, MakeSharedExecutor(std::move(callee_sequence)),
+          std::move(caller_buffers), /*constants=*/nullptr));
 
   Thunk::ExecuteParams params = {nullptr, &caller_allocations};
   auto execute_event = thunk->Execute(params);
@@ -175,8 +189,9 @@ TEST(RemappedCallThunkTest, BufferUsesAreReportedInCallerSpace) {
 
   TF_ASSERT_OK_AND_ASSIGN(
       auto thunk,
-      RemappedCallThunk::Create({"cu_call"}, std::move(callee_sequence),
-                                std::move(caller_buffers)));
+      RemappedCallThunk::Create(
+          {"cu_call"}, MakeSharedExecutor(std::move(callee_sequence)),
+          std::move(caller_buffers), /*constants=*/nullptr));
 
   auto uses = thunk->buffer_uses();
   ASSERT_EQ(uses.size(), 2);
@@ -196,6 +211,155 @@ TEST(RemappedCallThunkTest, BufferUsesAreReportedInCallerSpace) {
   }
   EXPECT_TRUE(read_caller_param);
   EXPECT_TRUE(write_caller_result);
+}
+
+// One compilation unit emitted ONCE is shared by N call sites: they all hold the
+// same ThunkExecutor (and thus the same underlying ThunkSequence pointer), but
+// each binds it onto its own caller buffers.
+TEST(RemappedCallThunkTest, SharedExecutorAcrossTwoSites) {
+  auto input_a = LiteralUtil::CreateR1<float>({1.0, 2.0, 3.0, 4.0});
+  auto output_a = LiteralUtil::CreateR1<float>({0.0, 0.0, 0.0, 0.0});
+  auto input_b = LiteralUtil::CreateR1<float>({5.0, 6.0, 7.0, 8.0});
+  auto output_b = LiteralUtil::CreateR1<float>({0.0, 0.0, 0.0, 0.0});
+
+  // Callee (shared, emitted once) in its OWN index space: copy index 0 -> 1.
+  BufferAllocation callee_param = CreateBufferAllocation(0, input_a);
+  BufferAllocation callee_result = CreateBufferAllocation(1, output_a);
+  TF_ASSERT_OK_AND_ASSIGN(
+      auto copy, CopyThunk::Create({"copy"},
+                                   CreateBufferAllocationSlice(callee_param),
+                                   input_a.shape(),
+                                   CreateBufferAllocationSlice(callee_result),
+                                   output_a.shape()));
+  ThunkSequence callee_sequence;
+  callee_sequence.push_back(std::move(copy));
+  auto shared_executor = MakeSharedExecutor(std::move(callee_sequence));
+
+  // Site A: input@2, output@3.
+  BufferAllocations caller_allocations_a =
+      CreateBufferAllocations(input_a, input_a, input_a, output_a);
+  BufferAllocation caller_in_a = CreateBufferAllocation(2, input_a);
+  BufferAllocation caller_out_a = CreateBufferAllocation(3, output_a);
+  std::vector<BufferAllocation::Slice> caller_buffers_a = {
+      CreateBufferAllocationSlice(caller_in_a),
+      CreateBufferAllocationSlice(caller_out_a)};
+  TF_ASSERT_OK_AND_ASSIGN(
+      auto site_a,
+      RemappedCallThunk::Create({"site_a"}, shared_executor,
+                                std::move(caller_buffers_a),
+                                /*constants=*/nullptr));
+
+  // Site B: different bindings -- input@0, output@1.
+  BufferAllocations caller_allocations_b =
+      CreateBufferAllocations(input_b, output_b);
+  BufferAllocation caller_in_b = CreateBufferAllocation(0, input_b);
+  BufferAllocation caller_out_b = CreateBufferAllocation(1, output_b);
+  std::vector<BufferAllocation::Slice> caller_buffers_b = {
+      CreateBufferAllocationSlice(caller_in_b),
+      CreateBufferAllocationSlice(caller_out_b)};
+  TF_ASSERT_OK_AND_ASSIGN(
+      auto site_b,
+      RemappedCallThunk::Create({"site_b"}, shared_executor,
+                                std::move(caller_buffers_b),
+                                /*constants=*/nullptr));
+
+  // Both sites point at the SAME underlying ThunkSequence.
+  EXPECT_EQ(site_a->nested_thunks()[0].second,
+            site_b->nested_thunks()[0].second);
+
+  Thunk::ExecuteParams params_a = {nullptr, &caller_allocations_a};
+  auto event_a = site_a->Execute(params_a);
+  tsl::BlockUntilReady(event_a);
+  ASSERT_FALSE(event_a.IsError());
+
+  Thunk::ExecuteParams params_b = {nullptr, &caller_allocations_b};
+  auto event_b = site_b->Execute(params_b);
+  tsl::BlockUntilReady(event_b);
+  ASSERT_FALSE(event_b.IsError());
+
+  // Each site wrote its own input through its own output binding.
+  EXPECT_EQ(output_a, input_a);
+  EXPECT_EQ(output_b, input_b);
+}
+
+// A callee constant allocation has NO caller buffer (the runtime buffer table is
+// sized to the parent assignment only). The thunk owns the ConstantAllocation
+// and resolves that callee index itself; the binding entry is left null.
+TEST(RemappedCallThunkTest, ResolvesConstantAllocationsFromOwnedData) {
+  auto lit = LiteralUtil::CreateR1<float>({1.0, 2.0, 3.0, 4.0});
+  auto output = LiteralUtil::CreateR1<float>({0.0, 0.0, 0.0, 0.0});
+
+  // Callee reads private index 0 (the constant) and writes private index 1.
+  BufferAllocation callee_param = CreateBufferAllocation(0, lit);
+  BufferAllocation callee_result = CreateBufferAllocation(1, output);
+  TF_ASSERT_OK_AND_ASSIGN(
+      auto copy, CopyThunk::Create({"copy"},
+                                   CreateBufferAllocationSlice(callee_param),
+                                   lit.shape(),
+                                   CreateBufferAllocationSlice(callee_result),
+                                   output.shape()));
+  ThunkSequence callee_sequence;
+  callee_sequence.push_back(std::move(copy));
+
+  // Index 0 is a thunk-owned constant; index 1 is a real caller output.
+  auto constants = std::make_shared<std::vector<ConstantAllocation>>();
+  constants->push_back(
+      ConstantAllocation{/*index=*/0, std::make_unique<Literal>(std::move(lit))});
+
+  // Caller only has the output buffer (index 0 in its space). The constant has
+  // no caller buffer, so binding[0] is left null.
+  BufferAllocations caller_allocations = CreateBufferAllocations(output);
+  BufferAllocation caller_out = CreateBufferAllocation(0, output);
+  std::vector<BufferAllocation::Slice> caller_buffers(2);
+  caller_buffers[1] = CreateBufferAllocationSlice(caller_out);
+
+  TF_ASSERT_OK_AND_ASSIGN(
+      auto thunk,
+      RemappedCallThunk::Create({"cu_call"},
+                                MakeSharedExecutor(std::move(callee_sequence)),
+                                std::move(caller_buffers), constants));
+
+  // Constants are not reported as buffer uses (no caller slice to map).
+  for (const BufferUse& use : thunk->buffer_uses()) {
+    EXPECT_NE(use.slice().allocation(), nullptr);
+  }
+
+  Thunk::ExecuteParams params = {nullptr, &caller_allocations};
+  auto execute_event = thunk->Execute(params);
+  tsl::BlockUntilReady(execute_event);
+  ASSERT_FALSE(execute_event.IsError());
+
+  EXPECT_EQ(output, LiteralUtil::CreateR1<float>({1.0, 2.0, 3.0, 4.0}));
+}
+
+// A null binding entry must be backed by a constant of that index; otherwise the
+// callee index is unresolvable and Create must reject it.
+TEST(RemappedCallThunkTest, RejectsNullBindingWithoutConstant) {
+  auto input = LiteralUtil::CreateR1<float>({1.0, 2.0, 3.0, 4.0});
+  auto output = LiteralUtil::CreateR1<float>({0.0, 0.0, 0.0, 0.0});
+
+  BufferAllocation callee_param = CreateBufferAllocation(0, input);
+  BufferAllocation callee_result = CreateBufferAllocation(1, output);
+  TF_ASSERT_OK_AND_ASSIGN(
+      auto copy, CopyThunk::Create({"copy"},
+                                   CreateBufferAllocationSlice(callee_param),
+                                   input.shape(),
+                                   CreateBufferAllocationSlice(callee_result),
+                                   output.shape()));
+  ThunkSequence callee_sequence;
+  callee_sequence.push_back(std::move(copy));
+
+  BufferAllocation caller_out = CreateBufferAllocation(0, output);
+  std::vector<BufferAllocation::Slice> caller_buffers(2);
+  // binding[0] left null, but no constant covers it.
+  caller_buffers[1] = CreateBufferAllocationSlice(caller_out);
+
+  EXPECT_THAT(
+      RemappedCallThunk::Create({"cu_call"},
+                                MakeSharedExecutor(std::move(callee_sequence)),
+                                std::move(caller_buffers), /*constants=*/nullptr)
+          .status(),
+      StatusIs(absl::StatusCode::kInvalidArgument));
 }
 
 }  // namespace

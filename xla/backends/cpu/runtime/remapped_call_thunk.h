@@ -22,6 +22,7 @@ limitations under the License.
 #include <vector>
 
 #include "absl/status/statusor.h"
+#include "xla/backends/cpu/constant_allocation.h"
 #include "xla/backends/cpu/runtime/thunk.h"
 #include "xla/backends/cpu/runtime/thunk_executor.h"
 #include "xla/service/buffer_assignment.h"
@@ -41,9 +42,20 @@ class RemappedCallThunk final : public Thunk {
  public:
   // `caller_buffers[i]` is the caller buffer that provides callee allocation
   // index `i` (parameters and result occupy the callee's low indices).
+  //
+  // The callee `ThunkExecutor` is shared (re-entrant: each Execute builds its own
+  // per-run heap state), so N call sites of one compilation unit can hold the
+  // same `called_executor` and bind it onto their own `caller_buffers`.
+  //
+  // A null (default-constructed) `caller_buffers[i]` slice means callee index `i`
+  // is a callee constant: there is no caller buffer for it (the runtime buffer
+  // table is sized to the parent assignment only). Such an index must be covered
+  // by an entry in `constants` with that index; the thunk owns the constants and
+  // resolves those indices itself. `constants` may be nullptr.
   static absl::StatusOr<std::unique_ptr<RemappedCallThunk>> Create(
-      Info info, ThunkSequence called_sequence,
-      std::vector<BufferAllocation::Slice> caller_buffers);
+      Info info, std::shared_ptr<ThunkExecutor> called_executor,
+      std::vector<BufferAllocation::Slice> caller_buffers,
+      std::shared_ptr<const std::vector<ConstantAllocation>> constants);
 
   tsl::AsyncValueRef<ExecuteEvent> Execute(const ExecuteParams& params) final;
 
@@ -54,11 +66,14 @@ class RemappedCallThunk final : public Thunk {
       const final;
 
  private:
-  RemappedCallThunk(Info info, ThunkExecutor called_executor,
-                    std::vector<BufferAllocation::Slice> caller_buffers);
+  RemappedCallThunk(
+      Info info, std::shared_ptr<ThunkExecutor> called_executor,
+      std::vector<BufferAllocation::Slice> caller_buffers,
+      std::shared_ptr<const std::vector<ConstantAllocation>> constants);
 
-  ThunkExecutor called_executor_;
+  std::shared_ptr<ThunkExecutor> called_executor_;
   std::vector<BufferAllocation::Slice> caller_buffers_;
+  std::shared_ptr<const std::vector<ConstantAllocation>> constants_;
 };
 
 }  // namespace xla::cpu
