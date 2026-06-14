@@ -64,7 +64,9 @@ limitations under the License.
 #include "xla/backends/cpu/runtime/kernel_thunk.h"
 #include "xla/backends/cpu/runtime/logical_id_thunk.h"
 #include "xla/backends/cpu/runtime/outfeed_thunk.h"
+#include "xla/backends/cpu/constant_allocation.h"
 #include "xla/backends/cpu/runtime/reduce_scatter_thunk.h"
+#include "xla/backends/cpu/runtime/remapped_call_thunk.h"
 #include "xla/backends/cpu/runtime/rng_seed_thunk.h"
 #include "xla/backends/cpu/runtime/rng_state_thunk.h"
 #include "xla/backends/cpu/runtime/sort_thunk.h"
@@ -90,12 +92,14 @@ limitations under the License.
 #include "xla/hlo/ir/hlo_module.h"
 #include "xla/hlo/ir/hlo_opcode.h"
 #include "xla/hlo/ir/hlo_schedule.h"
+#include "xla/hlo/transforms/hlo_module_stitcher.h"
 #include "xla/layout_util.h"
 #include "xla/runtime/resource_use.h"
 #include "xla/runtime/work_group.h"
 #include "xla/service/buffer_assignment.h"
 #include "xla/service/collective_ops_utils.h"
 #include "xla/service/cpu/backend_config.pb.h"
+#include "xla/service/cpu/compilation_unit_binding.h"
 #include "xla/service/cpu/cpu_options.h"
 #include "xla/service/cpu/dot_op_emitter.h"
 #include "xla/service/cpu/ir_emission_utils.h"
@@ -1222,6 +1226,9 @@ absl::StatusOr<ThunkSequence> ThunkEmitter::EmitCustomCallThunk(
 
   // TODO(penporn): Support these existing targets.
   auto custom_call_target = custom_call->custom_call_target();
+  if (custom_call_target == kMultiModuleCustomCallTarget) {
+    return EmitCompilationUnitCallThunk(instruction);
+  }
   if (custom_call_target == "PadToStatic") {
     return Unimplemented("Custom call target %s is not implemented.",
                          custom_call_target);
@@ -1267,6 +1274,73 @@ absl::StatusOr<ThunkSequence> ThunkEmitter::EmitCustomCallThunk(
   return ThunkSequence::Of<CustomCallThunk>(ThunkInfo(instruction),
                                             custom_call_target, op_buffers,
                                             backend_config_str, version);
+}
+
+absl::StatusOr<ThunkSequence> ThunkEmitter::EmitCompilationUnitCallThunk(
+    const HloInstruction* instruction) {
+  if (options_.compilation_units == nullptr) {
+    return Internal(
+        "Encountered %s custom-call but shared compilation-unit emission is "
+        "not active",
+        kMultiModuleCustomCallTarget);
+  }
+  const std::string& name = instruction->raw_backend_config_string();
+  auto it = options_.compilation_units->find(name);
+  if (it == options_.compilation_units->end()) {
+    return Internal("No emitted compilation unit named %s", name);
+  }
+  const CompilationUnitArtifacts& unit = it->second;
+
+  CalleeCallerSlices caller;
+  // Parameters: each operand subshape with a unique slice.
+  for (int64_t p = 0; p < instruction->operand_count(); ++p) {
+    const HloInstruction* operand = instruction->operand(p);
+    RETURN_IF_ERROR(ShapeUtil::ForEachSubshapeWithStatus(
+        operand->shape(),
+        [&](const Shape&, const ShapeIndex& index) -> absl::Status {
+          absl::StatusOr<BufferAllocation::Slice> slice =
+              GetAllocationSlice(operand, index);
+          if (slice.ok()) caller.params[{p, index}] = *slice;
+          return absl::OkStatus();
+        }));
+  }
+  // Results (+ scratch if the 3B rewrite wrapped the result in a tuple).
+  const Shape& root_shape = unit.entry->root_instruction()->shape();
+  const bool rewritten = !ShapeUtil::Equal(instruction->shape(), root_shape);
+  if (rewritten &&
+      (!instruction->shape().IsTuple() ||
+       instruction->shape().tuple_shapes_size() < 1 ||
+       !ShapeUtil::Equal(instruction->shape().tuple_shapes(0), root_shape))) {
+    return Internal("Compilation unit call site %s has unexpected shape %s",
+                    instruction->name(), instruction->shape().ToString());
+  }
+  ShapeIndex result_prefix;
+  if (rewritten) result_prefix.push_back(0);
+  RETURN_IF_ERROR(ShapeUtil::ForEachSubshapeWithStatus(
+      root_shape, [&](const Shape&, const ShapeIndex& index) -> absl::Status {
+        ShapeIndex caller_index = result_prefix;
+        for (int64_t d : index) caller_index.push_back(d);
+        absl::StatusOr<BufferAllocation::Slice> slice =
+            GetAllocationSlice(instruction, caller_index);
+        if (slice.ok()) caller.results[index] = *slice;
+        return absl::OkStatus();
+      }));
+  if (rewritten) {
+    for (int64_t i = 1; i < instruction->shape().tuple_shapes_size(); ++i) {
+      ASSIGN_OR_RETURN(caller.scratch.emplace_back(),
+                       GetAllocationSlice(instruction, {i}));
+    }
+  }
+
+  ASSIGN_OR_RETURN(std::vector<BufferAllocation::Slice> binding,
+                   BuildCalleeBinding(*unit.assignment, *unit.entry, caller));
+  ASSIGN_OR_RETURN(
+      auto thunk,
+      RemappedCallThunk::Create(ThunkInfo(instruction), unit.executor,
+                                std::move(binding), unit.constants));
+  ThunkSequence seq;
+  seq.push_back(std::move(thunk));
+  return seq;
 }
 
 absl::StatusOr<ThunkSequence> ThunkEmitter::EmitSliceToDynamicThunk(

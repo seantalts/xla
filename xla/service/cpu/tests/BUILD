@@ -78,6 +78,21 @@ xla_test(
     ],
 )
 
+xla_test(
+    name = "compilation_unit_shared_emission_test",
+    srcs = ["compilation_unit_shared_emission_test.cc"],
+    backends = ["cpu"],
+    deps = [
+        "//xla:error_spec",
+        "//xla:xla_proto_cc",
+        "//xla/tests:hlo_pjrt_interpreter_reference_mixin",
+        "//xla/tests:hlo_pjrt_test_base",
+        "//xla/tests:xla_internal_test_main",
+        "//xla/tsl/platform:test",
+        "@com_google_absl//absl/strings:string_view",
+    ],
+)
+
 xla_cc_test(
     name = "cpu_bytesizeof_test",
     srcs = ["cpu_bytesizeof_test.cc"],

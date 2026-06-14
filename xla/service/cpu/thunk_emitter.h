@@ -32,8 +32,10 @@ limitations under the License.
 #include "mlir/IR/MLIRContext.h"
 #include "xla/backends/cpu/codegen/fusion_compiler.h"
 #include "xla/backends/cpu/codegen/target_machine_features.h"
+#include "xla/backends/cpu/constant_allocation.h"
 #include "xla/backends/cpu/runtime/sort_thunk.h"
 #include "xla/backends/cpu/runtime/thunk.h"
+#include "xla/backends/cpu/runtime/thunk_executor.h"
 #include "xla/codegen/kernel_spec.h"
 #include "xla/hlo/ir/hlo_computation.h"
 #include "xla/hlo/ir/hlo_instruction.h"
@@ -59,6 +61,16 @@ namespace xla::cpu {
 // multiple LLVM modules compiled to object files).
 class ThunkEmitter {
  public:
+  // A compilation unit (shared `compilation_unit` callee) emitted once by the
+  // backend. Each marked call site lowers to a RemappedCallThunk that binds
+  // this executor onto the call site's caller buffers.
+  struct CompilationUnitArtifacts {
+    std::shared_ptr<ThunkExecutor> executor;
+    const BufferAssignment* assignment = nullptr;
+    const HloComputation* entry = nullptr;
+    std::shared_ptr<const std::vector<ConstantAllocation>> constants;
+  };
+
   struct Options {
     // Whether to compile copy as LLVM kernel. This is used to avoid
     // dependencies on pjrt/transpose for tfcompiled models.
@@ -67,6 +79,11 @@ class ThunkEmitter {
     // kernels get linked together and might have to respect certain
     // restrictions, such as having the same module flags.
     bool is_aot_compilation;
+    // Shared compilation units emitted once by the backend, keyed by submodule
+    // name (custom-call raw_backend_config_string). Null when shared emission
+    // is off.
+    const absl::flat_hash_map<std::string, CompilationUnitArtifacts>*
+        compilation_units = nullptr;
   };
 
   struct EmittedKernel {
@@ -82,7 +99,8 @@ class ThunkEmitter {
                const TargetMachineFeatures& target_machine_features,
                const HloModule& hlo_module,
                const Options& options = {/*compile_copy_as_llvm_kernel=*/false,
-                                         /*is_aot_compilation=*/false});
+                                         /*is_aot_compilation=*/false,
+                                         /*compilation_units=*/nullptr});
 
   // Emits HLO module entry computation as a sequence of thunks.
   absl::StatusOr<ThunkSequence> EmitEntryComputation(const HloModule& module);
@@ -201,6 +219,12 @@ class ThunkEmitter {
       const HloInstruction* instruction);
 
   absl::StatusOr<ThunkSequence> EmitCustomCallThunk(
+      const HloInstruction* instruction);
+
+  // Lowers a `_xla_multi_module_call` custom-call to a RemappedCallThunk that
+  // binds the shared compilation unit (looked up in options_.compilation_units)
+  // onto this call site's caller buffers.
+  absl::StatusOr<ThunkSequence> EmitCompilationUnitCallThunk(
       const HloInstruction* instruction);
 
   absl::StatusOr<ThunkSequence> EmitSliceToDynamicThunk(
