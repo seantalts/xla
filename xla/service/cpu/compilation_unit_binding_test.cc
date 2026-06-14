@@ -20,6 +20,7 @@ limitations under the License.
 #include <memory>
 #include <vector>
 
+#include <gmock/gmock.h>
 #include <gtest/gtest.h>
 #include "absl/status/status.h"
 #include "absl/status/status_matchers.h"
@@ -40,6 +41,7 @@ namespace xla::cpu {
 namespace {
 
 using ::absl_testing::StatusIs;
+using ::testing::HasSubstr;
 
 int64_t BufferSizeBytes(const BufferValue& buffer) {
   return ShapeUtil::ByteSizeOf(buffer.shape(), sizeof(void*));
@@ -313,22 +315,33 @@ TEST_F(CompilationUnitBindingTest, RejectsUndersizedScratchSlice) {
   BufferAllocation caller_p0(10, 256, LogicalBuffer::Color(0));
   BufferAllocation caller_p1(11, 256, LogicalBuffer::Color(0));
   BufferAllocation caller_res(12, 256, LogicalBuffer::Color(0));
-  // Undersized scratch: only 4 bytes, but the internal temp is f32[64] = 256B.
-  BufferAllocation caller_scratch(13, 4, LogicalBuffer::Color(0));
   BufferAllocation::Slice p0_slice(&caller_p0, 0, 256);
   BufferAllocation::Slice p1_slice(&caller_p1, 0, 256);
   BufferAllocation::Slice res_slice(&caller_res, 0, 256);
-  BufferAllocation::Slice scratch_slice(&caller_scratch, 0, 4);
+
+  // Provide more scratch slices than there can be internal allocations so the
+  // count is never the limiter; the failure must come from undersizing (each
+  // slice is only 4 bytes vs the f32[64] = 256B internal temp), not exhaustion.
+  std::vector<BufferAllocation> scratch_allocs;
+  scratch_allocs.reserve(4);
+  for (int i = 0; i < 4; ++i) {
+    scratch_allocs.emplace_back(20 + i, 4, LogicalBuffer::Color(0));
+  }
+  std::vector<BufferAllocation::Slice> scratch_slices;
+  scratch_slices.reserve(scratch_allocs.size());
+  for (BufferAllocation& alloc : scratch_allocs) {
+    scratch_slices.emplace_back(&alloc, 0, 4);
+  }
 
   CalleeCallerSlices caller;
   caller.params[{0, ShapeIndex{}}] = p0_slice;
   caller.params[{1, ShapeIndex{}}] = p1_slice;
   caller.results[ShapeIndex{}] = res_slice;
-  caller.scratch = {scratch_slice};
+  caller.scratch = scratch_slices;
 
   EXPECT_THAT(
       BuildCalleeBinding(*assignment, *module->entry_computation(), caller),
-      StatusIs(absl::StatusCode::kInvalidArgument));
+      StatusIs(absl::StatusCode::kInvalidArgument, HasSubstr("too small for")));
 }
 
 }  // namespace

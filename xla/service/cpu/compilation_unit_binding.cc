@@ -45,13 +45,15 @@ absl::StatusOr<std::vector<BufferAllocation::Slice>> BuildCalleeBinding(
   TF_RETURN_IF_ERROR(ShapeUtil::ForEachSubshapeWithStatus(
       root->shape(),
       [&](const Shape& /*subshape*/, const ShapeIndex& index) -> absl::Status {
-        absl::StatusOr<BufferAllocation::Slice> slice =
-            callee_assignment.GetUniqueSlice(root, index);
-        if (!slice.ok()) {
-          // No buffer at this shape index (e.g. an interior tuple node without a
-          // materialized table); nothing to bind.
+        if (!callee_assignment.HasAllocationAt(root, index)) {
+          // Genuinely no buffer at this shape index (e.g. an interior tuple node
+          // without a materialized table); nothing to bind. Distinct from an
+          // ambiguous slice, which GetUniqueSlice also reports as an error but
+          // must NOT be swallowed below.
           return absl::OkStatus();
         }
+        TF_ASSIGN_OR_RETURN(BufferAllocation::Slice slice,
+                            callee_assignment.GetUniqueSlice(root, index));
         auto it = caller.results.find(index);
         if (it == caller.results.end()) {
           return absl::InvalidArgumentError(
@@ -59,10 +61,10 @@ absl::StatusOr<std::vector<BufferAllocation::Slice>> BuildCalleeBinding(
                            " has no caller result slice"));
         }
         auto [inserted_it, inserted] =
-            result_binding.try_emplace(slice->index(), it->second);
+            result_binding.try_emplace(slice.index(), it->second);
         if (!inserted && inserted_it->second != it->second) {
           return absl::InvalidArgumentError(absl::StrCat(
-              "Callee result allocation ", slice->index(),
+              "Callee result allocation ", slice.index(),
               " maps to conflicting caller result slices"));
         }
         return absl::OkStatus();
