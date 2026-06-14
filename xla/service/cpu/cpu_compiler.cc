@@ -1817,6 +1817,21 @@ CpuCompiler::CompileCpuExecutable(
       sub->mutable_config()
           .mutable_debug_options()
           .set_xla_cpu_generate_unique_c_style_kernel_entry_points(true);
+      // A shared unit is emitted once and reused at N call sites. A
+      // side-effecting op (infeed/outfeed/send/recv/collective/rng-state/...)
+      // inside such a unit could hang or misorder at runtime, so reject it at
+      // compile time.
+      for (const HloComputation* comp : sub->computations()) {
+        for (const HloInstruction* instr : comp->instructions()) {
+          if (instr->HasSideEffect()) {
+            return Unimplemented(
+                "Shared compilation unit %s contains a side-effecting "
+                "operation %s; side-effecting ops inside a shared unit are not "
+                "supported",
+                sub->name(), instr->name());
+          }
+        }
+      }
       ASSIGN_OR_RETURN(HloSchedule sub_schedule, CreateHloSchedule(*sub));
       RETURN_IF_ERROR(sub->set_schedule(sub_schedule));
       ASSIGN_OR_RETURN(std::unique_ptr<BufferAssignment> sub_assignment,

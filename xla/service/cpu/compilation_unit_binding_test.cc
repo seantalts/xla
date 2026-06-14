@@ -344,5 +344,45 @@ TEST_F(CompilationUnitBindingTest, RejectsUndersizedScratchSlice) {
       StatusIs(absl::StatusCode::kInvalidArgument, HasSubstr("too small for")));
 }
 
+// A callee whose root IS an entry parameter (ROOT p0 = parameter(0)) produces a
+// single allocation that is both an entry parameter and live-out. Binding it
+// would write only the caller's operand slice and leave the result slice
+// unwritten (silent miscompile), so it is rejected up front.
+TEST_F(CompilationUnitBindingTest, RejectsParamResultAliasing) {
+  constexpr absl::string_view kHlo = R"(
+    HloModule callee
+    ENTRY e {
+      ROOT p0 = f32[8] parameter(0)
+    })";
+  TF_ASSERT_OK_AND_ASSIGN(auto module, ParseAndReturnVerifiedModule(kHlo));
+  std::unique_ptr<BufferAssignment> assignment =
+      RunBufferAssignment(module.get());
+
+  // Sanity: the single buffer is both an entry parameter and live-out.
+  bool has_param_liveout = false;
+  for (const BufferAllocation& a : assignment->Allocations()) {
+    if (a.is_entry_computation_parameter() && a.maybe_live_out()) {
+      has_param_liveout = true;
+      break;
+    }
+  }
+  ASSERT_TRUE(has_param_liveout)
+      << "test needs an allocation that is both param and live-out";
+
+  BufferAllocation caller_p0(10, 32, LogicalBuffer::Color(0));
+  BufferAllocation caller_res(12, 32, LogicalBuffer::Color(0));
+  BufferAllocation::Slice p0_slice(&caller_p0, 0, 32);
+  BufferAllocation::Slice res_slice(&caller_res, 0, 32);
+
+  CalleeCallerSlices caller;
+  caller.params[{0, ShapeIndex{}}] = p0_slice;
+  caller.results[ShapeIndex{}] = res_slice;
+
+  EXPECT_THAT(
+      BuildCalleeBinding(*assignment, *module->entry_computation(), caller),
+      StatusIs(absl::StatusCode::kUnimplemented,
+               HasSubstr("both an entry parameter and live-out")));
+}
+
 }  // namespace
 }  // namespace xla::cpu

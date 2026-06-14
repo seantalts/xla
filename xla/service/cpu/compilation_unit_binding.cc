@@ -79,13 +79,26 @@ absl::StatusOr<std::vector<BufferAllocation::Slice>> BuildCalleeBinding(
   // that reserves the scratch tuple elements must use the same order.
   size_t next_scratch = 0;
   for (const BufferAllocation& allocation : allocations) {
+    // An allocation that is both an entry parameter and live-out (e.g. a callee
+    // whose root forwards a parameter, or HLO input/output aliasing) would take
+    // the parameter branch below and bind only to the caller's operand slice,
+    // leaving the caller's result slice unwritten -> silent miscompile. Reject
+    // such param/result aliasing inside a unit up front.
+    if (allocation.is_entry_computation_parameter() &&
+        allocation.maybe_live_out()) {
+      return absl::UnimplementedError(absl::StrCat(
+          "Shared compilation unit has a buffer that is both an entry "
+          "parameter and live-out (allocation ",
+          allocation.index(),
+          "); parameter/result aliasing inside a unit is not supported"));
+    }
     // Constant allocations are owned by the emitted callee; leave them unbound.
     if (allocation.is_constant()) {
       continue;
     }
     // Check parameters before live-out so a parameter aliased with the output
-    // binds to the caller's operand buffer. (TODO: revisit in/out aliasing and
-    // constant allocations inside a unit.)
+    // binds to the caller's operand buffer. (Param/result aliasing within a unit
+    // is rejected above; this branch handles ordinary entry parameters.)
     if (allocation.is_entry_computation_parameter()) {
       std::pair<int64_t, ShapeIndex> key{allocation.parameter_number(),
                                          allocation.param_shape_index()};

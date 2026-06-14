@@ -18,6 +18,8 @@ limitations under the License.
 #include <utility>
 
 #include "absl/container/flat_hash_set.h"
+#include "absl/status/status.h"
+#include "absl/status/status_matchers.h"
 #include "absl/strings/match.h"
 #include "absl/strings/str_cat.h"
 #include "absl/strings/str_format.h"
@@ -185,6 +187,42 @@ ENTRY e {
                                           kN, kN, constant_text, kN, kN, kN,
                                           kN);
   EXPECT_TRUE(RunAndCompare(hlo, ErrorSpec{1e-5, 1e-5}));
+}
+
+TEST_F(CompilationUnitSharedEmissionTest, RejectsSideEffectingOpInUnit) {
+  // A shared unit emitted once and reused at N sites must not contain a
+  // side-effecting op (here an outfeed): it could hang or misorder at runtime.
+  // The compiler must reject it cleanly (Unimplemented), not crash or silently
+  // miscompile.
+  constexpr absl::string_view kHlo = R"(
+HloModule m
+unit {
+  p0 = f32[64] parameter(0)
+  tok = token[] after-all()
+  of = token[] outfeed(p0, tok), outfeed_shape=f32[64]
+  ROOT a = f32[64] add(p0, p0)
+}
+ENTRY e {
+  p = f32[64] parameter(0)
+  ROOT c = f32[64] call(p), to_apply=unit, frontend_attributes={compilation_unit="unit0"}
+}
+)";
+  CpuCompiler compiler;
+  Compiler::CompileOptions compile_options;
+  TF_ASSERT_OK_AND_ASSIGN(std::unique_ptr<HloModule> module,
+                          ParseAndReturnVerifiedModule(kHlo));
+  module->mutable_config()
+      .mutable_debug_options()
+      .set_xla_cpu_compilation_unit_shared_emission(true);
+  TF_ASSERT_OK_AND_ASSIGN(
+      std::unique_ptr<HloModule> optimized,
+      compiler.RunHloPasses(std::move(module), /*stream_exec=*/nullptr,
+                            compile_options));
+  absl::StatusOr<std::unique_ptr<Executable>> result =
+      compiler.RunBackend(std::move(optimized), /*stream_exec=*/nullptr,
+                          compile_options);
+  EXPECT_THAT(result.status(),
+              ::absl_testing::StatusIs(absl::StatusCode::kUnimplemented));
 }
 
 }  // namespace
