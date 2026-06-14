@@ -79,6 +79,46 @@ cc_test(
 )
 
 cc_library(
+    name = "compilation_unit_scratch_rewriter",
+    srcs = ["compilation_unit_scratch_rewriter.cc"],
+    hdrs = ["compilation_unit_scratch_rewriter.h"],
+    deps = [
+        "//xla:shape_util",
+        "//xla:util",
+        "//xla/hlo/ir:hlo",
+        "//xla/hlo/transforms:hlo_module_stitcher",
+        "//xla/service:buffer_assignment",
+        "//xla/tsl/platform:status_macros",
+        "@com_google_absl//absl/container:flat_hash_map",
+        "@com_google_absl//absl/status",
+        "@com_google_absl//absl/status:statusor",
+        "@com_google_absl//absl/strings",
+    ],
+)
+
+cc_test(
+    name = "compilation_unit_scratch_rewriter_test",
+    srcs = ["compilation_unit_scratch_rewriter_test.cc"],
+    deps = [
+        ":compilation_unit_scratch_rewriter",
+        "//xla:shape_util",
+        "//xla/hlo/analysis:alias_info",
+        "//xla/hlo/analysis:hlo_ordering",
+        "//xla/hlo/ir:hlo",
+        "//xla/hlo/testlib:hlo_hardware_independent_test_base",
+        "//xla/service:buffer_assignment",
+        "//xla/service:buffer_value",
+        "//xla/service:logical_buffer",
+        "//xla/tsl/platform:statusor",
+        "@com_google_absl//absl/container:flat_hash_map",
+        "@com_google_absl//absl/status",
+        "@com_google_absl//absl/status:status_matchers",
+        "@com_google_absl//absl/strings",
+        "@com_google_googletest//:gtest_main",
+    ],
+)
+
+cc_library(
     name = "test_header_helper",
     testonly = True,
     hdrs = ["test_target_triple_helper.h"],
