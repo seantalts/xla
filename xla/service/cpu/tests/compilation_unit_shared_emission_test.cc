@@ -14,10 +14,13 @@ limitations under the License.
 ==============================================================================*/
 
 #include <memory>
+#include <string>
 #include <utility>
 
 #include "absl/container/flat_hash_set.h"
 #include "absl/strings/match.h"
+#include "absl/strings/str_cat.h"
+#include "absl/strings/str_format.h"
 #include "absl/strings/string_view.h"
 #include "xla/backends/cpu/runtime/thunk.h"
 #include "xla/error_spec.h"
@@ -150,6 +153,38 @@ ENTRY e {
 }
 )";
   EXPECT_TRUE(RunAndCompare(kHlo, ErrorSpec{1e-4, 1e-4}));
+}
+
+TEST_F(CompilationUnitSharedEmissionTest, ConstantInsideUnit) {
+  // f32[4096] == 16 KiB > CpuInstructionFusion::GetLargeConstantThresholdBytes()
+  // (10000 bytes). Constants at or below that threshold are emitted as LLVM
+  // globals via EmitSmallConstantGlobals and would not exercise the
+  // thunk-owned ConstantAllocation path that the shared-emission binding
+  // relies on, so the constant must be large enough to be a real constant
+  // allocation in the callee's private buffer assignment.
+  constexpr int kN = 4096;
+  std::string constant_text;
+  for (int i = 0; i < kN; ++i) {
+    absl::StrAppend(&constant_text, i == 0 ? "" : ", ", i, ".5");
+  }
+  const std::string hlo = absl::StrFormat(R"(
+HloModule m
+
+unit {
+  p0 = f32[%d] parameter(0)
+  k = f32[%d] constant({%s})
+  ROOT a = f32[%d] add(p0, k)
+}
+
+ENTRY e {
+  p = f32[%d] parameter(0)
+  c0 = f32[%d] call(p), to_apply=unit, frontend_attributes={compilation_unit="unit0"}
+  ROOT c1 = f32[%d] call(c0), to_apply=unit, frontend_attributes={compilation_unit="unit0"}
+}
+)",
+                                          kN, kN, constant_text, kN, kN, kN,
+                                          kN);
+  EXPECT_TRUE(RunAndCompare(hlo, ErrorSpec{1e-5, 1e-5}));
 }
 
 }  // namespace
