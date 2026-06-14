@@ -1821,6 +1821,12 @@ CpuCompiler::CompileCpuExecutable(
       RETURN_IF_ERROR(sub->set_schedule(sub_schedule));
       ASSIGN_OR_RETURN(std::unique_ptr<BufferAssignment> sub_assignment,
                        CreateBufferAssignment(*sub));
+      if (cu_assignment_map.contains(sub->name())) {
+        return Internal(
+            "Duplicate compilation-unit submodule name %s; submodule names "
+            "must be unique for shared emission",
+            sub->name());
+      }
       cu_assignment_map[sub->name()] = sub_assignment.get();
       cu_assignments.push_back(std::move(sub_assignment));
     }
@@ -1929,6 +1935,8 @@ CpuCompiler::CompileCpuExecutable(
                      ThunkExecutor::Create(std::move(sub_thunks)));
     ASSIGN_OR_RETURN(std::vector<ConstantAllocation> sub_constants,
                      CreateConstantAllocations(sub_assignment));
+    // Key is the submodule name, which must equal each call site's
+    // raw_backend_config_string().
     cu_artifacts[sub->name()] = ThunkEmitter::CompilationUnitArtifacts{
         std::make_shared<ThunkExecutor>(std::move(sub_executor)),
         &sub_assignment, sub->entry_computation(),
