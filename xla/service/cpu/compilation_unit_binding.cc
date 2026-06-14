@@ -17,21 +17,57 @@ limitations under the License.
 
 #include <cstddef>
 #include <cstdint>
+#include <utility>
 #include <vector>
 
+#include "absl/container/flat_hash_map.h"
 #include "absl/status/status.h"
 #include "absl/status/statusor.h"
 #include "absl/strings/str_cat.h"
-#include "absl/types/span.h"
+#include "xla/hlo/ir/hlo_computation.h"
+#include "xla/hlo/ir/hlo_instruction.h"
 #include "xla/service/buffer_assignment.h"
+#include "xla/shape.h"
+#include "xla/shape_util.h"
+#include "xla/tsl/platform/status_macros.h"
 
 namespace xla::cpu {
 
 absl::StatusOr<std::vector<BufferAllocation::Slice>> BuildCalleeBinding(
     const BufferAssignment& callee_assignment,
-    absl::Span<const BufferAllocation::Slice> caller_param_slices,
-    const BufferAllocation::Slice& caller_result_slice,
-    absl::Span<const BufferAllocation::Slice> caller_scratch_slices) {
+    const HloComputation& callee_entry, const CalleeCallerSlices& caller) {
+  // Build a map from callee result allocation index to the caller result slice
+  // that receives it, by walking every subshape of the callee root. Several
+  // shape indices may share one allocation (e.g. a tuple table); the map must
+  // be consistent across them.
+  const HloInstruction* root = callee_entry.root_instruction();
+  absl::flat_hash_map<int64_t, BufferAllocation::Slice> result_binding;
+  TF_RETURN_IF_ERROR(ShapeUtil::ForEachSubshapeWithStatus(
+      root->shape(),
+      [&](const Shape& /*subshape*/, const ShapeIndex& index) -> absl::Status {
+        absl::StatusOr<BufferAllocation::Slice> slice =
+            callee_assignment.GetUniqueSlice(root, index);
+        if (!slice.ok()) {
+          // No buffer at this shape index (e.g. an interior tuple node without a
+          // materialized table); nothing to bind.
+          return absl::OkStatus();
+        }
+        auto it = caller.results.find(index);
+        if (it == caller.results.end()) {
+          return absl::InvalidArgumentError(
+              absl::StrCat("Callee result at shape index ", index.ToString(),
+                           " has no caller result slice"));
+        }
+        auto [inserted_it, inserted] =
+            result_binding.try_emplace(slice->index(), it->second);
+        if (!inserted && inserted_it->second != it->second) {
+          return absl::InvalidArgumentError(absl::StrCat(
+              "Callee result allocation ", slice->index(),
+              " maps to conflicting caller result slices"));
+        }
+        return absl::OkStatus();
+      }));
+
   const std::vector<BufferAllocation>& allocations =
       callee_assignment.Allocations();
   std::vector<BufferAllocation::Slice> binding(allocations.size());
@@ -39,30 +75,52 @@ absl::StatusOr<std::vector<BufferAllocation::Slice>> BuildCalleeBinding(
   // Internal allocations consume scratch slices in iteration order, which is
   // ascending allocation index (Allocations() is index-ordered). The producer
   // that reserves the scratch tuple elements must use the same order.
-  size_t scratch_index = 0;
+  size_t next_scratch = 0;
   for (const BufferAllocation& allocation : allocations) {
+    // Constant allocations are owned by the emitted callee; leave them unbound.
+    if (allocation.is_constant()) {
+      continue;
+    }
     // Check parameters before live-out so a parameter aliased with the output
     // binds to the caller's operand buffer. (TODO: revisit in/out aliasing and
     // constant allocations inside a unit.)
     if (allocation.is_entry_computation_parameter()) {
-      int64_t parameter = allocation.parameter_number();
-      if (parameter < 0 ||
-          parameter >= static_cast<int64_t>(caller_param_slices.size())) {
+      std::pair<int64_t, ShapeIndex> key{allocation.parameter_number(),
+                                         allocation.param_shape_index()};
+      auto it = caller.params.find(key);
+      if (it == caller.params.end()) {
         return absl::InvalidArgumentError(absl::StrCat(
-            "Callee parameter ", parameter, " has no caller slice (",
-            caller_param_slices.size(), " provided)"));
+            "Callee parameter ", allocation.parameter_number(),
+            " at shape index ", allocation.param_shape_index().ToString(),
+            " has no caller slice"));
       }
-      binding[allocation.index()] = caller_param_slices[parameter];
-    } else if (allocation.maybe_live_out()) {
-      binding[allocation.index()] = caller_result_slice;
-    } else {
-      if (scratch_index >= caller_scratch_slices.size()) {
-        return absl::InvalidArgumentError(absl::StrCat(
-            "Callee has more internal allocations than caller scratch slices (",
-            caller_scratch_slices.size(), " provided)"));
-      }
-      binding[allocation.index()] = caller_scratch_slices[scratch_index++];
+      binding[allocation.index()] = it->second;
+      continue;
     }
+    if (auto it = result_binding.find(allocation.index());
+        it != result_binding.end()) {
+      binding[allocation.index()] = it->second;
+      continue;
+    }
+    if (allocation.maybe_live_out()) {
+      return absl::InvalidArgumentError(absl::StrCat(
+          "Callee live-out allocation ", allocation.index(),
+          " is not reachable from any caller result slice"));
+    }
+    // Internal (scratch) allocation.
+    if (next_scratch >= caller.scratch.size()) {
+      return absl::InvalidArgumentError(absl::StrCat(
+          "Callee has more internal allocations than caller scratch slices (",
+          caller.scratch.size(), " provided)"));
+    }
+    const BufferAllocation::Slice& scratch = caller.scratch[next_scratch++];
+    if (scratch.size() < allocation.size()) {
+      return absl::InvalidArgumentError(absl::StrCat(
+          "Caller scratch slice of ", scratch.size(),
+          " bytes is too small for callee internal allocation ",
+          allocation.index(), " of ", allocation.size(), " bytes"));
+    }
+    binding[allocation.index()] = scratch;
   }
   return binding;
 }

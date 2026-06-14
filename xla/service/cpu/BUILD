@@ -46,11 +46,14 @@ cc_library(
     srcs = ["compilation_unit_binding.cc"],
     hdrs = ["compilation_unit_binding.h"],
     deps = [
+        "//xla:shape_util",
+        "//xla/hlo/ir:hlo",
         "//xla/service:buffer_assignment",
+        "//xla/tsl/platform:status_macros",
+        "@com_google_absl//absl/container:flat_hash_map",
         "@com_google_absl//absl/status",
         "@com_google_absl//absl/status:statusor",
         "@com_google_absl//absl/strings",
-        "@com_google_absl//absl/types:span",
     ],
 )
 
@@ -68,6 +71,8 @@ cc_test(
         "//xla/service:buffer_value",
         "//xla/service:logical_buffer",
         "//xla/tsl/platform:statusor",
+        "@com_google_absl//absl/status",
+        "@com_google_absl//absl/status:status_matchers",
         "@com_google_absl//absl/strings",
         "@com_google_googletest//:gtest_main",
     ],

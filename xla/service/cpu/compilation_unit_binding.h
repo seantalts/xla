@@ -16,13 +16,36 @@ limitations under the License.
 #ifndef XLA_SERVICE_CPU_COMPILATION_UNIT_BINDING_H_
 #define XLA_SERVICE_CPU_COMPILATION_UNIT_BINDING_H_
 
+#include <cstdint>
+#include <utility>
 #include <vector>
 
+#include "absl/container/flat_hash_map.h"
 #include "absl/status/statusor.h"
-#include "absl/types/span.h"
+#include "xla/hlo/ir/hlo_computation.h"
 #include "xla/service/buffer_assignment.h"
+#include "xla/shape_util.h"
 
 namespace xla::cpu {
+
+// The caller-side buffer slices that provide a shared `compilation_unit`
+// callee's inputs, outputs, and scratch at one call site. Used to map the
+// callee's private allocations onto the caller's buffers.
+struct CalleeCallerSlices {
+  // For each callee entry parameter, keyed by (parameter_number, shape index
+  // within that parameter), the caller slice that provides it. Tuple-shaped
+  // parameters contribute one entry per leaf (and possibly the tuple table).
+  absl::flat_hash_map<std::pair<int64_t, ShapeIndex>, BufferAllocation::Slice>
+      params;
+  // For each shape index of the callee root, the caller slice that receives
+  // that output. Tuple-shaped results contribute one entry per leaf, plus the
+  // top-level tuple table at index {} if the callee materializes one.
+  absl::flat_hash_map<ShapeIndex, BufferAllocation::Slice> results;
+  // Per-site scratch slices, consumed by the callee's internal allocations in
+  // order of increasing callee allocation index (see plan 3B: tuple output
+  // `(result, scratch...)`).
+  std::vector<BufferAllocation::Slice> scratch;
+};
 
 // Builds the per-allocation binding consumed by a RemappedCallThunk for one call
 // site of a shared `compilation_unit` callee.
@@ -31,17 +54,16 @@ namespace xla::cpu {
 // allocations are indexed 0..N-1. This returns a vector indexed by that private
 // allocation index, giving the caller buffer that provides each callee
 // allocation at this call site:
-//   - a callee parameter allocation p  -> `caller_param_slices[p]`
-//   - the callee result allocation     -> `caller_result_slice`
-//   - an internal (scratch) allocation -> the next `caller_scratch_slices`
-//     entry, consumed in order of increasing callee allocation index. These are
-//     the per-site scratch buffers the caller reserves (see plan 3B: tuple
-//     output `(result, scratch...)`).
+//   - a callee parameter allocation     -> `caller.params[{param, index}]`
+//   - a callee result allocation (leaf
+//     or tuple table)                   -> the matching `caller.results[index]`
+//   - an internal (scratch) allocation  -> the next `caller.scratch` entry,
+//     consumed in order of increasing callee allocation index.
+//   - a constant allocation             -> left unbound (null allocation); the
+//     emitted callee owns its own constants.
 absl::StatusOr<std::vector<BufferAllocation::Slice>> BuildCalleeBinding(
     const BufferAssignment& callee_assignment,
-    absl::Span<const BufferAllocation::Slice> caller_param_slices,
-    const BufferAllocation::Slice& caller_result_slice,
-    absl::Span<const BufferAllocation::Slice> caller_scratch_slices);
+    const HloComputation& callee_entry, const CalleeCallerSlices& caller);
 
 }  // namespace xla::cpu
 

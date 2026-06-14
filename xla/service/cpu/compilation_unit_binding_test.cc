@@ -15,14 +15,19 @@ limitations under the License.
 
 #include "xla/service/cpu/compilation_unit_binding.h"
 
+#include <cstddef>
 #include <cstdint>
 #include <memory>
 #include <vector>
 
 #include <gtest/gtest.h>
+#include "absl/status/status.h"
+#include "absl/status/status_matchers.h"
 #include "absl/strings/string_view.h"
 #include "xla/hlo/analysis/alias_info.h"
 #include "xla/hlo/analysis/hlo_ordering.h"
+#include "xla/hlo/ir/hlo_computation.h"
+#include "xla/hlo/ir/hlo_instruction.h"
 #include "xla/hlo/ir/hlo_module.h"
 #include "xla/hlo/testlib/hlo_hardware_independent_test_base.h"
 #include "xla/service/buffer_assignment.h"
@@ -34,6 +39,8 @@ limitations under the License.
 namespace xla::cpu {
 namespace {
 
+using ::absl_testing::StatusIs;
+
 int64_t BufferSizeBytes(const BufferValue& buffer) {
   return ShapeUtil::ByteSizeOf(buffer.shape(), sizeof(void*));
 }
@@ -42,6 +49,9 @@ class CompilationUnitBindingTest : public HloHardwareIndependentTestBase {
  protected:
   std::unique_ptr<BufferAssignment> RunBufferAssignment(HloModule* module) {
     BufferAssigner::Options opts;
+    // So that callee constants surface as constant allocations (mirroring how
+    // the CPU backend assigns buffers for the shared callee).
+    opts.allocate_buffers_for_constants = true;
     return BufferAssigner::Run(
                module, std::make_unique<DependencyHloOrdering>(module),
                &BufferSizeBytes, &alias_info_,
@@ -75,10 +85,14 @@ TEST_F(CompilationUnitBindingTest, MapsParamsAndResultToCallerSlices) {
   BufferAllocation::Slice p1_slice(&caller_p1, 0, 16);
   BufferAllocation::Slice res_slice(&caller_res, 0, 16);
 
+  CalleeCallerSlices caller;
+  caller.params[{0, ShapeIndex{}}] = p0_slice;
+  caller.params[{1, ShapeIndex{}}] = p1_slice;
+  caller.results[ShapeIndex{}] = res_slice;
+
   TF_ASSERT_OK_AND_ASSIGN(
       std::vector<BufferAllocation::Slice> binding,
-      BuildCalleeBinding(*assignment, {p0_slice, p1_slice}, res_slice,
-                         /*caller_scratch_slices=*/{}));
+      BuildCalleeBinding(*assignment, *module->entry_computation(), caller));
 
   // One binding entry per callee private allocation.
   ASSERT_EQ(binding.size(), assignment->Allocations().size());
@@ -140,10 +154,15 @@ TEST_F(CompilationUnitBindingTest, MapsInternalAllocationsToScratchSlices) {
     scratch_slices.emplace_back(&alloc, 0, 16);
   }
 
+  CalleeCallerSlices caller;
+  caller.params[{0, ShapeIndex{}}] = p0_slice;
+  caller.params[{1, ShapeIndex{}}] = p1_slice;
+  caller.results[ShapeIndex{}] = res_slice;
+  caller.scratch = scratch_slices;
+
   TF_ASSERT_OK_AND_ASSIGN(
       std::vector<BufferAllocation::Slice> binding,
-      BuildCalleeBinding(*assignment, {p0_slice, p1_slice}, res_slice,
-                         scratch_slices));
+      BuildCalleeBinding(*assignment, *module->entry_computation(), caller));
 
   ASSERT_EQ(binding.size(), assignment->Allocations().size());
   // Internal allocations consume scratch slices in ascending index order.
@@ -151,6 +170,165 @@ TEST_F(CompilationUnitBindingTest, MapsInternalAllocationsToScratchSlices) {
     EXPECT_EQ(binding[internal_indices[k]], scratch_slices[k])
         << "internal #" << k << " (allocation " << internal_indices[k] << ")";
   }
+}
+
+// A tuple-returning callee has its leaf result allocations mapped to the
+// per-leaf caller result slices keyed by ShapeIndex.
+TEST_F(CompilationUnitBindingTest, MapsTupleResultLeavesToCallerSlices) {
+  constexpr absl::string_view kHlo = R"(
+    HloModule callee
+    ENTRY e {
+      p0 = f32[4] parameter(0)
+      e0 = f32[4] exponential(p0)
+      n0 = f32[4] negate(p0)
+      ROOT t = (f32[4], f32[4]) tuple(e0, n0)
+    })";
+  TF_ASSERT_OK_AND_ASSIGN(auto module, ParseAndReturnVerifiedModule(kHlo));
+  std::unique_ptr<BufferAssignment> assignment =
+      RunBufferAssignment(module.get());
+
+  // Fabricate caller buffers a0..a3.
+  BufferAllocation a0(10, 16, LogicalBuffer::Color(0));  // param 0
+  BufferAllocation a1(11, 16, LogicalBuffer::Color(0));  // result leaf {0}
+  BufferAllocation a2(12, 16, LogicalBuffer::Color(0));  // result leaf {1}
+  BufferAllocation a3(13, 16, LogicalBuffer::Color(0));  // tuple table {}
+  BufferAllocation::Slice s0(&a0, 0, 16);
+  BufferAllocation::Slice s1(&a1, 0, 16);
+  BufferAllocation::Slice s2(&a2, 0, 16);
+  BufferAllocation::Slice s3(&a3, 0, 16);
+
+  CalleeCallerSlices caller;
+  caller.params[{0, ShapeIndex{}}] = s0;
+  caller.results[ShapeIndex{0}] = s1;
+  caller.results[ShapeIndex{1}] = s2;
+  caller.results[ShapeIndex{}] = s3;
+
+  TF_ASSERT_OK_AND_ASSIGN(
+      std::vector<BufferAllocation::Slice> binding,
+      BuildCalleeBinding(*assignment, *module->entry_computation(), caller));
+
+  ASSERT_EQ(binding.size(), assignment->Allocations().size());
+
+  // Every non-constant allocation is bound.
+  for (const BufferAllocation& a : assignment->Allocations()) {
+    if (!a.is_constant()) {
+      EXPECT_NE(binding[a.index()].allocation(), nullptr)
+          << "allocation " << a.index();
+    }
+  }
+
+  // The two leaf result allocations map to a1 and a2.
+  const HloInstruction* root =
+      module->entry_computation()->root_instruction();
+  TF_ASSERT_OK_AND_ASSIGN(BufferAllocation::Slice leaf0,
+                          assignment->GetUniqueSlice(root, {0}));
+  TF_ASSERT_OK_AND_ASSIGN(BufferAllocation::Slice leaf1,
+                          assignment->GetUniqueSlice(root, {1}));
+  EXPECT_EQ(binding[leaf0.index()], s1);
+  EXPECT_EQ(binding[leaf1.index()], s2);
+}
+
+// Constant allocations inside the callee are left unbound (the emitted callee
+// owns its constants); params and results bind normally.
+TEST_F(CompilationUnitBindingTest, LeavesConstantAllocationsUnbound) {
+  constexpr absl::string_view kHlo = R"(
+    HloModule callee
+    ENTRY e {
+      p0 = f32[64] parameter(0)
+      c = f32[64] constant({1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,
+                            17,18,19,20,21,22,23,24,25,26,27,28,29,30,31,32,
+                            33,34,35,36,37,38,39,40,41,42,43,44,45,46,47,48,
+                            49,50,51,52,53,54,55,56,57,58,59,60,61,62,63,64})
+      ROOT a = f32[64] add(p0, c)
+    })";
+  TF_ASSERT_OK_AND_ASSIGN(auto module, ParseAndReturnVerifiedModule(kHlo));
+  std::unique_ptr<BufferAssignment> assignment =
+      RunBufferAssignment(module.get());
+
+  // There must be at least one constant allocation for this test to be
+  // meaningful.
+  bool has_constant = false;
+  for (const BufferAllocation& a : assignment->Allocations()) {
+    if (a.is_constant()) {
+      has_constant = true;
+      break;
+    }
+  }
+  ASSERT_TRUE(has_constant) << "test needs >=1 constant allocation";
+
+  BufferAllocation caller_p0(10, 256, LogicalBuffer::Color(0));
+  BufferAllocation caller_res(12, 256, LogicalBuffer::Color(0));
+  BufferAllocation::Slice p0_slice(&caller_p0, 0, 256);
+  BufferAllocation::Slice res_slice(&caller_res, 0, 256);
+
+  CalleeCallerSlices caller;
+  caller.params[{0, ShapeIndex{}}] = p0_slice;
+  caller.results[ShapeIndex{}] = res_slice;
+
+  TF_ASSERT_OK_AND_ASSIGN(
+      std::vector<BufferAllocation::Slice> binding,
+      BuildCalleeBinding(*assignment, *module->entry_computation(), caller));
+
+  ASSERT_EQ(binding.size(), assignment->Allocations().size());
+
+  for (const BufferAllocation& a : assignment->Allocations()) {
+    if (a.is_constant()) {
+      EXPECT_EQ(binding[a.index()].allocation(), nullptr)
+          << "constant allocation " << a.index() << " must be unbound";
+    } else if (a.is_entry_computation_parameter()) {
+      EXPECT_EQ(binding[a.index()], p0_slice);
+    } else if (a.maybe_live_out()) {
+      EXPECT_EQ(binding[a.index()], res_slice);
+    }
+  }
+}
+
+// An internal (scratch) allocation whose size exceeds the provided caller
+// scratch slice is rejected.
+TEST_F(CompilationUnitBindingTest, RejectsUndersizedScratchSlice) {
+  constexpr absl::string_view kHlo = R"(
+    HloModule callee
+    ENTRY e {
+      p0 = f32[64] parameter(0)
+      p1 = f32[64] parameter(1)
+      a = f32[64] add(p0, p1)
+      b = f32[64] multiply(p0, p1)
+      ROOT sub = f32[64] subtract(a, b)
+    })";
+  TF_ASSERT_OK_AND_ASSIGN(auto module, ParseAndReturnVerifiedModule(kHlo));
+  std::unique_ptr<BufferAssignment> assignment =
+      RunBufferAssignment(module.get());
+
+  // Sanity: at least one internal allocation exists to consume scratch.
+  bool has_internal = false;
+  for (const BufferAllocation& a : assignment->Allocations()) {
+    if (!a.is_entry_computation_parameter() && !a.maybe_live_out() &&
+        !a.is_constant()) {
+      has_internal = true;
+      break;
+    }
+  }
+  ASSERT_TRUE(has_internal) << "test needs >=1 internal allocation";
+
+  BufferAllocation caller_p0(10, 256, LogicalBuffer::Color(0));
+  BufferAllocation caller_p1(11, 256, LogicalBuffer::Color(0));
+  BufferAllocation caller_res(12, 256, LogicalBuffer::Color(0));
+  // Undersized scratch: only 4 bytes, but the internal temp is f32[64] = 256B.
+  BufferAllocation caller_scratch(13, 4, LogicalBuffer::Color(0));
+  BufferAllocation::Slice p0_slice(&caller_p0, 0, 256);
+  BufferAllocation::Slice p1_slice(&caller_p1, 0, 256);
+  BufferAllocation::Slice res_slice(&caller_res, 0, 256);
+  BufferAllocation::Slice scratch_slice(&caller_scratch, 0, 4);
+
+  CalleeCallerSlices caller;
+  caller.params[{0, ShapeIndex{}}] = p0_slice;
+  caller.params[{1, ShapeIndex{}}] = p1_slice;
+  caller.results[ShapeIndex{}] = res_slice;
+  caller.scratch = {scratch_slice};
+
+  EXPECT_THAT(
+      BuildCalleeBinding(*assignment, *module->entry_computation(), caller),
+      StatusIs(absl::StatusCode::kInvalidArgument));
 }
 
 }  // namespace
