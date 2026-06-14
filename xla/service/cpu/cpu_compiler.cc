@@ -97,6 +97,7 @@ limitations under the License.
 #include "xla/backends/cpu/constant_allocation.h"
 #include "xla/backends/cpu/runtime/function_library.h"
 #include "xla/backends/cpu/runtime/thunk.h"
+#include "xla/backends/cpu/runtime/thunk_executor.h"
 #include "xla/backends/cpu/runtime/thunk.pb.h"
 #include "xla/backends/cpu/target_machine_options.h"
 #include "xla/backends/cpu/transforms/collectives/all_reduce_combiner.h"
@@ -180,6 +181,7 @@ limitations under the License.
 #include "xla/service/cpu/conv_canonicalization.h"
 #include "xla/service/cpu/cpu_aot_compilation_result.h"
 #include "xla/service/cpu/cpu_aot_loader.h"
+#include "xla/service/cpu/compilation_unit_scratch_rewriter.h"
 #include "xla/service/cpu/cpu_executable.h"
 #include "xla/service/cpu/cpu_float_support.h"
 #include "xla/service/cpu/cpu_instruction_fusion.h"
@@ -1786,6 +1788,49 @@ CpuCompiler::CompileCpuExecutable(
   const bool embed_ir_in_executable =
       debug_options.xla_embed_ir_in_executable();
 
+  // Mutable copy of the thunk emitter options so the shared compilation-unit
+  // memo (built below) can be wired into the parent ThunkEmitter.
+  ThunkEmitter::Options cu_thunk_emitter_options = thunk_emitter_options;
+
+  // Block A: drain compilation-unit submodules stashed by RunHloPasses, give
+  // each its own schedule + private BufferAssignment, and rewrite the parent
+  // call sites for callee scratch. These locals must outlive parent emission
+  // and CpuExecutable::Create (the memo stores pointers into them).
+  std::vector<std::unique_ptr<HloModule>> cu_submodules;
+  std::vector<std::unique_ptr<BufferAssignment>> cu_assignments;
+  absl::flat_hash_map<std::string, const BufferAssignment*> cu_assignment_map;
+  if (module->config()
+          .debug_options()
+          .xla_cpu_compilation_unit_shared_emission()) {
+    {
+      absl::MutexLock lock(&compilation_unit_submodules_mu_);
+      auto it = compilation_unit_submodules_.find(module->unique_id());
+      if (it != compilation_unit_submodules_.end()) {
+        cu_submodules = std::move(it->second);
+        compilation_unit_submodules_.erase(it);
+      }
+    }
+    module->mutable_config()
+        .mutable_debug_options()
+        .set_xla_cpu_generate_unique_c_style_kernel_entry_points(true);
+    for (std::unique_ptr<HloModule>& sub : cu_submodules) {
+      sub->mutable_config()
+          .mutable_debug_options()
+          .set_xla_cpu_generate_unique_c_style_kernel_entry_points(true);
+      ASSIGN_OR_RETURN(HloSchedule sub_schedule, CreateHloSchedule(*sub));
+      RETURN_IF_ERROR(sub->set_schedule(sub_schedule));
+      ASSIGN_OR_RETURN(std::unique_ptr<BufferAssignment> sub_assignment,
+                       CreateBufferAssignment(*sub));
+      cu_assignment_map[sub->name()] = sub_assignment.get();
+      cu_assignments.push_back(std::move(sub_assignment));
+    }
+    if (!cu_submodules.empty()) {
+      RETURN_IF_ERROR(
+          RewriteCompilationUnitScratch(module.get(), cu_assignment_map)
+              .status());
+    }
+  }
+
   ASSIGN_OR_RETURN(HloSchedule schedule, CreateHloSchedule(*module));
   RETURN_IF_ERROR(module->set_schedule(schedule));
 
@@ -1847,17 +1892,68 @@ CpuCompiler::CompileCpuExecutable(
   // corresponding HLO instructions (fusions, elemental instructions, etc.).
   IrEmitter2 ir_emitter2(*module, llvm_module.get(), &nested_ir_emitter);
 
+  // Block B: emit each compilation-unit submodule ONCE into the shared LLVM
+  // module via a separate IrEmitter2/ThunkEmitter, and build the memo of
+  // artifacts (shared executor + private assignment + constants) that the
+  // parent ThunkEmitter consumes when lowering marked call sites.
+  absl::flat_hash_map<std::string, ThunkEmitter::CompilationUnitArtifacts>
+      cu_artifacts;
+  std::vector<ThunkEmitter::EmittedKernel> cu_kernels;
+  for (std::unique_ptr<HloModule>& sub : cu_submodules) {
+    const BufferAssignment& sub_assignment = *cu_assignment_map.at(sub->name());
+    IrEmitter sub_nested_ir_emitter(
+        &mlir_context, *sub, sub_assignment, llvm_module.get(),
+        /*instruction_to_profile_idx=*/{},
+        /*computation_to_profile_idx=*/{},
+        ModuleComputationsTransitivelyContainCustomCall(*sub),
+        &target_machine_features,
+#ifdef MEMORY_SANITIZER
+        /*emit_code_for_msan=*/true
+#else
+        /*emit_code_for_msan=*/false
+#endif
+    );
+    RETURN_IF_ERROR(sub_nested_ir_emitter.EmitSmallConstantGlobals());
+    IrEmitter2 sub_ir_emitter2(*sub, llvm_module.get(), &sub_nested_ir_emitter);
+    ThunkEmitter sub_thunk_emitter(sub_ir_emitter2, *GetCompilationThreadPool(),
+                                   sub_assignment, target_machine_features,
+                                   *sub, cu_thunk_emitter_options);
+    ASSIGN_OR_RETURN(ThunkSequence sub_thunks,
+                     sub_thunk_emitter.EmitEntryComputation(*sub));
+    ASSIGN_OR_RETURN(auto sub_kernels, sub_thunk_emitter.ConsumeKernels());
+    cu_kernels.insert(cu_kernels.end(),
+                      std::make_move_iterator(sub_kernels.begin()),
+                      std::make_move_iterator(sub_kernels.end()));
+    ir_emitter2.AppendFrom(std::move(sub_ir_emitter2));
+    ASSIGN_OR_RETURN(ThunkExecutor sub_executor,
+                     ThunkExecutor::Create(std::move(sub_thunks)));
+    ASSIGN_OR_RETURN(std::vector<ConstantAllocation> sub_constants,
+                     CreateConstantAllocations(sub_assignment));
+    cu_artifacts[sub->name()] = ThunkEmitter::CompilationUnitArtifacts{
+        std::make_shared<ThunkExecutor>(std::move(sub_executor)),
+        &sub_assignment, sub->entry_computation(),
+        std::make_shared<const std::vector<ConstantAllocation>>(
+            std::move(sub_constants))};
+  }
+  if (!cu_artifacts.empty()) {
+    cu_thunk_emitter_options.compilation_units = &cu_artifacts;
+  }
+
   // Thunk emitter is responsible for building a Thunk sequence that will
   // resolved kernels in the compiled LLVM module and execute them together
   // with Thunks implemented as library calls (e.g. oneDNN or Eigen).
   ThunkEmitter thunk_emitter(ir_emitter2, *GetCompilationThreadPool(),
                              *assignment, target_machine_features, *module,
-                             thunk_emitter_options);
+                             cu_thunk_emitter_options);
   ASSIGN_OR_RETURN(ThunkSequence thunks,
                    thunk_emitter.EmitEntryComputation(*module));
 
   ASSIGN_OR_RETURN(std::vector<ThunkEmitter::EmittedKernel> kernels,
                    thunk_emitter.ConsumeKernels());
+  // Append submodule kernels so the shared LLVM module's symbol collection and
+  // codegen see them alongside the parent's kernels.
+  kernels.insert(kernels.end(), std::make_move_iterator(cu_kernels.begin()),
+                 std::make_move_iterator(cu_kernels.end()));
 
   std::string ir_module_string;
   if (embed_ir_in_executable) {
@@ -2081,6 +2177,12 @@ CpuCompiler::CompileCpuExecutable(
           std::move(function_library), std::move(assignment), std::move(module),
           std::move(thunks), std::move(constants),
           std::move(target_machine_options), std::move(data_layout)));
+
+  // Retain compilation-unit submodules and their private assignments: submodule
+  // thunks hold BufferAllocation::Slices into these assignments, and
+  // ConstantAllocations may alias literals in the submodule HloModules.
+  cpu_executable->RetainCompilationUnitResources(std::move(cu_submodules),
+                                                 std::move(cu_assignments));
 
   // Save object files to be able to export them to AOT compilation
   // result.

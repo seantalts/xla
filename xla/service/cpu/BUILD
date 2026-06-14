@@ -207,6 +207,7 @@ cc_library(
     ],
     copts = tsl_copts(),
     deps = [
+        ":compilation_unit_scratch_rewriter",
         ":conv_canonicalization",
         ":cpu_aot_compilation_result",
         ":cpu_aot_loader",
@@ -253,6 +254,7 @@ cc_library(
         "//xla/backends/cpu/runtime:function_library",
         "//xla/backends/cpu/runtime:kernel_thunk",
         "//xla/backends/cpu/runtime:thunk",
+        "//xla/backends/cpu/runtime:thunk_executor",
         "//xla/backends/cpu/runtime:thunk_proto_cc_impl",
         "//xla/backends/cpu/runtime:thunk_proto_serdes",
         "//xla/backends/cpu/transforms:library_rewriter",

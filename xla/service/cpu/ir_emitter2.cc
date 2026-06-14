@@ -19,6 +19,7 @@ limitations under the License.
 #include <array>
 #include <cstddef>
 #include <cstdint>
+#include <iterator>
 #include <optional>
 #include <string>
 #include <utility>
@@ -128,6 +129,17 @@ IrEmitter2::IrEmitter2(const HloModule& hlo_module, llvm::Module* module,
       kernel_api_ir_builder_(module_->getContext(),
                              KernelApiIrBuilder::Options::FromHloModuleConfig(
                                  hlo_module_.config())) {}
+
+void IrEmitter2::AppendFrom(IrEmitter2&& other) {
+  kernels_.insert(kernels_.end(),
+                  std::make_move_iterator(other.kernels_.begin()),
+                  std::make_move_iterator(other.kernels_.end()));
+  comparators_.insert(comparators_.end(),
+                      std::make_move_iterator(other.comparators_.begin()),
+                      std::make_move_iterator(other.comparators_.end()));
+  other.kernels_.clear();
+  other.comparators_.clear();
+}
 
 bool IrEmitter2::fast_min_max() const {
   return hlo_module_.config().debug_options().xla_cpu_enable_fast_min_max();

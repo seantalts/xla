@@ -195,6 +195,13 @@ static absl::StatusOr<MaybeOwningDeviceAddress> MemoryForAllocation(
   return MaybeOwningDeviceAddress{std::move(out)};
 }
 
+void CpuExecutable::RetainCompilationUnitResources(
+    std::vector<std::unique_ptr<HloModule>> submodules,
+    std::vector<std::unique_ptr<BufferAssignment>> assignments) {
+  compilation_unit_modules_ = std::move(submodules);
+  compilation_unit_assignments_ = std::move(assignments);
+}
+
 absl::StatusOr<std::vector<MaybeOwningDeviceAddress>>
 CpuExecutable::CreateBufferTable(se::DeviceAddressAllocator* memory_allocator,
                                  int device_ordinal,

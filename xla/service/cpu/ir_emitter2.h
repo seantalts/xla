@@ -110,6 +110,12 @@ class IrEmitter2 {
 
   absl::Span<const ComparatorInfo> comparators() const { return comparators_; }
 
+  // Takes over another emitter's kernel/comparator records. Used when
+  // compilation-unit submodules are emitted by separate IrEmitter2 instances
+  // into the same llvm::Module, so the parent's symbol collection sees all of
+  // them.
+  void AppendFrom(IrEmitter2&& other);
+
   // Emits a host kernel for the pad instruction.
   absl::StatusOr<KernelInfo> EmitPadHostKernel(const HloInstruction* pad);
 

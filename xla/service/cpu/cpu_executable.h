@@ -157,6 +157,14 @@ class CpuExecutable : public Executable {
 
   const std::string& data_layout() const { return data_layout_; }
 
+  // Keeps compilation-unit submodules and their private buffer assignments
+  // alive: submodule thunks hold BufferAllocation::Slices into these
+  // assignments, and ConstantAllocations may alias literals in the submodule
+  // HloModules.
+  void RetainCompilationUnitResources(
+      std::vector<std::unique_ptr<HloModule>> submodules,
+      std::vector<std::unique_ptr<BufferAssignment>> assignments);
+
  private:
   // Creates an array suitable for passing as the "buffer_table" argument to the
   // JIT compiled function pointer.
@@ -246,6 +254,12 @@ class CpuExecutable : public Executable {
 
   // Entry function name for the computation.
   std::string entry_function_name_;
+
+  // Compilation-unit submodules and their private buffer assignments, retained
+  // so submodule thunks' BufferAllocation::Slices and ConstantAllocations stay
+  // valid for the lifetime of the executable.
+  std::vector<std::unique_ptr<HloModule>> compilation_unit_modules_;
+  std::vector<std::unique_ptr<BufferAssignment>> compilation_unit_assignments_;
 
   CpuExecutable(std::unique_ptr<HloModule> hlo_module,
                 std::unique_ptr<BufferAssignment> assignment,
