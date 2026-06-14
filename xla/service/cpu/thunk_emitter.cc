@@ -1298,14 +1298,21 @@ absl::StatusOr<ThunkSequence> ThunkEmitter::EmitCompilationUnitCallThunk(
     RETURN_IF_ERROR(ShapeUtil::ForEachSubshapeWithStatus(
         operand->shape(),
         [&](const Shape&, const ShapeIndex& index) -> absl::Status {
-          absl::StatusOr<BufferAllocation::Slice> slice =
-              GetAllocationSlice(operand, index);
-          if (slice.ok()) caller.params[{p, index}] = *slice;
+          // Skip only shape indices with no backing allocation; a present-but-
+          // ambiguous slice is a real error and must propagate.
+          if (!buffer_assignment_.HasAllocationAt(operand, index)) {
+            return absl::OkStatus();
+          }
+          ASSIGN_OR_RETURN((caller.params[{p, index}]),
+                           GetAllocationSlice(operand, index));
           return absl::OkStatus();
         }));
   }
   // Results (+ scratch if the 3B rewrite wrapped the result in a tuple).
   const Shape& root_shape = unit.entry->root_instruction()->shape();
+  // The 3B scratch rewriter wraps the result in a tuple IFF the callee has
+  // scratch (>0 internal allocations) and always places the real callee root at
+  // tuple element 0, so shape inequality reliably detects the rewritten case.
   const bool rewritten = !ShapeUtil::Equal(instruction->shape(), root_shape);
   if (rewritten &&
       (!instruction->shape().IsTuple() ||
@@ -1320,9 +1327,13 @@ absl::StatusOr<ThunkSequence> ThunkEmitter::EmitCompilationUnitCallThunk(
       root_shape, [&](const Shape&, const ShapeIndex& index) -> absl::Status {
         ShapeIndex caller_index = result_prefix;
         for (int64_t d : index) caller_index.push_back(d);
-        absl::StatusOr<BufferAllocation::Slice> slice =
-            GetAllocationSlice(instruction, caller_index);
-        if (slice.ok()) caller.results[index] = *slice;
+        // Skip only shape indices with no backing allocation; a present-but-
+        // ambiguous slice is a real error and must propagate.
+        if (!buffer_assignment_.HasAllocationAt(instruction, caller_index)) {
+          return absl::OkStatus();
+        }
+        ASSIGN_OR_RETURN(caller.results[index],
+                         GetAllocationSlice(instruction, caller_index));
         return absl::OkStatus();
       }));
   if (rewritten) {
