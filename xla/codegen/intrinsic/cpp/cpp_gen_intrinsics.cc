@@ -58,6 +58,16 @@ llvm::Function* GetCppGenFunction(llvm::Module* module,
                                   absl::string_view name) {
   llvm::Function* func =
       module->getFunction(llvm::StringRef(name.data(), name.size()));
+  if (func == nullptr) {
+    // On Mach-O targets clang prefixes explicit asm() labels (used to name the
+    // intrinsics in eigen_unary.h) with '\01' to suppress the leading-underscore
+    // mangling, so the bitcode compiled on macOS carries that prefix while the
+    // lookup name does not. Retry with the prefix. (No-op on ELF, where the
+    // names already match.)
+    std::string prefixed = "\01";
+    prefixed.append(name.data(), name.size());
+    func = module->getFunction(prefixed);
+  }
   CHECK(func != nullptr)
       << "CppGen function '" << name
       << "' was not found in the module. Ensure the "
@@ -150,6 +160,9 @@ void CppGenIntrinsicLibrary::LinkIntoModule(llvm::Module& dst_module) const {
       if (!linked_func->hasFnAttribute(llvm::Attribute::NoInline)) {
         linked_func->addFnAttr(llvm::Attribute::AlwaysInline);
       }
+      linked_func->removeFnAttr("probe-stack");
+      linked_func->removeFnAttr("target-cpu");
+      linked_func->removeFnAttr("target-features");
     }
   }
 }
