@@ -83,6 +83,7 @@ cc_library(
     srcs = ["compilation_unit_scratch_rewriter.cc"],
     hdrs = ["compilation_unit_scratch_rewriter.h"],
     deps = [
+        ":compilation_unit_binding",
         "//xla:shape_util",
         "//xla:util",
         "//xla/hlo/ir:hlo",

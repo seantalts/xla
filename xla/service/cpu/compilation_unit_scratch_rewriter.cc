@@ -31,6 +31,7 @@ limitations under the License.
 #include "xla/hlo/ir/hlo_opcode.h"
 #include "xla/hlo/transforms/hlo_module_stitcher.h"
 #include "xla/service/buffer_assignment.h"
+#include "xla/service/cpu/compilation_unit_binding.h"
 #include "xla/shape.h"
 #include "xla/shape_util.h"
 #include "xla/tsl/platform/status_macros.h"
@@ -42,11 +43,9 @@ std::vector<const BufferAllocation*> GetCalleeScratchAllocations(
     const BufferAssignment& callee_assignment) {
   std::vector<const BufferAllocation*> scratch;
   for (const BufferAllocation& allocation : callee_assignment.Allocations()) {
-    if (allocation.is_entry_computation_parameter() ||
-        allocation.maybe_live_out() || allocation.is_constant()) {
-      continue;
+    if (IsCalleeInternalAllocation(allocation)) {
+      scratch.push_back(&allocation);
     }
-    scratch.push_back(&allocation);
   }
   return scratch;
 }

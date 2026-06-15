@@ -28,6 +28,16 @@ limitations under the License.
 
 namespace xla::cpu {
 
+// True iff `allocation` is a callee-internal (scratch) allocation: not an entry
+// parameter, not live-out, and not a constant. These are the allocations that
+// BuildCalleeBinding binds to per-site scratch slices and that the 3B scratch
+// rewriter reserves space for. Centralized here so the binding and the scratch
+// rewriter agree on exactly one definition of "internal".
+inline bool IsCalleeInternalAllocation(const BufferAllocation& allocation) {
+  return !allocation.is_entry_computation_parameter() &&
+         !allocation.maybe_live_out() && !allocation.is_constant();
+}
+
 // The caller-side buffer slices that provide a shared `compilation_unit`
 // callee's inputs, outputs, and scratch at one call site. Used to map the
 // callee's private allocations onto the caller's buffers.

@@ -132,7 +132,7 @@ TEST_F(CompilationUnitBindingTest, MapsInternalAllocationsToScratchSlices) {
   // ascending index order.
   std::vector<int64_t> internal_indices;
   for (const BufferAllocation& a : assignment->Allocations()) {
-    if (!a.is_entry_computation_parameter() && !a.maybe_live_out()) {
+    if (IsCalleeInternalAllocation(a)) {
       internal_indices.push_back(a.index());
     }
   }
