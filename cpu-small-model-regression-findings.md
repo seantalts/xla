@@ -9,7 +9,7 @@ The three reported "CPU got slower with the thunk runtime" issues have **three d
 | issue | workload | clean regression | root cause | fix locus | difficulty | bounded win |
 |---|---|---|---|---|---|---|
 | **#37465** | `jnp.diff` regularization | cost 9.4→25µs (2.7×) | scalar **reduce-window** emission | experimental tiling stack (→ then vectorizes free) | feature | ~12µs / **33%** of cost |
-| **#26145** | jaxley branched-cable sim | 2.5–4.2× | per-iteration **dispatch** inside while-loop (~28 kernels/step), **gated by scatter** | MLIR region emission (Stage-1) | deep | **~2–4×** |
+| **#26145** | jaxley branched-cable sim | 2.5–4.2× | per-iteration **kernel granularity** in while-loop (~28 kernels/step): mostly **memory round-trips (layer 2)**, ~10% dispatch — **gated by scatter** | region collapse inside loop body (Stage-1 / body-internal hoisting) | deep | **~2–4×** |
 | **#33666** | diffrax stiff ODE | 1.54× (stiff only) | LAPACK FFI + python callback in Newton loop | FFI/callback overhead | n/a for hoisting | ~0 from hoisting |
 
 ## Method & discarded hypotheses
@@ -18,7 +18,7 @@ Measured via clean jit'd fixed-input timings (`venv`=0.10.1, `venv-old`=0.4.30 i
 
 - "bench_hlo can't see the win / it's JAX-side dispatch" — **false**; bench_hlo reproduces the XLA-side regression (mm 70µs ≈ JAX 63µs).
 - "scalar-tanh vectorization regression" — **false**; that was an artifact of routing frag through Stage-0's legacy `ComputationKernelEmitter`. The shipping **fusion** emitter vectorizes frag fine (640 vector ops, 0 scalar fabs).
-- "thunk fragmentation is the bottleneck" — **false for the proxies** (frag is dispatched once; collapsing 59→1 thunk = 0 delta. mm exceeds the 64KB region gate and never hoists). **True in spirit only for the loop-structured issues**, where dispatch is *per loop iteration* — but those are gated (below).
+- "thunk fragmentation is the bottleneck" — **false for the proxies** (frag is dispatched once; collapsing 59→1 thunk = 0 delta. mm exceeds the 64KB region gate and never hoists). **For the loop-structured issues the granularity tax is real but it's mostly memory, not dispatch** — per-thunk dispatch is only ~15–20ns (measured, §Decomposition); the cost is intermediates round-tripping through buffer slices across many small kernels per iteration.
 
 Measurement traps that bit us, recorded for next time: eager ops inside timed loops (`frag_repro.py`'s `run(v0+1e-9*k)` inflated 7.6µs→27µs); `bench_hlo`'s ~12µs PjRt per-execute floor masking tiny workloads (noop=13µs); and dumping the wrong emitter path.
 
@@ -40,10 +40,14 @@ Measurement traps that bit us, recorded for next time: eager ops inside timed lo
   - (b) Targeted HLO rewrite: non-overlapping reduce-window (`size==stride`) → reshape-to-tiles + `reduce`, inserted **after** the tiling rewrite so it isn't reasserted (naive `jnp.sum` de-tiling *is* rewritten back).
 - grad path (1.7×) is separate (pad/transpose/elementwise), lower priority.
 
-### #26145 — jaxley → per-iteration dispatch, gated by scatter
+### #26145 — jaxley → per-iteration kernel granularity (memory-dominated), gated by scatter
 
 - Real `jaxley` 0.5.0 branched cable, `bwd_euler`, 300 steps. 2.5–4.2× regression (reporter said 5–10×). ~28 distinct tiny kernels fire per timestep; the branched sparse solve is expressed as **scatter (987/119) + gather (705/132)**, not triangular-solve.
-- **Win is ~2–4×, not 13×.** The `ThunkExecutor::Execute` "422ms vs 31ms compute" figure is profiler-inflated (recursive Execute + wait-for-completion accumulation). The removable part is intra-step scheduling (~28→1 kernel/step), **not** the loop trip count — the while-thunk driver, one buffer-table setup, and one call/step remain. Anyone claiming >5× is overclaiming.
+- **It is per-fusion overhead, not per-thunk dispatch (measured — see §Decomposition).** Per-thunk dispatch on current main is only ~15–20ns; for jaxley (~28 kernels × 300 steps ≈ 8,400 executions) that's only ~140µs ≈ **~9%** of the 1,526µs solve. The other ~90% — and most of the 4× regression vs the old 373µs — is the body being ~28 separate kernels instead of one inlined function: **intermediates round-trip through buffer slices instead of registers, with no cross-kernel optimization**. The old non-thunk runtime emitted the whole loop body as one inlined function and paid neither.
+- **Win is ~2–4×, not 13×.** (The `ThunkExecutor::Execute` "422ms" figure was profiler nesting/double-count; solve is 1.5ms.) The fix lever is **fewer/bigger kernels** (collapse the body, intermediates in registers) — a cheaper *executor* recovers only the ~9% dispatch slice.
+- **Mechanism proven by A/B (§Decomposition):** on a hoistable synthetic loop, collapsing a 20-kernel body→1/iter via the Stage-0 pass recovers a granularity tax that is ~26% dispatch / ~74% memory round-trips. Region collapse is the right fix; it just needs to reach jaxley's body.
+- **Blocker CONFIRMED:** the while body transitively contains `kScatter`, on `InstructionIsUnavailable`, so `SmallWhileLoopHoistingPass` / `SmallRegionHoistingPass` refuse to hoist it. Verified: `xla_cpu_small_call` = 0 on `module_0272.jit_run`; a scatter-free sibling module *does* hoist. (Also: Stage-0 is ENTRY-only, and jaxley's compute lives in the while body, so even without scatter it would need body-internal partitioning.)
+- **Unblock paths:** (a) **Stage-1** — back region emission with the MLIR fusion-emitter stack, which already emits scatter (the design doc's staging anticipated exactly this: Stage-0/legacy `IrEmitter::HandleScatter` is `Unimplemented`, `ir_emitter.cc:1896`; Stage-1/MLIR handles it). (b) **Body-internal maximal regions split at scatter boundaries** — keep scatters as their own thunks, collapse the non-scatter runs between them via the existing `ComputationKernelEmitter`; cheaper if the body has long scatter-free runs (needs verification of body structure).
 - **Blocker CONFIRMED:** the while body transitively contains `kScatter`, which is on `InstructionIsUnavailable`, so `SmallWhileLoopHoistingPass` (and the generalized `SmallRegionHoistingPass`) refuse to hoist it. Verified: `xla_cpu_small_call` count = 0 on `module_0272.jit_run`, while a scatter-free sibling module *does* hoist.
 - **Unblock is Stage-1, not a legacy hack.** `IrEmitter::HandleScatter` (`ir_emitter.cc:1896`) is `Unimplemented("Scatter is not implemented on CPUs")`, and the legacy `ComputationKernelEmitter` path (which Stage-0 uses) has no scatter generator. But scatter *does* run in jaxley today — via the **MLIR fusion emitter**. So the fix is to back region emission with the MLIR fusion-emitter stack (which already supports scatter) = **Stage-1 region compilation** from the region-compilation design doc. The design's staging anticipated exactly this gap (Stage-0/legacy can't do scatter; Stage-1/MLIR can).
 
@@ -52,6 +56,24 @@ Measurement traps that bit us, recorded for next time: eager ops inside timed lo
 - Regression is **only on the stiff path** (Kvaerno5 1.54×; non-stiff Tsit5 is *not* regressed, actually faster on 0.10.1). Matches the reporter's "stiff ~2×."
 - Dominated by LAPACK FFI (`lapack_sgetrf_ffi` + 2× `lapack_strsm_ffi`) and a python callback **inside** the Newton while (`module_0014`, every Newton iteration). These need runtime services (`allow_runtime_calls=false` in the kernel emitter forbids them) — they fundamentally cannot be hoisted into one kernel.
 - **No-go for loop-body hoisting.** This is an FFI/callback dispatch-overhead problem (8×8 LU+trsm per Newton step) — a separate workstream from the small-model codegen/region work.
+
+## Decomposition: dispatch (layer 1) vs memory round-trips (layer 2) vs compute (layer 3)
+
+To answer "is the loop-structured tax per-thunk *runtime* overhead or per-*fusion* overhead," measured on current-main XLA:
+
+- **Per-thunk dispatch (layer 1) ≈ 15–20 ns.** Synthetic while loop, body = K dependent dots (param weight, so they don't simplify), T iterations, hoisting disabled. Sweeping K and T and taking the slope cancels both the `bench_hlo` per-execute floor and the per-iteration while overhead: K=10 → 0.146 µs/iter, K=20 → 0.354 µs/iter, so the marginal cost per body-thunk is (0.354−0.146)/10 ≈ 0.02 µs. This is far below the design-doc's assumed 0.5–1.2 µs/thunk, and the "13× dispatch" claim was profiler nesting.
+- **Inlined-vs-granular A/B (same XLA build, via the Stage-0 pass).** Hoisting OFF = K kernels/iter (granular); ON = one kernel/iter (inlined, intermediates in registers). K=20, T=400, swept over intermediate size:
+
+  | intermediate | granular | inlined | delta recovered |
+  |---|---|---|---|
+  | 32 B | 169 µs | 103 µs | **66 µs** |
+  | 128 B | 485 µs | 271 µs | **214 µs** |
+  | 256 B | 1215 µs | 965 µs | **250 µs** |
+  | 512 B | 4087 µs | 3842 µs | **245 µs** |
+
+  At tiny intermediates the recovered delta (66 µs ≈ 7,600 collapsed dispatches × ~8.7 ns) is **pure dispatch (layer 1)**. As intermediates grow the delta climbs and **saturates at ~250 µs**; the +184 µs growth is **memory round-trips (layer 2)** of intermediates that no longer hit memory once the body is one kernel. So the granularity tax is **~26% dispatch / ~74% memory**, and layer-3 compute (the S² dot work) grows untouched.
+
+- **Implication.** The loop-structured regression is **per-fusion overhead (memory + lost cross-kernel optimization), not per-thunk runtime dispatch.** Region collapse recovers it (demonstrated above); a cheaper executor would recover only the ~quarter that is dispatch. Caveat: the layer-2 vs layer-3 split *for jaxley specifically* is inferred from structure (old inlined 373 µs ≈ its compute; new 1,526 µs adds the granularity tax) — a direct jaxley measurement needs jaxley actually hoisted, which is gated by scatter.
 
 ## Stage-0 region-hoisting pass — status
 
