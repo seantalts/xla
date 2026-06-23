@@ -36,7 +36,17 @@ The work is therefore to route an outlined region to this emitter rather than th
 
 Once a region is a single kernel emitting tensor SSA, the standard CPU bufferization pipeline (`xla/backends/cpu/codegen/fusion_compiler.cc`, `AddBufferizationPasses`: `OneShotBufferize` → `BufferHoisting` → `PromoteBuffersToStack` with `maxAllocSizeInBytes = 4096`) turns non-escaping, statically-sized intermediates into `memref.alloca` with no additional emitter work. This is the lever the legacy region path cannot reach and that recovers the memory-round-trip component of the regression. Region-escaping values keep their buffer slices; externally-visible aliasing is unchanged, since buffer assignment sees the region as one opaque kernel.
 
-### 2.3 Why not the elemental emitter
+### 2.3 Regions must reach the emitter as un-nested ops
+
+The region-hoisting pass runs late in the pipeline — after instruction fusion, layout assignment, and copy insertion — because it needs the final schedule and buffer information. Consequently a hoisted region's body contains the *products* of instruction fusion: nested `kLoop` fusions and materialized constants. The tiled emitter does not accept these — `SymbolicTileAnalysis` rejects nested fusions outright (`xla/codegen/tiling/symbolic_tile_analysis.cc:1221`, "Nested fusions are not supported"), and non-scalar constants are likewise unsupported. The tiled substrate has been validated on the region *shape* (an un-nested `dot → tanh → reduce → divide → broadcast → subtract` chain emits as one tiled kernel with `alloca` intermediates, bitwise-identical to the legacy path and ~35% faster), but a region taken verbatim from the live pipeline declines and falls back to the legacy emitter.
+
+So the region must be presented to the tiled emitter as **un-nested** ops. Two options:
+- **Flatten when constructing the region's fused computation:** recursively inline any nested `kLoop` fusion bodies (and re-materialize constants appropriately) so the tiled emitter sees raw ops. Contained to the region emitter; the tiled emitter then re-tiles the flattened graph.
+- **Hoist before instruction fusion** for region-flagged compilation, so regions are raw to begin with (the region itself becomes the fusion the tiled emitter tiles). A larger pipeline change; the cost model/eligibility must work pre-fusion.
+
+The first is the more contained starting point. Either way this is a graph-shaping step in front of a validated substrate, not a limitation of the substrate.
+
+### 2.4 Why not the elemental emitter
 
 XLA has a second MLIR emission model (the elemental / loop-fusion emitter, via `computation_partitioner.cc` and `elemental_hlo_to_mlir.cc`) that computes each root output element from the computation's parameters. It is scalar-per-output-element and shares a single output-index domain across all ops, so it cannot thread differently-shaped intermediate tensors — it is not a viable substrate for a multi-shape region, and broadening its function-ABI gate (`computation_partitioner.cc:497`) would not change that. The tiled emitter is the correct substrate.
 
@@ -61,7 +71,9 @@ Each milestone adds one capability. The driver, scatter emitter, and kernel ABI 
 
 ### Milestone 1 — straight-line multi-shape regions (pointwise, dot, reduce, broadcast)
 
-Route a region with no scatter and no control flow to the tiled emitter, behind an experimental flag. Loosen the CPU tiled-emitter instruction allow-list (`IsSupportedInstruction`, `tiled_fusion_emitter.cc:177`, currently `default: IsElementwise()`) to admit dot/reduce/broadcast when the region path is active, and compose tiling propagation for the dot case (§3). Regions containing scatter, control flow, or a tuple (multi-output) root decline and fall back to the legacy region emitter. Flag off ⇒ the existing legacy path is byte-for-byte unchanged.
+Route a region with no scatter and no control flow to the tiled emitter, behind an experimental flag. Loosen the CPU tiled-emitter instruction allow-list (`IsSupportedInstruction`, `tiled_fusion_emitter.cc:177`, currently `default: IsElementwise()`) to admit dot/reduce/broadcast when the region path is active, and compose tiling propagation for the dot case (§3). Present the region to the emitter as un-nested ops (§2.3) — without this step, live post-fusion regions decline. Regions containing scatter, control flow, or a tuple (multi-output) root decline and fall back to the legacy region emitter. Flag off ⇒ the existing legacy path is byte-for-byte unchanged.
+
+The tiled-emitter routing, the allow-list loosening (behind an `admit_region_ops` flag, default off so ordinary fusions are unchanged), declines-with-fallback, and a fusion-view of the region's computation (so the hoisting pass and its output are untouched) are implemented and validated on the region shape; the remaining piece for this milestone is the un-nesting step (§2.3) so live regions reach the substrate.
 
 **Acceptance:** bitwise-identical results flag on/off on representative regions (e.g. a `dot → tanh → reduce → divide → broadcast → subtract` chain and a `reduce → broadcast` chain); the region emits as a single tiled kernel (tiled-emitter provenance, `memref.alloca` for intermediates); latency no worse than the legacy region path, with the stack-localization win visible on multi-intermediate regions.
 
