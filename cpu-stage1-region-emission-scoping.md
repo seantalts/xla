@@ -80,6 +80,23 @@ Rationale: one capability per increment (matches design §3 "each stage changes 
 
 **Alternative if the premise had been false (it wasn't):** (a) implement `HandleScatter` in the legacy `IrEmitter` to keep the `ComputationKernelEmitter` substrate, or (b) dispatch-fast-path-only (design §4) — bounded at ~2-3× and explicitly insufficient.
 
+## UPDATE 2026-06-23 — Increment 1 attempt hit a substrate wall; increment plan revised
+
+Built the Increment-1 scaffold (TDD): `RegionKernelEmitter : KernelEmitter<MlirKernelSource>` (`xla/backends/cpu/codegen/emitters/region_kernel_emitter.{h,cc}`), flag `xla_cpu_experimental_region_compilation` (via `xla_backend_extra_options`), routed in `thunk_emitter.cc` at the `ComputationKernelEmitter` selection site, with `IsSupportedRegion` gating + clean fallback to the legacy emitter. All staged (not committed), tests pass, and **parity verified** (flag on/off bitwise-identical on frag + a synthetic straight-line region) — because the emitter currently *declines* everything real and falls back. The build is a safe scaffold, not a working MLIR region emitter yet.
+
+**Wall (verified):** `xla/codegen/emitters/computation_partitioner.cc:497` builds the tensor-parameter + per-output index-arg ABI **only** for `computation->IsFusionComputation() || IsEntryComputation()`. An `xla_cpu_small_call` region is a plain `kCall` `to_apply()` (neither), so `CreateSubgraphMlirFunction` emits index-less scalar reducer-style funcs while the subgraph's `index_ranges` expect index args → `SubgraphToMlirFunction`'s `drop_front(num_parameters)` underflows (`SmallVector ... capacity 18446744073709551615`). Emitting a region as one MLIR kernel therefore requires the region to *be* a fusion computation, or broadening this ABI gate.
+
+**Second finding (re-scopes the increment order):** pure straight-line *single-shape* elementwise chains never reach the hoisting pass as `kCall`s — ordinary loop *instruction fusion* already collapses them into a single `kLoop` fusion (verified: synthetic chains emerge as one fusion, not a small_call). The `xla_cpu_small_call` regions that actually exist are **multi-shape** (frag: `dot→tanh→reduce→divide→broadcast→subtract` over `f32[16,16]`/`f32[16]`/`f32[]`; `call.99` returns a 4-tuple of differing shapes). So "straight-line single-shape region via MLIR" both (a) hits the wall and (b) duplicates loop fusion and isn't exercised by real workloads.
+
+**Why this is bigger than an Increment-1 wrapper:** the MLIR substrate's model is "one subgraph func computes one output element of the root from the *computation parameters*" (`ProvideParameter`, `elemental_hlo_to_mlir.cc:1286`, always re-derives operands via `take_front(num_parameters)`). There is no mechanism to thread an intermediate SSA *tensor* between differently-shaped subgraphs. A multi-shape region needs a genuine region driver: per-op loop nests in schedule order, intermediates materialized as tensors/allocas and threaded.
+
+**Revised increment plan (supersedes Q4 above):**
+- **Increment 1' (the real substrate, two candidate approaches — DECISION NEEDED):**
+  - **A. Region-as-fusion.** Have `SmallRegionHoistingPass` emit the region as a `kFusion` (multi-output) instead of/in addition to the `kCall`+attr, so the existing fusion ABI + partitioner apply unchanged. Pro: reuses all fusion machinery. Con: fusion semantics (single hero root, elementwise-rooted) may not cleanly model a multi-shape region containing dots/reduces; design §4 already flags that fusion can't model multi-output-with-control-flow (control flow is Increment 3, so straight-line multi-shape may be OK).
+  - **B. Generalize the partitioner + multi-shape driver.** Broaden `CreateSubgraphMlirFunction`'s ABI gate to general region computations and build the schedule-walk driver that materializes/threads intermediate tensors. Pro: the genuine, general region substrate the design anticipated. Con: more new code; touches shared partitioner infra (cross-backend blast radius).
+- **Increment 2 — scatter inside the driver** (unblocks jaxley 3×). Unchanged from original plan; depends on 1'.
+- **Increment 3 — control flow.** Unchanged.
+
 ## Investigation method note
 
 Conclusions here were reached by: grepping the emitter trees for dispatch/handlers; reading the cited `file:line` sites; and — for the load-bearing scatter question — an *empirical* dump (`--xla_dump_to`) of the real jaxley module confirming the `cpu_scatter_fusion` kernel-provenance tag, not just static code reading. The four key claims (CpuScatterFusion exists + is routed; legacy HandleScatter dead; PartitionedComputations takes a general HloComputation; ComputationKernelEmitter is the template) were independently re-verified after the initial spike.
