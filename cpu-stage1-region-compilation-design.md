@@ -1,80 +1,99 @@
-# Stage-1 Region Compilation for XLA:CPU — Design
+# Single-Kernel Region Emission for XLA:CPU
 
-**Author:** seantalts · **Date:** 2026-06-23 · **Status:** Design for review
-**Predecessors:** `cpu-region-compilation-design.md` (the overall Stage 0/1/2 plan) · `cpu-stage1-region-emission-scoping.md` (feasibility record, all risks retired) · `cpu-small-model-regression-findings.md` (root-cause map)
-**Landed:** Stage-0 (`c710a3a39d`) — body-internal region hoisting via the legacy `ComputationKernelEmitter`, jaxley #26145 1.33×.
+**Status:** Design for review · **Date:** 2026-06-23
 
-## Abstract
+## Summary
 
-The thunk runtime executes each top-level HLO instruction as its own kernel + thunk. For loop-structured small models (ODE solvers, neuron sims, MPC) this is a large regression: the per-iteration body is dozens of tiny kernels, and the cost is dominated **not** by per-thunk dispatch (~15–20 ns, measured) but by **per-kernel granularity** — every intermediate round-trips through a buffer slice instead of a register, and there is no optimization across kernel boundaries. Profiling decomposed jaxley's ~3× residual as ~74% memory-round-trips / ~26% dispatch; the old non-thunk runtime avoided both by emitting the whole loop body as one inlined, cross-optimized function.
+On the XLA:CPU thunk runtime, each top-level HLO instruction is compiled to its own kernel and executed as its own thunk. For small, loop-structured models (ODE solvers, neuron simulators, MPC, samplers) this granularity is a significant performance regression relative to the older whole-module CPU runtime: a single loop-body iteration becomes dozens of tiny kernels, executed every trip.
 
-Stage-0 recovered the part of this tax that lives *around* ops the legacy emitter can't handle (it collapsed jaxley's non-scatter runs, 1.33×). The remaining ~3× requires collapsing *across* scatter and across differing shapes into one kernel. **Stage-1 emits a region as a single kernel on the MLIR/xtile tiled-emitter stack**, which (a) already has a multi-op, multi-shape, tensor-threading driver (`EmitTiledComputation`), (b) emits scatter (`CpuScatterFusion`), and (c) localizes non-escaping intermediates to `alloca` automatically via bufferization. The region *mechanism* (HLO-level partitioning + an attribute) is unchanged from Stage-0; only the *executor* behind it changes — the migration-safe decomposition from the overall design.
+Profiling shows the cost is **not** dominated by per-thunk dispatch (measured at ~15–20 ns/thunk). It is dominated by **fine kernel granularity**: every intermediate value round-trips through a buffer-assignment slice in memory instead of staying in a register, and there is no optimization (fusion, vectorization, CSE) across kernel boundaries. The older runtime avoided both by emitting a whole loop body as one inlined, cross-optimized function.
 
-## 1. Goal
+This doc proposes emitting a **region** — a maximal run of adjacent, codegen-compatible instructions — as a **single MLIR kernel** on the existing tiled (xtile) fusion-emitter stack. Differently-shaped intermediates are threaded as tensor SSA values within one kernel; non-escaping intermediates are localized to stack (`alloca`) automatically by the existing bufferization pipeline. A region containing many tiny ops thus compiles to one kernel with intermediates in registers — recovering the older runtime's behavior without resurrecting its architecture.
 
-Take an outlined region — a maximal schedule-contiguous run of region-eligible instructions, produced by the existing `SmallRegionHoistingPass` — and emit it as **one tiled MLIR kernel** with intermediates in registers/allocas and cross-op optimization, instead of N per-op kernels (Stage-0/thunk) or one legacy-IrEmitter kernel that cannot express scatter (Stage-0's `ComputationKernelEmitter`).
+A region-hoisting HLO pass that partitions a computation's schedule into such regions and outlines each into its own kernel already exists; today it emits each region through a legacy IrEmitter-based path that cannot express several common ops (notably scatter) and produces non-tiled code. This design routes regions to the **tiled emitter** instead, which removes both limitations.
 
-Target: close the bulk of jaxley's remaining ~3× (ceiling ≈ the old 373 µs; the scatters are tiny `f32[32]`/scalar, so the residual is granularity, not intrinsic scatter compute).
+## 1. Background
 
-## 2. Design
+### 1.1 The regression
 
-### 2.1 Region → fusion → tiled emitter
+Measured on M-series macOS (older whole-module runtime vs. current thunk runtime), small loop-structured workloads regress 1.5–4×. A representative case (a branched-cable neuron simulation, JAX issue #26145): ~28 tiny kernels run per timestep over hundreds of timesteps. Decomposition attributes the regression roughly 3:1 to memory round-trips (kernel granularity) over dispatch. An existing region-hoisting pass that collapses the *non-scatter* runs of such a body into single kernels recovers ~1.3× of this; the remainder requires collapsing *across* scatter and *across differing shapes* into one kernel, which the legacy region emitter cannot do.
 
-The region's outlined computation is routed to the CPU **xtile tiled fusion emitter** rather than the legacy `ComputationKernelEmitter`. The tiled emitter's `EmitTiledComputation` (`xla/codegen/xtile/codegen/fusion_emitter.cc:1034`) is precisely the region driver the overall design called for: it walks the (tiled) computation in schedule order, emits each instruction via `EmitTiledHloInstruction` → a `tensor`-typed SSA value, and threads results through an instruction→`TensorValue` map. It natively handles dot, reduce, broadcast, pad, concatenate, transpose, reshape, and elementwise — i.e. the full op set of the regressing workloads — and intermediates of differing shapes compose because each is a real tensor value, not a shared per-output-element index domain.
+### 1.2 What a region is
 
-Two mechanisms reach it; v1 picks whichever is cleaner (decided during implementation, recorded in the scoping doc):
-- **(A) region-as-fusion:** `SmallRegionHoistingPass`, under the Stage-1 flag, emits the region as a `kFusion` (kLoop) whose fused computation is the region, instead of a `kCall` tagged `xla_cpu_small_call`. The existing fusion/tiled path then applies unchanged.
-- **(B) fusion-view:** keep the `kCall`+attr and have the Stage-1 emitter construct an `HloFusionInstruction` view of `to_apply()` for the tiled emitter.
+After HLO optimization (post-fusion, post-library-rewrite, schedule known), a **region** is a maximal schedule-contiguous run of instructions that can all be emitted into one kernel. Region boundaries are instructions that inherently need runtime services — library/custom fusions, custom calls, infeed/outfeed, collectives, and (until the work below extends coverage) scatter, sort, FFT. The region-hoisting pass outlines each maximal eligible run into its own computation and tags it for single-kernel emission; boundary ops remain their own thunks. The pass, its liveness-based outlining, and its cost model (aggregate `bytes_accessed` below a threshold, plus a minimum region size or the presence of control flow) are unchanged by this design — only the **kernel emitter** behind the tag changes.
 
-### 2.2 Intermediates → alloca (the memory-round-trip win)
+## 2. Approach: emit the region through the tiled fusion emitter
 
-Once the region is one kernel emitting tensor SSA, the standard CPU bufferization pipeline (`fusion_compiler.cc` `AddBufferizationPasses`: `OneShotBufferize` → `BufferHoisting` → `PromoteBuffersToStack`, `maxAllocSizeInBytes = 4096`) turns non-escaping, statically-sized intermediates into `memref.alloca` automatically — no driver work. This is the lever Stage-0 could not reach and that recovers the ~74%-of-tax memory component. Region-escaping values keep their buffer slices; externally-visible aliasing is unchanged (the region is one opaque kernel to buffer assignment).
+### 2.1 The tiled emitter already has a region driver
 
-### 2.3 The region mechanism is unchanged
+The CPU tiled (xtile) fusion emitter contains exactly the driver a region needs. `EmitTiledComputation` (`xla/codegen/xtile/codegen/fusion_emitter.cc:1034`) walks a computation in schedule order, emits each instruction via `EmitTiledHloInstruction` to a `tensor`-typed SSA value, and threads results through an instruction→value map. It natively emits dot, reduce, broadcast, pad, concatenate, transpose, reshape, and elementwise ops — the op set of the regressing workloads — and intermediates of differing shapes compose naturally because each is a real tensor value rather than a shared per-output-element index domain. CPU already reaches this driver for ordinary fusions via `xla/backends/cpu/codegen/fusion_emitter.cc:284` → `xla/backends/cpu/codegen/tiled/tiled_fusion_emitter.cc:305`.
 
-`SmallRegionHoistingPass`, its liveness outlining, the cost model (aggregate `bytes_accessed` + min-region-size/control-flow), and the eligibility partition all carry over from Stage-0. Stage-1 changes (i) the executor behind the region and (ii) — once Increment 2 lands — loosens the eligibility list so scatter is no longer a region boundary.
+The work is therefore to route an outlined region to this emitter rather than the legacy one. Two mechanisms are viable; the implementation picks the simpler:
+- **Region as fusion:** the hoisting pass emits the region as a `kFusion` whose fused computation is the region, so the existing fusion/tiled path applies unchanged.
+- **Fusion view:** keep the region as a tagged call and construct an `HloFusionInstruction` view of its computation for the tiled emitter.
 
-## 3. Key dependency: the experimental tiled emitter / tiling propagation (PARALLEL WORK)
+### 2.2 Intermediates become stack allocations automatically
 
-**Stage-1 depends on the experimental tiled-emitter tiling-propagation path, and this dependency is load-bearing.** The CPU tiled emitter's *default* tile-assignment helper (`GetTiling`, `tiled_fusion_emitter.cc:159`) builds a `TileMapping` for the fusion root only. That is sufficient for single-output-domain fusions, but a multi-shape region with a **dot** has hidden tiling parameters (the dot's contracting dimension, `tiling_specification.cc:72`) that the root-only mapping leaves unassigned — emission then fails with `No tile sizes found for instruction: …dot`. The **experimental tiling-propagation path** (`GetTiledHloComputation` / `TilingSpace`, gated today by `--xla_cpu_experimental_enable_tiling_propagation`) assigns tile sizes to *all* tiling-space dimensions and emits dot+reduce+broadcast regions correctly (verified: frag region → one tiled kernel, 7 allocas, correct result).
+Once a region is a single kernel emitting tensor SSA, the standard CPU bufferization pipeline (`xla/backends/cpu/codegen/fusion_compiler.cc`, `AddBufferizationPasses`: `OneShotBufferize` → `BufferHoisting` → `PromoteBuffersToStack` with `maxAllocSizeInBytes = 4096`) turns non-escaping, statically-sized intermediates into `memref.alloca` with no additional emitter work. This is the lever the legacy region path cannot reach and that recovers the memory-round-trip component of the regression. Region-escaping values keep their buffer slices; externally-visible aliasing is unchanged, since buffer assignment sees the region as one opaque kernel.
 
-This path is **experimental and off by default**; productionizing it (making full tiling propagation the standard CPU tile assignment, retiring the "single-tile dummy" placeholder, `tiled_fusion_emitter.cc:339`, b/511084185) is **assumed to be separate, parallel work**. Stage-1's posture toward it:
-- **Until it is production:** Stage-1 is itself experimental (behind `xla_cpu_experimental_region_compilation`) and composes the tiling-propagation flag for region-fusions. Dot-containing regions require it; dot-free multi-shape regions (e.g. reduce→broadcast) tile on the default path and work without it.
-- **When it lands:** Stage-1 drops the composed flag and relies on the now-default tiling propagation; no other change.
-- **Risk shared with that work:** any limitation in tiling propagation (shapes/ops it can't tile, multi-output) directly bounds which regions Stage-1 can fold. The two efforts should share the CPU `IsSupportedInstruction` allow-list and the region benchmark set so a tiling-propagation regression trips the region wire in presubmit.
+### 2.3 Why not the elemental emitter
 
-Alternatively, Stage-1 could carry a CPU-local fix to `GetTiling` to populate the full `TileMapping` from `TilingSpace` for region-fusions, removing the dependency on the experimental flag for the dot case. This is a smaller, region-scoped change and is the fallback if productionizing tiling propagation slips; it is noted as an option, not the primary plan.
+XLA has a second MLIR emission model (the elemental / loop-fusion emitter, via `computation_partitioner.cc` and `elemental_hlo_to_mlir.cc`) that computes each root output element from the computation's parameters. It is scalar-per-output-element and shares a single output-index domain across all ops, so it cannot thread differently-shaped intermediate tensors — it is not a viable substrate for a multi-shape region, and broadening its function-ABI gate (`computation_partitioner.cc:497`) would not change that. The tiled emitter is the correct substrate.
 
-## 4. Migration / increments
+## 3. Dependency: full tiling propagation for multi-shape regions
 
-Each increment adds exactly one capability (per the overall design's "each stage changes one thing"); the genuinely-new code is small because the driver, scatter emitter, and kernel ABI already exist.
+This design depends on **tiling propagation** in the CPU tiled emitter, and the dependency is load-bearing for any region containing a dot.
 
-- **Increment 1' — straight-line multi-shape region (incl. dot), behind the flag.** Route the region to the tiled emitter (§2.1), loosen the CPU `IsSupportedInstruction` allow-list for dot/reduce/broadcast behind the flag, compose the tiling-propagation path for dot (§3). Decline scatter / control flow / multi-output(tuple-root) regions → fall back to the Stage-0 legacy emitter. **Acceptance:** bitwise-identical output flag on/off on frag + a synthetic reduce→broadcast region; the region emits as ONE tiled kernel (`tiled_emitter` provenance, `memref.alloca` for intermediates); latency ≥ Stage-0, with the alloca win visible on multi-intermediate regions.
-- **Increment 2 — scatter inside the region (unblocks jaxley's ~3×).** Loosen the eligibility list so scatter is no longer a region boundary, and emit it inside the tiled region. One open item to confirm at the top of this increment: scatter is MLIR-emittable via `CpuScatterFusion` (a standalone per-fusion emitter); it must be reachable as an `EmitTiledHloInstruction` case (or composed in) for a scatter to live *inside* a tiled region, not just as its own fusion. **Acceptance:** jaxley emits a single (or few) region kernels spanning its scatters; output matches the interpreter; latency approaches the old 373 µs.
-- **Increment 3 — control flow.** Lower `kWhile`/`kConditional` inside a region to `scf.while`/`scf.if` so the loop body is one kernel per iteration (loop-carried values, in-place across iterations — highest risk, deferred last).
+The tiled emitter must assign tile sizes to every dimension in a fusion's tiling space. The default CPU tile-assignment helper (`GetTiling`, `tiled_fusion_emitter.cc:159`) builds a tile mapping for the fusion root only. That suffices for single-output-domain fusions, but a multi-shape region containing a **dot** has hidden tiling parameters — the dot's contracting dimension (`tiling_specification.cc:72`) — that a root-only mapping leaves unassigned; emission then fails (`No tile sizes found for instruction: …dot`). The tiling-propagation path (`GetTiledHloComputation` / `TilingSpace`) assigns tile sizes to *all* tiling-space dimensions and emits dot+reduce+broadcast regions correctly.
+
+Tiling propagation is currently experimental and off by default (gated by `--xla_cpu_experimental_enable_tiling_propagation`; the default path uses a placeholder single-tile strategy). **Productionizing it — making full tiling propagation the standard CPU tile assignment — is assumed to be separate, ongoing work, and is a prerequisite for the dot-containing regions that matter most here.** This design's relationship to it:
+
+- **While experimental:** region emission stays behind its own experimental flag and composes the tiling-propagation flag for region fusions. Dot-free multi-shape regions (e.g. reduce → broadcast) tile on the default path and do not require it; dot-containing regions do.
+- **Once production:** region emission drops the composed flag and relies on the now-default tiling propagation; no other change.
+- **Shared risk surface:** any op or shape that tiling propagation cannot tile directly bounds which regions can be folded. The two efforts should share the tiled emitter's instruction allow-list and a common benchmark set so a tiling-propagation regression is caught against region emission in presubmit.
+- **Fallback if it slips:** a region-scoped fix to `GetTiling` that populates the full tile mapping from the tiling space for region fusions removes the dependency on the experimental flag for the dot case. This is a smaller, contained change, noted as a fallback rather than the primary plan.
+
+The other capability this design relies on — emitting scatter through MLIR — already exists: scatter is emitted by a dedicated MLIR emitter (`CpuScatterFusion`, `xla/backends/cpu/codegen/emitters/cpu_scatter_emitter.cc`), routed at `xla/service/cpu/thunk_emitter.cc` for scatter-rooted fusions. (The legacy IrEmitter's `HandleScatter` is unimplemented, which is why the legacy region path cannot collapse across scatter.)
+
+## 4. Implementation plan
+
+Each milestone adds one capability. The driver, scatter emitter, and kernel ABI already exist, so the net new code is small.
+
+### Milestone 1 — straight-line multi-shape regions (pointwise, dot, reduce, broadcast)
+
+Route a region with no scatter and no control flow to the tiled emitter, behind an experimental flag. Loosen the CPU tiled-emitter instruction allow-list (`IsSupportedInstruction`, `tiled_fusion_emitter.cc:177`, currently `default: IsElementwise()`) to admit dot/reduce/broadcast when the region path is active, and compose tiling propagation for the dot case (§3). Regions containing scatter, control flow, or a tuple (multi-output) root decline and fall back to the legacy region emitter. Flag off ⇒ the existing legacy path is byte-for-byte unchanged.
+
+**Acceptance:** bitwise-identical results flag on/off on representative regions (e.g. a `dot → tanh → reduce → divide → broadcast → subtract` chain and a `reduce → broadcast` chain); the region emits as a single tiled kernel (tiled-emitter provenance, `memref.alloca` for intermediates); latency no worse than the legacy region path, with the stack-localization win visible on multi-intermediate regions.
+
+### Milestone 2 — scatter inside a region
+
+Stop treating scatter as a region boundary and emit it inside the tiled region. One item to confirm at the start of this milestone: scatter is emittable via the standalone `CpuScatterFusion`; it must be reachable as an `EmitTiledHloInstruction` case (reusing that emitter's bounds-checked store + reducer emission) so a scatter can live *inside* a tiled region rather than only as its own fusion. This is the milestone that addresses the largest remaining share of the regression for scatter-heavy workloads.
+
+**Acceptance:** scatter-containing loop bodies (e.g. the #26145 neuron simulation) emit as one or few region kernels spanning their scatters; results match the interpreter; latency approaches the older runtime.
+
+### Milestone 3 — control flow inside a region
+
+Lower `while`/`conditional` inside a region to `scf.while`/`scf.if`, so a loop body is one kernel per iteration rather than a thunk graph re-executed each trip. Highest risk (loop-carried values, in-place updates across iterations); sequenced last.
 
 ## 5. Validation
 
-- **Correctness:** bitwise / interpreter-comparison on frag, the synthetic region set, and jaxley (Increment 2). The existing Stage-0 unit tests + the region/token/control-dep guards remain green.
-- **Performance:** `bench_hlo` flag on/off on frag, jaxley, mock_mass_matrix; the region MWEs join the in-tree CPU benchmarks (alongside TORAX).
-- **Tripwire:** the region benchmark set + the shared `IsSupportedInstruction` allow-list gate both this work and the tiling-propagation productionization (§3).
-- **Guardrails:** large models form no multi-instruction regions (cost model), so they are untouched; flag off ⇒ byte-identical Stage-0 path.
+- **Correctness:** bitwise / interpreter comparison on the representative regions, scatter workloads (Milestone 2), and control-flow workloads (Milestone 3). Existing region-hoisting unit tests (including token-ordering and control-dependency guards) stay green.
+- **Performance:** `bench_hlo` with the region flag on/off on the regressing workloads; the region MWEs join the in-tree CPU benchmark set.
+- **No-regression guardrail:** the cost model forms multi-instruction regions only where work is small and dispatch dominates, so large models form no such regions and are untouched. Flag off ⇒ unchanged behavior.
+- **Shared tripwire:** the region benchmark set and the tiled-emitter instruction allow-list gate both this work and the tiling-propagation productionization (§3).
 
-## 6. Risks
+## 6. Alternatives considered
 
-| risk | status / mitigation |
-|---|---|
-| Scatter not MLIR-emittable | **Retired** — `CpuScatterFusion`, confirmed live in jaxley kernels. |
-| No multi-op/multi-shape driver | **Retired** — `EmitTiledComputation` is exactly it; CPU-wired. |
-| Multi-shape incl. dot won't tile as one kernel | **Retired** — verified via tiling propagation (frag → one kernel). Default path needs the dot tile-size plumbing (§3). |
-| Intermediates not localized | **Retired** — `PromoteBuffersToStack` makes allocas automatically (verified in dumps). |
-| Tiling-propagation productionization slips | Stage-1 composes the experimental flag meanwhile; CPU-local `GetTiling` fix is the fallback (§3). |
-| Multi-output (tuple-root) regions | Deferred; v1 targets single-array-root regions (frag qualifies); tiled emitter currently wants a single array root. |
-| Scatter reachable only as standalone fusion, not inside a tiled region | Confirm at the top of Increment 2; if so, add an `EmitTiledHloInstruction` scatter case (reusing `CpuScatterFusion`'s `scf.if` bounds-check + reducer emission). |
+- **Legacy IrEmitter region path (the current emitter behind the region tag):** in production for non-scatter regions, but cannot emit scatter (`HandleScatter` unimplemented) and produces non-tiled code. Retained as the fallback for ops the tiled path declines.
+- **Broadening the elemental partitioner ABI:** wrong substrate — the elemental emitter is scalar-per-output-element and cannot thread differently-shaped intermediate tensors (§2.3); also has cross-backend blast radius. Rejected.
+- **A hand-written per-op loop driver:** unnecessary — `EmitTiledComputation` already is that driver.
+- **Dispatch fast-path only (pre-resolved pointers, lighter executor):** addresses only the ~quarter of the cost that is dispatch and cannot remove per-intermediate buffer traffic. Complementary, not sufficient.
 
-## 7. Alternatives considered
+## Appendix: key code references
 
-- **Stage-0 substrate (legacy `ComputationKernelEmitter`):** in production for non-scatter regions; cannot emit scatter (`IrEmitter::HandleScatter` is `Unimplemented`) and gives legacy (not tiled/vectorized) codegen. Kept as the fall-back for ops the tiled path declines.
-- **Broaden the elemental partitioner ABI (`computation_partitioner.cc:497`):** wrong model — the elemental emitter is scalar-per-output-element and cannot thread differently-shaped intermediate tensors; also cross-backend blast radius. Rejected.
-- **Hand-rolled per-op loop driver:** unnecessary — `EmitTiledComputation` already is the driver.
-- **Dispatch fast-path only:** bounded at ~2–3× of a larger gap and cannot remove per-intermediate buffer traffic (overall design §4). Complementary, not sufficient.
+- Tiled region driver: `xla/codegen/xtile/codegen/fusion_emitter.cc:1034` (`EmitTiledComputation`), per-op tensor emission `:447,:887` (`EmitTiledHloInstruction`).
+- CPU tiled entry + gates: `xla/backends/cpu/codegen/fusion_emitter.cc:284`; `xla/backends/cpu/codegen/tiled/tiled_fusion_emitter.cc:177` (`IsSupportedInstruction`), `:159` (`GetTiling`, root-only tile mapping), `:305` (`EmitTiledFusionKernel`), `:339` (placeholder tile strategy).
+- Tiling space / propagation: `xla/codegen/tiling/symbolic_tile_analysis.cc` (handles dot), `xla/codegen/tiling/tiling_specification.cc:72` (hidden tiling parameter).
+- Scatter (MLIR): `xla/backends/cpu/codegen/emitters/cpu_scatter_emitter.cc`; routed at `xla/service/cpu/thunk_emitter.cc`.
+- Bufferization → stack: `xla/backends/cpu/codegen/fusion_compiler.cc` (`AddBufferizationPasses`, `PromoteBuffersToStack`).
+- Elemental (non-substrate) model: `xla/codegen/emitters/computation_partitioner.cc:497`, `xla/codegen/emitters/elemental_hlo_to_mlir.cc`.
