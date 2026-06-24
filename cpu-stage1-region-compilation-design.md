@@ -81,11 +81,17 @@ Route a region with no scatter and no control flow to the tiled emitter, behind 
 
 **Acceptance:** bitwise-identical results flag on/off on representative regions (e.g. a `dot → tanh → reduce → divide → broadcast → subtract` chain and a `reduce → broadcast` chain); the region emits as a single tiled kernel (tiled-emitter provenance, `memref.alloca` for intermediates); latency no worse than the legacy region path, with the stack-localization win visible on multi-intermediate regions.
 
-### Milestone 2 — scatter inside a region
+### Milestone 2 — multi-output (tuple-root) regions
 
-Stop treating scatter as a region boundary and emit it inside the tiled region. One item to confirm at the start of this milestone: scatter is emittable via the standalone `CpuScatterFusion`; it must be reachable as an `EmitTiledHloInstruction` case (reusing that emitter's bounds-checked store + reducer emission) so a scatter can live *inside* a tiled region rather than only as its own fusion. This is the milestone that addresses the largest remaining share of the regression for scatter-heavy workloads.
+This is the milestone that actually helps scatter-heavy loop bodies (the #26145 neuron simulation). Investigation reframed it away from "scatter inside a region":
 
-**Acceptance:** scatter-containing loop bodies (e.g. the #26145 neuron simulation) emit as one or few region kernels spanning their scatters; results match the interpreter; latency approaches the older runtime.
+1. **Scatter cannot be tiled, and is not the gate.** `SymbolicTileAnalysis` has no output-to-input tile rule for scatter, by nature — scatter's update→operand mapping is decided at runtime by the indices operand, so there is no static affine relation (`indexing_analysis.cc` yields unknown indexing; `tile_propagation.cc` errors "tile propagation not implemented" for `kScatter`). Scatter therefore stays a standalone `CpuScatterFusion` kernel and remains a region **boundary** — which is fine: in the #26145 body the scatters are already region operands/boundaries, not members, and the goal is to fold everything *between* them.
+
+2. **The real gate is multi-output regions.** Every one of #26145's 25 hoisted regions has a **tuple root** (a maximal scatter-free run produces several independently-live values feeding different downstream scatters/consumers). The region emitter declines a non-array root (`region_kernel_emitter.cc`, `!root->shape().IsArray()`), so all 25 decline today and Milestone 1 alone folds nothing for this workload (measured: ~2–3% flag on/off, within noise). Folding them requires emitting a region whose root is a tuple.
+
+This is tractable: the tiled driver `EmitTiledComputation` already returns a vector of tile values (multiple roots), and multi-output tiling exists on the GPU side. The work is (a) reify a tuple-root fusion view of the region, (b) map each tuple element to a kernel result buffer, (c) thread multiple roots through tile selection. Before building, audit the op coverage of the target region bodies (at least one contains a dynamic-update-slice) so member ops the tiled emitter still rejects are handled or keep that region as a declining case.
+
+**Acceptance:** the #26145 loop body's scatter-free runs fold into single tiled kernels (kernels-per-timestep drops materially), results match the interpreter, and per-iteration latency moves toward the older runtime.
 
 ### Milestone 3 — control flow inside a region
 
@@ -93,7 +99,7 @@ Lower `while`/`conditional` inside a region to `scf.while`/`scf.if`, so a loop b
 
 ## 5. Validation
 
-- **Correctness:** bitwise / interpreter comparison on the representative regions, scatter workloads (Milestone 2), and control-flow workloads (Milestone 3). Existing region-hoisting unit tests (including token-ordering and control-dependency guards) stay green.
+- **Correctness:** bitwise / interpreter comparison on the representative regions, multi-output / #26145 workloads (Milestone 2), and control-flow workloads (Milestone 3). Existing region-hoisting unit tests (including token-ordering and control-dependency guards) stay green.
 - **Performance:** `bench_hlo` with the region flag on/off on the regressing workloads; the region MWEs join the in-tree CPU benchmark set.
 - **No-regression guardrail:** the cost model forms multi-instruction regions only where work is small and dispatch dominates, so large models form no such regions and are untouched. Flag off ⇒ unchanged behavior.
 - **Shared tripwire:** the region benchmark set and the tiled-emitter instruction allow-list gate both this work and the tiling-propagation productionization (§3).
