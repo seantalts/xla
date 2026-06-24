@@ -173,4 +173,10 @@ bool EnableExperimentalTiling(const HloModuleConfig& config) {
       .xla_cpu_experimental_enable_tiling_propagation();
 }
 
+bool ExperimentalRegionCompilation(const HloModuleConfig& config) {
+  const auto& extra_options_map =
+      config.debug_options().xla_backend_extra_options();
+  return extra_options_map.count(kExperimentalRegionCompilation) > 0;
+}
+
 }  // namespace xla::cpu::options

@@ -174,7 +174,7 @@ bool IsSupportedShape(const Shape& shape) {
   return is_supported;
 }
 
-bool IsSupportedInstruction(const HloInstruction& inst) {
+bool IsSupportedInstruction(const HloInstruction& inst, bool admit_region_ops) {
   HloOpcode opcode = inst.opcode();
   switch (opcode) {
     case HloOpcode::kBitcast:
@@ -185,6 +185,15 @@ bool IsSupportedInstruction(const HloInstruction& inst) {
       return true;
     case HloOpcode::kConstant:
       return ShapeUtil::IsEffectiveScalar(inst.shape());
+    // Stage-1 region compilation (flag-gated): a straight-line region kernel
+    // routed through the tiled emitter admits the shape-changing ops that
+    // multi-shape regions are built from. `SymbolicTileAnalysis` / the tiling
+    // propagation path handle these natively; only this CPU allow-list gates
+    // them. Off the region path the default-elementwise rule is unchanged.
+    case HloOpcode::kDot:
+    case HloOpcode::kReduce:
+    case HloOpcode::kBroadcast:
+      return admit_region_ops;
     case HloOpcode::kBitcastConvert:
     case HloOpcode::kMap:
     case HloOpcode::kPopulationCount:
@@ -241,7 +250,8 @@ absl::StatusOr<SymbolicTileAnalysis> GetSymbolicTileAnalysis(
   return std::get<SymbolicTileAnalysis>(std::move(symbolic_tile_analysis_or));
 }
 
-absl::Status IsSupportedTiledFusion(const HloFusionInstruction& fusion) {
+absl::Status IsSupportedTiledFusion(const HloFusionInstruction& fusion,
+                                    bool admit_region_ops) {
   // TODO(willfroom): Support multi-output fusions.
   if (!fusion.shape().IsArray()) {
     return Internal(
@@ -263,7 +273,7 @@ absl::Status IsSupportedTiledFusion(const HloFusionInstruction& fusion) {
           inst->ToString());
     }
 
-    if (!IsSupportedInstruction(*inst)) {
+    if (!IsSupportedInstruction(*inst, admit_region_ops)) {
       return Internal(
           "Instruction %s is not supported by the tiled CPU emitter.",
           inst->ToString());
@@ -275,6 +285,7 @@ absl::Status IsSupportedTiledFusion(const HloFusionInstruction& fusion) {
 
 absl::StatusOr<KernelDefinition<MlirKernelSource>> CreateTiledKernelDefinition(
     mlir::MLIRContext& context, const HloFusionInstruction& fusion,
+    const HloInstruction& kernel_spec_hlo,
     const BufferAssignment* buffer_assignment, absl::string_view name,
     int64_t num_work_groups, int64_t num_tiles,
     mlir::OwningOpRef<mlir::ModuleOp> module) {
@@ -295,15 +306,21 @@ absl::StatusOr<KernelDefinition<MlirKernelSource>> CreateTiledKernelDefinition(
 
   WorkDimensions work_dimensions;
   work_dimensions.num_work_groups.x = num_work_groups;
-  ASSIGN_OR_RETURN(KernelSpec kernel_spec,
-                   emitters::GetKernelSpec(name, fusion, buffer_assignment,
-                                           work_dimensions));
+  // Buffer slices are resolved against `kernel_spec_hlo`, which is the
+  // instruction that buffer assignment actually saw. For an ordinary fusion
+  // this is the fusion itself; for a region-fusion-view it is the original
+  // `xla_cpu_small_call` kCall (same operands and result shape).
+  ASSIGN_OR_RETURN(
+      KernelSpec kernel_spec,
+      emitters::GetKernelSpec(name, kernel_spec_hlo, buffer_assignment,
+                              work_dimensions));
   return KernelDefinition<MlirKernelSource>(
       std::move(kernel_spec), MlirKernelSource(std::move(module)));
 }
 
 absl::StatusOr<KernelDefinition<MlirKernelSource>> EmitTiledFusionKernelImpl(
     mlir::MLIRContext& context, const HloFusionInstruction& fusion,
+    const HloInstruction& kernel_spec_hlo,
     const BufferAssignment* buffer_assignment, absl::string_view name,
     int64_t num_work_groups, const SymbolicTileAnalysis& symbolic_tile_analysis,
     const Tiling& tiling) {
@@ -320,9 +337,9 @@ absl::StatusOr<KernelDefinition<MlirKernelSource>> EmitTiledFusionKernelImpl(
     num_tiles *= CeilOfRatio(dim, tile_size);
   }
 
-  return CreateTiledKernelDefinition(context, fusion, buffer_assignment, name,
-                                     num_work_groups, num_tiles,
-                                     std::move(module));
+  return CreateTiledKernelDefinition(context, fusion, kernel_spec_hlo,
+                                     buffer_assignment, name, num_work_groups,
+                                     num_tiles, std::move(module));
 }
 
 absl::StatusOr<ge::TiledHloComputation> GetTiledHloComputation(
@@ -357,6 +374,7 @@ absl::StatusOr<ge::TiledHloComputation> GetTiledHloComputation(
 
 absl::StatusOr<KernelDefinition<MlirKernelSource>> EmitTiledFusionKernelImpl(
     mlir::MLIRContext& context, const HloFusionInstruction& fusion,
+    const HloInstruction& kernel_spec_hlo,
     const BufferAssignment* buffer_assignment, absl::string_view name,
     int64_t num_work_groups, const ge::TiledHloComputation& tiled_computation) {
   ASSIGN_OR_RETURN(
@@ -371,9 +389,9 @@ absl::StatusOr<KernelDefinition<MlirKernelSource>> EmitTiledFusionKernelImpl(
     num_tiles *= CeilOfRatio(dim, tile_size);
   }
 
-  return CreateTiledKernelDefinition(context, fusion, buffer_assignment, name,
-                                     num_work_groups, num_tiles,
-                                     std::move(module));
+  return CreateTiledKernelDefinition(context, fusion, kernel_spec_hlo,
+                                     buffer_assignment, name, num_work_groups,
+                                     num_tiles, std::move(module));
 }
 
 }  // namespace
@@ -406,11 +424,14 @@ bool IsSupportedTilingType(PrimitiveType type) {
   return true;
 }
 
-TiledEmissionResult EmitTiledFusionKernel(
+namespace {
+
+TiledEmissionResult EmitTiledFusionKernelCommon(
     mlir::MLIRContext& context, const HloFusionInstruction& fusion,
+    const HloInstruction& kernel_spec_hlo,
     const BufferAssignment* buffer_assignment, absl::string_view name,
-    int64_t num_work_groups) {
-  if (!IsSupportedTiledFusion(fusion).ok()) {
+    int64_t num_work_groups, bool admit_region_ops) {
+  if (!IsSupportedTiledFusion(fusion, admit_region_ops).ok()) {
     return {absl::UnimplementedError(
                 "Fusion is not supported by the tiled CPU emitter."),
             /*tiling_succeeded=*/false};
@@ -423,8 +444,9 @@ TiledEmissionResult EmitTiledFusionKernel(
       return {tiled_computation.status(), /*tiling_succeeded=*/false};
     }
 
-    return {EmitTiledFusionKernelImpl(context, fusion, buffer_assignment, name,
-                                      num_work_groups, *tiled_computation),
+    return {EmitTiledFusionKernelImpl(context, fusion, kernel_spec_hlo,
+                                      buffer_assignment, name, num_work_groups,
+                                      *tiled_computation),
             /*tiling_succeeded=*/true};
   }
 
@@ -440,10 +462,30 @@ TiledEmissionResult EmitTiledFusionKernel(
     return {tiling.status(), /*tiling_succeeded=*/false};
   }
 
-  return {EmitTiledFusionKernelImpl(context, fusion, buffer_assignment, name,
-                                    num_work_groups, *symbolic_tile_analysis,
-                                    *tiling),
+  return {EmitTiledFusionKernelImpl(context, fusion, kernel_spec_hlo,
+                                    buffer_assignment, name, num_work_groups,
+                                    *symbolic_tile_analysis, *tiling),
           /*tiling_succeeded=*/true};
+}
+
+}  // namespace
+
+TiledEmissionResult EmitTiledFusionKernel(
+    mlir::MLIRContext& context, const HloFusionInstruction& fusion,
+    const BufferAssignment* buffer_assignment, absl::string_view name,
+    int64_t num_work_groups) {
+  return EmitTiledFusionKernelCommon(context, fusion, fusion, buffer_assignment,
+                                     name, num_work_groups,
+                                     /*admit_region_ops=*/false);
+}
+
+TiledEmissionResult EmitTiledRegionKernel(
+    mlir::MLIRContext& context, const HloFusionInstruction& fusion_view,
+    const HloInstruction& region_call, const BufferAssignment* buffer_assignment,
+    absl::string_view name, int64_t num_work_groups) {
+  return EmitTiledFusionKernelCommon(context, fusion_view, region_call,
+                                     buffer_assignment, name, num_work_groups,
+                                     /*admit_region_ops=*/true);
 }
 
 }  // namespace xla::cpu

@@ -45,8 +45,18 @@ namespace xla::cpu {
 // static instruction count.
 class SmallRegionHoistingPass final : public HloModulePass {
  public:
+  // When `exclude_nonscalar_constants` is true (set by cpu_compiler when the
+  // experimental region-compilation flag is active), non-scalar `constant`
+  // instructions are excluded from region membership: they are left in the
+  // parent computation and become region INPUTS (→ kCall operands → outlined
+  // parameters). This makes their buffer slices reachable by the tiled region
+  // kernel ABI, which builds argument buffers from the kCall's operands only.
+  // The MLIR tiled emitter also cannot materialize non-scalar constants. With
+  // the flag off the legacy Stage-0 behavior is unchanged: constants are
+  // ordinary members.
   explicit SmallRegionHoistingPass(int64_t small_buffer_access_size,
-                                   int64_t min_region_size = 4);
+                                   int64_t min_region_size = 4,
+                                   bool exclude_nonscalar_constants = false);
 
   absl::string_view name() const final { return "small-region-hoisting"; }
 
@@ -58,6 +68,7 @@ class SmallRegionHoistingPass final : public HloModulePass {
  private:
   int64_t small_buffer_access_size_;
   int64_t min_region_size_;
+  bool exclude_nonscalar_constants_;
 };
 
 }  // namespace xla::cpu

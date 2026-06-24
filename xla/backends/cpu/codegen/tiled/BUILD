@@ -28,6 +28,7 @@ cc_library(
     hdrs = ["tiled_fusion_emitter.h"],
     visibility = [
         "//xla/backends/cpu/codegen:__pkg__",
+        "//xla/backends/cpu/codegen/emitters:__pkg__",
         "//xla/service/cpu:__pkg__",
     ],
     deps = [

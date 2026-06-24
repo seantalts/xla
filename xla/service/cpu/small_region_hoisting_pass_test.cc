@@ -31,6 +31,7 @@ limitations under the License.
 #include "xla/hlo/ir/hlo_opcode.h"
 #include "xla/hlo/testlib/hlo_hardware_independent_test_base.h"
 #include "xla/hlo/testlib/test.h"
+#include "xla/shape_util.h"
 #include "xla/tsl/platform/statusor.h"
 
 namespace xla {
@@ -43,6 +44,15 @@ class SmallRegionHoistingPassTest : public HloHardwareIndependentTestBase {
   absl::StatusOr<bool> RunPass(HloModule* module,
                                int64_t small_buffer_access_size = 1 << 16) {
     return cpu::SmallRegionHoistingPass(small_buffer_access_size).Run(module);
+  }
+
+  // Region-flag variant: excludes non-scalar constants from region membership.
+  absl::StatusOr<bool> RunPassWithRegionCompilation(
+      HloModule* module, int64_t small_buffer_access_size = 1 << 16) {
+    return cpu::SmallRegionHoistingPass(
+               small_buffer_access_size, /*min_region_size=*/4,
+               /*exclude_nonscalar_constants=*/true)
+        .Run(module);
   }
 
   // Returns the single `xla_cpu_small_call`-tagged call in the module, or
@@ -720,6 +730,104 @@ TEST_F(SmallRegionHoistingPassTest, CrossingControlDepBlocksHoisting) {
   // Both regions carry a boundary-crossing control dep, so neither hoists.
   EXPECT_FALSE(changed);
   EXPECT_EQ(SoleSmallCall(m.get()), nullptr);
+}
+
+// Step 2: under the region flag, a non-scalar constant used by the region is
+// excluded from region membership -- it stays in the parent computation and
+// becomes a kCall operand (region input / outlined parameter). Scalar
+// constants remain ordinary members.
+TEST_F(SmallRegionHoistingPassTest, NonscalarConstantBecomesRegionOperand) {
+  constexpr absl::string_view hlo_string = R"(
+    HloModule c
+
+    add_reducer (a: f32[], b: f32[]) -> f32[] {
+      a = f32[] parameter(0)
+      b = f32[] parameter(1)
+      ROOT add = f32[] add(a, b)
+    }
+
+    ENTRY main (v: f32[16]) -> f32[] {
+      v = f32[16]{0} parameter(0)
+      w = f32[16,16]{1,0} constant({...})
+      zero = f32[] constant(0)
+      dot = f32[16]{0} dot(w, v), lhs_contracting_dims={1}, rhs_contracting_dims={0}
+      t = f32[16]{0} tanh(dot)
+      r = f32[] reduce(t, zero), dimensions={0}, to_apply=add_reducer
+      s = f32[16]{0} broadcast(r), dimensions={}
+      d = f32[16]{0} subtract(t, s)
+      ROOT out = f32[] reduce(d, zero), dimensions={0}, to_apply=add_reducer
+    }
+    )";
+
+  TF_ASSERT_OK_AND_ASSIGN(std::unique_ptr<HloModule> m,
+                          ParseAndReturnVerifiedModule(hlo_string));
+  // Tiny threshold-free run: this region is well under 64KB.
+  TF_ASSERT_OK_AND_ASSIGN(bool changed,
+                          RunPassWithRegionCompilation(m.get()));
+  EXPECT_TRUE(changed);
+  const HloInstruction* call = SoleSmallCall(m.get());
+  ASSERT_NE(call, nullptr);
+
+  // The non-scalar constant `w` must be an OPERAND of the call (a region
+  // input), not a member of the region body.
+  bool w_is_operand = absl::c_any_of(
+      call->operands(), [](const HloInstruction* op) {
+        return op->opcode() == HloOpcode::kConstant &&
+               !ShapeUtil::IsEffectiveScalar(op->shape());
+      });
+  EXPECT_TRUE(w_is_operand);
+  // No non-scalar constant survives inside the region body.
+  bool body_has_nonscalar_constant = absl::c_any_of(
+      call->to_apply()->instructions(), [](const HloInstruction* i) {
+        return i->opcode() == HloOpcode::kConstant &&
+               !ShapeUtil::IsEffectiveScalar(i->shape());
+      });
+  EXPECT_FALSE(body_has_nonscalar_constant);
+  // The scalar constant `zero` stays a region member (effective scalar).
+  bool body_has_scalar_constant = absl::c_any_of(
+      call->to_apply()->instructions(), [](const HloInstruction* i) {
+        return i->opcode() == HloOpcode::kConstant &&
+               ShapeUtil::IsEffectiveScalar(i->shape());
+      });
+  EXPECT_TRUE(body_has_scalar_constant);
+}
+
+// Flag off (Stage-0): the same non-scalar constant remains a region MEMBER.
+TEST_F(SmallRegionHoistingPassTest, NonscalarConstantStaysMemberWhenFlagOff) {
+  constexpr absl::string_view hlo_string = R"(
+    HloModule c
+
+    add_reducer (a: f32[], b: f32[]) -> f32[] {
+      a = f32[] parameter(0)
+      b = f32[] parameter(1)
+      ROOT add = f32[] add(a, b)
+    }
+
+    ENTRY main (v: f32[16]) -> f32[] {
+      v = f32[16]{0} parameter(0)
+      w = f32[16,16]{1,0} constant({...})
+      zero = f32[] constant(0)
+      dot = f32[16]{0} dot(w, v), lhs_contracting_dims={1}, rhs_contracting_dims={0}
+      t = f32[16]{0} tanh(dot)
+      r = f32[] reduce(t, zero), dimensions={0}, to_apply=add_reducer
+      s = f32[16]{0} broadcast(r), dimensions={}
+      d = f32[16]{0} subtract(t, s)
+      ROOT out = f32[] reduce(d, zero), dimensions={0}, to_apply=add_reducer
+    }
+    )";
+
+  TF_ASSERT_OK_AND_ASSIGN(std::unique_ptr<HloModule> m,
+                          ParseAndReturnVerifiedModule(hlo_string));
+  TF_ASSERT_OK_AND_ASSIGN(bool changed, RunPass(m.get()));
+  EXPECT_TRUE(changed);
+  const HloInstruction* call = SoleSmallCall(m.get());
+  ASSERT_NE(call, nullptr);
+  bool body_has_nonscalar_constant = absl::c_any_of(
+      call->to_apply()->instructions(), [](const HloInstruction* i) {
+        return i->opcode() == HloOpcode::kConstant &&
+               !ShapeUtil::IsEffectiveScalar(i->shape());
+      });
+  EXPECT_TRUE(body_has_nonscalar_constant);
 }
 
 }  // namespace

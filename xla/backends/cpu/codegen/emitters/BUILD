@@ -24,10 +24,12 @@ cc_library(
     srcs = [
         "cpu_fusion_emitter.cc",
         "cpu_scatter_emitter.cc",
+        "region_kernel_emitter.cc",
     ],
     hdrs = [
         "cpu_fusion_emitter.h",
         "cpu_scatter_emitter.h",
+        "region_kernel_emitter.h",
     ],
     deps = [
         "//xla:shape_util",
@@ -37,6 +39,7 @@ cc_library(
         "//xla/backends/cpu/codegen:fusion_compiler",
         "//xla/backends/cpu/codegen:kernel_api_ir_builder",
         "//xla/backends/cpu/codegen:symbol_name_util",
+        "//xla/backends/cpu/codegen/tiled:tiled_fusion_emitter",
         "//xla/codegen:kernel_definition",
         "//xla/codegen:kernel_emitter",
         "//xla/codegen:kernel_spec",
@@ -44,7 +47,10 @@ cc_library(
         "//xla/codegen/emitters:computation_partitioner",
         "//xla/codegen/emitters:elemental_hlo_to_mlir",
         "//xla/codegen/emitters:kernel_api_builder",
+        "//xla/codegen/emitters:kernel_arguments",
         "//xla/codegen/emitters:type_util",
+        "//xla/runtime:work_dimensions",
+        "//xla/runtime:work_item",
         "//xla/codegen/emitters/ir:xla",
         "//xla/codegen/emitters/ir:xla_attrs_inc_gen",
         "//xla/hlo/analysis:indexing_analysis",
@@ -82,6 +88,7 @@ cc_library(
         "@llvm-project//mlir:BuiltinToLLVMIRTranslation",
         "@llvm-project//mlir:DLTIDialect",
         "@llvm-project//mlir:DataLayoutInterfaces",
+        "@llvm-project//mlir:DialectUtils",
         "@llvm-project//mlir:FuncDialect",
         "@llvm-project//mlir:IR",
         "@llvm-project//mlir:LLVMDialect",
@@ -95,6 +102,32 @@ cc_library(
         "@llvm-project//mlir:TensorDialect",
         "@llvm-project//mlir:ToLLVMIRTranslation",
         "@llvm-project//mlir:VectorDialect",
+    ],
+)
+
+xla_cc_test(
+    name = "region_kernel_emitter_test",
+    srcs = ["region_kernel_emitter_test.cc"],
+    deps = [
+        ":cpu_fusion_emitters",
+        "//xla/backends/cpu/codegen:fusion_compiler",
+        "//xla/codegen:kernel_definition",
+        "//xla/codegen:llvm_kernel_source",
+        "//xla/codegen:mlir_kernel_source",
+        "//xla/hlo/analysis:alias_info",
+        "//xla/hlo/analysis:hlo_ordering",
+        "//xla/hlo/ir:hlo",
+        "//xla/hlo/testlib:filecheck",
+        "//xla/hlo/testlib:hlo_hardware_independent_test_base",
+        "//xla/service:buffer_assignment",
+        "//xla/service:buffer_value",
+        "//xla/service:logical_buffer",
+        "//xla/service/cpu:cpu_executable",
+        "//xla/tests:xla_internal_test_main",
+        "//xla/tsl/platform:statusor",
+        "@com_google_absl//absl/status:statusor",
+        "@com_google_absl//absl/strings:string_view",
+        "@com_google_googletest//:gtest",
     ],
 )
 

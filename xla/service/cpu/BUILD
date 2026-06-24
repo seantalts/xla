@@ -1722,6 +1722,7 @@ xla_cc_test(
     srcs = ["small_region_hoisting_pass_test.cc"],
     deps = [
         ":small_region_hoisting_pass",
+        "//xla:shape_util",
         "//xla/hlo/ir:hlo",
         "//xla/hlo/testlib:hlo_hardware_independent_test_base",
         "//xla/hlo/testlib:test",

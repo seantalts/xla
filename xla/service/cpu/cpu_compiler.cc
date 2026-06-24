@@ -1157,8 +1157,15 @@ absl::Status CpuCompiler::RunHloPassesAfterLayoutAssn(
     if (byte_threshold != 0) {
       // Straight-line regions aggregate several ops' footprints, so gate them
       // at the design default of 64KB rather than the 1KB single-while default.
+      // When experimental region compilation is on, exclude non-scalar
+      // constants from region membership so they become kCall operands
+      // (reachable by the tiled region kernel ABI). Off, Stage-0 behavior is
+      // byte-identical.
       pipeline.AddPass<SmallRegionHoistingPass>(
-          std::max<int64_t>(byte_threshold, int64_t{1} << 16));
+          std::max<int64_t>(byte_threshold, int64_t{1} << 16),
+          /*min_region_size=*/4,
+          /*exclude_nonscalar_constants=*/
+          options::ExperimentalRegionCompilation(module->config()));
     }
   }
 

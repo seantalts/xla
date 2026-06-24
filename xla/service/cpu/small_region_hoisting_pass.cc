@@ -124,16 +124,28 @@ void EnqueueControlFlowBodies(HloComputation* comp,
 }  // namespace
 
 SmallRegionHoistingPass::SmallRegionHoistingPass(
-    int64_t small_buffer_access_size, int64_t min_region_size)
+    int64_t small_buffer_access_size, int64_t min_region_size,
+    bool exclude_nonscalar_constants)
     : small_buffer_access_size_(small_buffer_access_size),
-      min_region_size_(min_region_size) {}
+      min_region_size_(min_region_size),
+      exclude_nonscalar_constants_(exclude_nonscalar_constants) {}
 
 // Partitions `comp`'s schedule into maximal region-eligible runs and outlines
 // each cost-model-passing run into an `xla_cpu_small_call` kCall. Returns true
 // if `comp` was modified. `unavailable_memo` is shared across computations.
+// True if `instr` is a non-scalar constant that, under the region flag, must
+// be excluded from region membership so it becomes a region input (kCall
+// operand) rather than an unreachable region-internal value.
+static bool IsExcludedNonscalarConstant(const HloInstruction* instr,
+                                        bool exclude_nonscalar_constants) {
+  return exclude_nonscalar_constants &&
+         instr->opcode() == HloOpcode::kConstant &&
+         !ShapeUtil::IsEffectiveScalar(instr->shape());
+}
+
 static absl::StatusOr<bool> PartitionComputation(
     HloModule* module, HloComputation* comp, int64_t small_buffer_access_size,
-    int64_t min_region_size,
+    int64_t min_region_size, bool exclude_nonscalar_constants,
     absl::flat_hash_map<const HloInstruction*, bool>& unavailable_memo) {
   // Partition the computation's topological order into maximal runs of
   // region-eligible instructions, split at unavailable instructions.
@@ -148,6 +160,13 @@ static absl::StatusOr<bool> PartitionComputation(
   };
   for (HloInstruction* instr : comp->MakeInstructionPostOrder()) {
     if (instr->opcode() == HloOpcode::kParameter) {
+      continue;
+    }
+    // Under the region flag, non-scalar constants are not region members:
+    // leave them in the parent so they become region inputs (kCall operands),
+    // reachable by the tiled region kernel ABI. They don't break a run, just
+    // like parameters.
+    if (IsExcludedNonscalarConstant(instr, exclude_nonscalar_constants)) {
       continue;
     }
     if (ContainsUnavailableInstruction(instr, unavailable_memo)) {
@@ -326,7 +345,8 @@ absl::StatusOr<bool> SmallRegionHoistingPass::RunImpl(
     ASSIGN_OR_RETURN(
         bool comp_changed,
         PartitionComputation(module, comp, small_buffer_access_size_,
-                             min_region_size_, unavailable_memo));
+                             min_region_size_, exclude_nonscalar_constants_,
+                             unavailable_memo));
     changed |= comp_changed;
     EnqueueControlFlowBodies(comp, worklist, seen);
   }

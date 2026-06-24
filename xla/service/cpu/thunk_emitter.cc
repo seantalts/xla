@@ -44,6 +44,7 @@ limitations under the License.
 #include "xla/backends/cpu/codegen/elemental/concatenate_kernel_emitter.h"
 #include "xla/backends/cpu/codegen/elemental/elemental_kernel_emitter.h"
 #include "xla/backends/cpu/codegen/emitters/cpu_scatter_emitter.h"
+#include "xla/backends/cpu/codegen/emitters/region_kernel_emitter.h"
 #include "xla/backends/cpu/codegen/fusion_compiler.h"
 #include "xla/backends/cpu/codegen/fusion_emitter.h"
 #include "xla/backends/cpu/codegen/ir_compiler.h"
@@ -662,6 +663,40 @@ absl::StatusOr<ThunkSequence> ThunkEmitter::EmitCallThunk(
   if (std::optional<std::string> maybe_small_call =
           instruction->get_frontend_attribute("xla_cpu_small_call");
       maybe_small_call.has_value() && *maybe_small_call == "true") {
+    // Stage-1 Increment-1: emit the region via the MLIR/xtile stack when the
+    // experimental flag is set and the region is within the Increment-1
+    // envelope (straight-line, single-output-shape elementwise). Otherwise fall
+    // back to the legacy ComputationKernelEmitter (flag off, or region declined
+    // by RegionKernelEmitter).
+    if (options::ExperimentalRegionCompilation(hlo_module_config_) &&
+        RegionKernelEmitter::IsSupportedRegion(instruction)) {
+      RegionKernelEmitter emitter(instruction, &buffer_assignment_,
+                                  mlir_context_.get());
+      // The region emitter may still decline a region that passed the cheap
+      // static gate (e.g. the tiled emitter rejects a fused op or tiling
+      // fails). In that case fall back to the legacy ComputationKernelEmitter
+      // rather than failing compilation.
+      absl::StatusOr<RegionKernelEmitter::KernelDefinition> kernel_definition =
+          emitter.EmitKernelDefinition();
+      if (kernel_definition.ok()) {
+        auto kernel_spec = kernel_definition->spec();
+        auto kernel_source = std::move(*kernel_definition).TakeSource();
+
+        ASSIGN_OR_RETURN(LlvmKernelSource llvm_kernel_source,
+                         fusion_compiler_.Compile(std::move(kernel_source)));
+
+        kernels_.push_back(
+            {kernel_spec.name(),
+             std::move(llvm_kernel_source).thread_safe_module()});
+
+        return MakeKernelThunkSequence(instruction, std::move(kernel_spec),
+                                       /*min_alignment=*/MinAlign());
+      }
+      VLOG(2) << "RegionKernelEmitter declined " << instruction->name()
+              << ": " << kernel_definition.status()
+              << "; falling back to legacy ComputationKernelEmitter.";
+    }
+
     ComputationKernelEmitter emitter(instruction, &buffer_assignment_,
                                      &target_machine_features_);
     ASSIGN_OR_RETURN(KernelDefinition kernel_definition,
