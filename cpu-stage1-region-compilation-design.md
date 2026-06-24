@@ -91,7 +91,9 @@ This is the milestone that actually helps scatter-heavy loop bodies (the #26145 
 
 This is tractable: the tiled driver `EmitTiledComputation` already returns a vector of tile values (multiple roots), and multi-output tiling exists on the GPU side. The work is (a) reify a tuple-root fusion view of the region, (b) map each tuple element to a kernel result buffer, (c) thread multiple roots through tile selection. Before building, audit the op coverage of the target region bodies (at least one contains a dynamic-update-slice) so member ops the tiled emitter still rejects are handled or keep that region as a declining case.
 
-**Acceptance:** the #26145 loop body's scatter-free runs fold into single tiled kernels (kernels-per-timestep drops materially), results match the interpreter, and per-iteration latency moves toward the older runtime.
+**Op-coverage caveat (important).** An audit of the #26145 region bodies found them pervaded by ops the tiled emitter does **not** support: `gather` (~91), `reverse` (~72), and `dynamic-update-slice` (~56), in addition to the tuple roots. So multi-output is *necessary but far from sufficient* for that workload — folding its regions on the tiled path additionally requires tiled emission of gather, reverse, and dynamic-update-slice (a substantial emitter-coverage effort). Moreover, #26145's region *folding* is already delivered by the legacy region emitter (the committed body-hoisting work, ~1.33×), which handles those ops; the tiled path's marginal value there would be codegen quality on already-folded regions, which must be weighed against the op-coverage cost. The tiled region path's clear, immediate value is the dense-math class (dot/reduce/broadcast/elementwise — frag-shaped), already delivered by the first milestone.
+
+**Acceptance:** the #26145 loop body's scatter-free runs fold into single tiled kernels (kernels-per-timestep drops materially), results match the interpreter, and per-iteration latency moves toward the older runtime — *contingent on the additional op coverage above*.
 
 ### Milestone 3 — control flow inside a region
 
