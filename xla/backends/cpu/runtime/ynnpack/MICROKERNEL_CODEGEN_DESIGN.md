@@ -1,6 +1,6 @@
 # Design: LLVM-IR microkernel codegen for the XLA:CPU ynnpack path
 
-Status: draft / RFC (v3)
+Status: draft / RFC (v4)
 Scope: XLA:CPU backend, `__ynn_fusion` path
 
 ## 1. Goal
@@ -9,11 +9,13 @@ Today XLA:CPU offloads matched fusions (dot / conv / reduce / elementwise) to
 **ynnpack** — the next-gen graph API inside the XNNPACK fork — and lets ynnpack
 *execute* them at runtime. This proposal changes the back half: **get
 ynnpack's microkernels out as LLVM IR**, embed that IR into a fused kernel that
-XLA JIT-compiles through its existing `JitCompiler`, and run it with a plain
-`KernelThunk` — instead of handing the subgraph to ynnpack's runtime to execute.
+XLA JIT-compiles, and run it with a plain `KernelThunk` — instead of handing the
+subgraph to ynnpack's runtime to execute. The extract→embed→link→inline
+machinery already exists in-tree (`xla/codegen/intrinsic/cpp/`, used for `tanh`
+and Eigen unary ops); this reuses it.
 
 The win is not "LLVM beats XNNPACK's microkernels" — we *keep* XNNPACK's
-microkernels, now as IR. The win is everything the offload model hides from the
+microkernels, now as IR. The win is what the offload model hides from the
 compiler once the microkernel is IR in our module:
 
 - **Epilogue/prologue fusion** — fold surrounding elementwise ops (bias,
@@ -68,12 +70,9 @@ Two facts shape this design:
 
 From the pinned `ynnpack.h`:
 
-- **Graph builders:** ~30 `ynn_define_*` ops — `tensor, iota, unary,
-  unary_polynomial, convert(_v2), quantize, dequantize, binary, lut,
-  (static_)broadcast, broadcast_like, static_expand_dims, static_reshape,
-  fuse_dim(s), split_dim, even_split, concatenate, stack, copy, static_slice,
-  slice_like, static_transpose, static_pad, stencil_copy, dot, reduce,
-  get_tensor_shape`.
+- **Graph builders:** ~30 `ynn_define_*` ops (`tensor, dot, reduce, unary,
+  binary, convert, quantize, dequantize, lut, stencil_copy, static_pad,
+  static_transpose, broadcast, concatenate, ...`).
 - **Optimize:** `ynn_optimize_subgraph(subgraph, threadpool, flags)` — status
   only. **No introspection** of the chosen tiling/schedule/microkernel.
 - **Runtime:** `ynn_create_runtime`, `ynn_reshape_runtime`, `ynn_invoke_runtime`,
@@ -81,12 +80,11 @@ From the pinned `ynnpack.h`:
   `ynn_runtime_property_concurrency`).
 - **Packing:** none. **Codegen/JIT/LLVM/emit:** none.
 
-**Consequence:** through the public API, ynnpack is a *graph builder + opaque
-optimizer + opaque runtime*. It will not tell us which microkernel it picked,
-hand us a packed layout, or give us IR. So "get the IR out of ynnpack" means
-reaching past the graph API to the microkernel **sources** underneath
-(XNNPACK's ukernels), and doing the selection/packing/stitching ourselves or via
-a small fork-side hook. That is the subject of §5.
+**Consequence:** the public API will not tell us which microkernel it picked,
+hand us a packed layout, or give us IR. "Get the IR out of ynnpack" therefore
+means reaching to the microkernel **sources** underneath (XNNPACK's ukernels)
+and doing selection/packing/stitching ourselves — with a small **fork-side hook**
+to recover ynnpack's own selection (decided in §5.4).
 
 ## 4. Target architecture
 
@@ -101,9 +99,9 @@ HLO fusion (__ynn_fusion)                         ← unchanged front half
 YnnKernelEmitter : KernelEmitter<LlvmKernelSource>    ← NEW
   │  - EmitKernelPrototype() via KernelApiIrBuilder → XLA_CPU kernel ABI
   │  - emit driver loop nest (M/N/K tiles), partitioned by workgroup_id
-  │  - per tile: call the ynnpack microkernel (linked in from bitcode),
-  │              then the fused elementwise epilogue on the tile in registers
-  │  - link the ukernel IR into the module, inline + specialize
+  │  - per tile: call the ynnpack microkernel (linked in from embedded
+  │              bitcode), then the fused elementwise epilogue in registers
+  │  - link ukernel IR via CppGenIntrinsicLibrary, inline + specialize
   │  - return KernelDefinition{ KernelSpec(name, NumWorkGroups, buffers),
   │                             LlvmKernelSource(module) }
   ▼
@@ -117,79 +115,95 @@ results
 
 Everything from `JitCompiler` down already exists and is what
 `DotKernelEmitter`/`ElementalKernelEmitter` use. New surface = `YnnKernelEmitter`
-+ the bitcode-extraction pipeline (§5). Anything not covered falls back to
-`YnnFusionThunk`, so rollout is incremental and reversible. The kernel ABI
-(`KernelApiIrBuilder::EmitKernelPrototype` → `XLA_CPU_KernelCallFrame`,
-`workgroup_id`/`num_workgroups`) and the workgroup-grid parallelism (as in
-`DotKernelEmitter`'s `NumWorkGroups`) are reused unchanged.
++ the bitcode targets (§5). Anything not covered falls back to `YnnFusionThunk`,
+so rollout is incremental and reversible. The kernel ABI
+(`KernelApiIrBuilder::EmitKernelPrototype`) and workgroup-grid parallelism
+(`NumWorkGroups`, as in `DotKernelEmitter`) are reused unchanged.
 
-## 5. The core plan: get ynnpack's microkernels out as LLVM IR
+## 5. The core plan: extract XNNPACK ukernels as IR and stitch them
 
-XNNPACK microkernels written in C with SIMD intrinsics compile to clean LLVM IR
-with clang. The plan extracts them as bitcode at build time and stitches them
-into the fused kernel.
+### 5.1 Reuse the existing extract→embed→link machinery
+XLA already compiles C++ to embedded LLVM IR and links it into JIT modules for
+intrinsics. We reuse it wholesale:
 
-### 5.1 The extraction pipeline
+- **Build:** `cc_ir_header` (`xla/codegen/intrinsic/cpp/cc_to_llvm_ir.bzl`)
+  compiles a `.cc` with `-emit-llvm -O3 -mprefer-vector-width=… [-m<isa>]`,
+  extracts the `.llvmbc` section, and embeds it as `inline const std::string
+  k<Name>Ir` via the `embed_bitcode` tool + `//xla/util:embedded_constant_buffers`.
+  We add `cc_ir_header` targets for the XNNPACK GEMM ukernel(s) + pack routine(s)
+  we want. **Generated in-build, never checked in.**
+- **Consume:** `CppGenIntrinsicLibrary::LinkIntoModule(dst)` parses the embedded
+  bitcode, sets the host datalayout, `llvm::Linker::linkModules` into the kernel
+  module, and marks each linked def `InternalLinkage + AlwaysInline`.
+  `GetCppGenFunction(module, name)` fetches a ukernel for inlining;
+  `AreEigenIntrinsicsAvailable()`-style guards detect empty bitcode and fall
+  back. (All in `xla/codegen/intrinsic/cpp/cpp_gen_intrinsics.{h,cc}`.)
+- **Specialize:** `IrCompiler`'s pass pipeline inlines the ukernel into the
+  driver, constant-folds the dims, unrolls K, **fuses the epilogue into the
+  ukernel's store**, vectorizes, emits the object.
 
-1. **In-build bitcode.** A Bazel rule compiles the needed XNNPACK microkernel
-   translation units (e.g. the `f32`/`bf16` GEMM ukernels and their pack
-   routines) to LLVM **bitcode** using XLA's vendored clang/LLVM toolchain, with
-   the target arch flags. The `.bc` is embedded as data in the XLA binary.
-   *Generated in-build, never checked in* — so it is always the same LLVM the
-   JIT links (see §6, the no-pinning point).
-2. **Microkernel registry + selection.** XNNPACK ukernel symbol names are
-   regular (e.g. `xnn_f32_gemm_minmax_ukernel_<MR>x<NR>__<isa>`). XLA holds a
-   table mapping (dtype, tile `MR×NR`, ISA) → symbol, and selects per fusion
-   from `TargetMachineFeatures`. (The public ynn API won't choose for us — §3 —
-   so XLA chooses; a fork hook to expose ynnpack's own choice is an optional
-   upgrade, §5.3.)
-3. **Driver emission.** `YnnKernelEmitter` emits the kernel prototype, the
-   M/N/K tiling loops (partitioned into the workgroup grid), the operand
-   prologue (pack/stride A; packed weights from step 5/§7.2), and per output
-   tile a **call** to the selected ukernel (declared with its ABI: tile dims,
-   `a`+stride, packed `w`, `c`+strides, a `params` struct for the built-in
-   clamp). Then the elementwise epilogue is emitted on the tile.
-4. **Link + specialize.** Load the ukernel (and pack) functions from the
-   embedded bitcode into the kernel `llvm::Module` (`llvm::Linker`/`IRMover`),
-   mark `alwaysinline`, constant-propagate dims/strides, and run `IrCompiler`'s
-   pipeline → inline, unroll, **fuse the epilogue into the ukernel's store**,
-   vectorize, emit object.
-5. **Packing.** For constant weights, run XNNPACK's pack routine (also available
-   as in-build bitcode, or called at compile time) to materialize a packed
-   constant buffer once; the ukernel reads it directly (§7.2).
-6. **JIT + KernelThunk**, then **fallback** to `YnnFusionThunk` for anything not
-   covered.
+### 5.2 The variant-count question (the "!!!!"): bounded ISA tiers, runtime-selected
+This is a solved pattern in the precedent. For Eigen unary, XLA ships **two**
+tiers — `eigen_unary_32_ll` (256-bit) and `eigen_unary_64_ll` (AVX-512) — and
+`GetCppGenIrString(options)` picks one **at runtime from the JIT target's
+features** (`+avx512f` & prefer-width 512 → the 512 blob, else the 256 blob).
 
-### 5.2 Option A (XLA emits its own microkernels) — fallback only
-The alternative is to have XLA write the GEMM microkernel itself in IR (extend
-`tiled_dot_emitter`/`VectorIrBuilder`) using ynnpack only for the high-level
-recipe, never XNNPACK's kernels. We keep this **only as a fallback** for tiles
-where no usable bitcode ukernel exists (notably asm-only kernels, §5.3), since
-on its own it doesn't deliver XNNPACK's tuned performance — the whole point of
-"using ynnpack."
+We do the same: embed a **small set of ISA tiers** (not a blob per micro-arch)
+and select by `TargetMachineFeatures`. Binary cost is a few blobs; the *compiled
+kernel* contains only the one selected ukernel (the linker pulls only referenced
+symbols). For AOT, embed only the target tier.
 
-### 5.3 Honest gaps (true regardless of approach)
-- **Selection.** The public API won't say which ukernel it would use; XLA must
-  select (step 2). Faithfully using *ynnpack's* selection needs a small fork
-  hook (e.g. a `ynn_query_*` returning the chosen ukernel/tiling per node).
-- **Asm-only kernels.** XNNPACK's fastest kernels on some ISAs (much of ARM,
-  some x86) are hand-written **assembly**, which cannot be turned into LLVM IR.
-  Bitcode extraction covers the intrinsic-C subset only; the rest fall back
-  (to Option A or to `YnnFusionThunk`). Coverage is therefore arch-dependent —
-  strongest where XNNPACK uses intrinsic-C (much of x86 AVX/AVX-512).
-- **Packing-layout coupling.** Using XNNPACK ukernels means using XNNPACK's
-  packed-weight layout, so we must use its pack routines (step 5). This couples
-  the driver to ukernel/pack versions in the pinned XNNPACK.
+### 5.3 The real open decision: what C do we feed `cc_ir_header`?
+The granularity of the embedded source trades performance against
+variant-count / coverage:
 
-## 6. LLVM version: no pinning if generated in-build
+- **(P) Portable XNNPACK reference kernels** → 1–2 tiers; lean on LLVM's
+  auto-vectorizer + `-mprefer-vector-width` + the JIT target to specialize.
+  Bounded and clean, but you mostly get LLVM's codegen, **not** XNNPACK's
+  hand-tuning. (This is what the Eigen precedent does — effectively Option A
+  seeded from XNNPACK's C.)
+- **(I) ISA-specific intrinsic XNNPACK kernels** → one bitcode per ISA tier you
+  support; preserves hand-tuning for covered tiers; **asm-only kernels
+  excluded**; variant count = tiers × kernels embedded.
 
-Concern (from v2): LLVM IR/bitcode and intrinsics are not stable across major
-versions, and a separately-built bitcode artifact could drift from the LLVM XLA
-links. **Resolution:** generate the microkernel bitcode *as part of the XLA
-build* with XLA's vendored clang (§5.1 step 1) and do **not** check in `.bc`.
-Then the embedded IR is, by construction, the exact LLVM version the JIT uses on
-every build — there is nothing to pin. (Pinning would only return if we shipped
-prebuilt bitcode produced outside the XLA build.)
+Recommendation: start with **(I)** for **x86 AVX-512 `f32` GEMM** (XNNPACK is
+intrinsic-C there, so extraction is clean and the tuning is preserved), and use
+**(P)** / Option-A fallback where intrinsic kernels don't exist or are asm.
+
+### 5.4 Selection: a ynnpack fork hook (decided)
+Because the public API won't tell us its choice (§3), add a small hook to the
+XNNPACK fork that, given a node + target, returns the chosen ukernel **identity**
+— symbol name, tile `MR×NR`, required ISA tier, and the matching pack routine.
+XLA maps the ISA tier → embedded bitcode variant (à la `GetCppGenIrString`) and
+links that symbol. This keeps XLA's emitted kernel faithful to ynnpack's own
+selection, at the cost of a fork patch to maintain.
+
+### 5.5 Option A (XLA emits its own microkernels) — fallback only
+Have XLA write the GEMM microkernel itself in IR (extend
+`tiled_dot_emitter`/`VectorIrBuilder`), using ynnpack only for the recipe. Kept
+**only as a fallback** for tiles with no usable bitcode ukernel (asm-only, §5.6),
+since alone it doesn't deliver XNNPACK's tuned performance.
+
+### 5.6 Honest gaps
+- **Asm-only ukernels.** XNNPACK's fastest kernels on many ISAs (much of ARM,
+  some x86) are hand-written **assembly**, which cannot become LLVM IR. Lifting
+  machine code (llvm-mctoll, RetDec, remill) yields un-reoptimizable IR that
+  defeats fusion — not viable. Coverage via bitcode is the **intrinsic-C
+  subset** (strong on x86 AVX/AVX-512; partial on ARM NEON; asm kernels fall
+  back). Coverage is therefore arch-dependent.
+- **Packed-layout coupling.** Using XNNPACK ukernels means using its packed
+  layout and pack routines (§7.2); the driver is coupled to ukernel/pack
+  versions in the pinned XNNPACK.
+- **Runtime model.** We can't ship clang, so C→IR compilation is build-time
+  only; "runtime" specialization is the JIT linking + optimizing the embedded
+  IR for the host. No per-host recompilation of sources.
+
+## 6. LLVM version: no pinning, by construction
+`cc_ir_header` compiles with the build's own clang/LLVM and embeds the result;
+`LinkIntoModule` links it into the JIT module built by the same LLVM. Since the
+bitcode is regenerated every build (never checked in), the embedded IR always
+matches the LLVM the JIT links — there is nothing to pin. The Eigen/tanh
+precedent works exactly this way today.
 
 ## 7. Supporting design points
 
@@ -198,19 +212,16 @@ prebuilt bitcode produced outside the XLA build.)
 one HLO computation. Once the ukernel is inlined IR, emit the elementwise chain
 on the output tile via `CpuElementalIrEmitter` generators (as
 `ElementalKernelEmitter` does) before the store; LLVM fuses it into the
-ukernel's epilogue. This removes the materialization the slinky pipeline pays
-for between contraction and elementwise. (XNNPACK's ukernel `params` clamp
-covers relu/relu6-style activations natively; richer epilogues are emitted by
-XLA.)
+ukernel's epilogue. XNNPACK's ukernel `params` clamp covers relu/relu6-style
+activations natively; richer epilogues are emitted by XLA.
 
 ### 7.2 Packing
 No public ynnpack packing API (§3), so:
 - **Constant weights:** prepack at compile time using XNNPACK's pack routine
-  (in-build bitcode or a direct compile-time call) into a new constant
-  allocation in the ukernel's expected layout. No per-call repack.
+  (also pulled in as `cc_ir_header` bitcode, or called at compile time) into a
+  new constant allocation in the ukernel's expected layout. No per-call repack.
 - **Non-constant operands:** emit a prologue pack into scratch
-  (`KernelSpec.scratch_bytes`), or gate such fusions to `YnnFusionThunk` for the
-  first cut.
+  (`KernelSpec.scratch_bytes`), or gate such fusions to `YnnFusionThunk` first.
 
 ### 7.3 Selection, gating, fallback
 - Reuse `YnnMatcher`/`ynn_support` for *what* fuses, unchanged.
@@ -232,36 +243,41 @@ shim only for fallback fusions.
 
 ## 8. Phasing
 
-1. **Skeleton + fallback.** Bitcode rule for one `f32` GEMM ukernel + its pack;
-   `YnnKernelEmitter` that links + drives it for a simple `f32` matmul (no
-   epilogue) behind a default-off flag; route in `ThunkEmitter`; everything else
-   falls back. Land JIT→`KernelThunk` + numerics tests.
+1. **Skeleton + fallback.** `cc_ir_header` target for one x86 AVX-512 `f32` GEMM
+   ukernel + its pack routine; `YnnKernelEmitter` that links them via
+   `CppGenIntrinsicLibrary` and drives a simple `f32` matmul (no epilogue) behind
+   a default-off flag; route in `ThunkEmitter`; everything else falls back. Land
+   JIT→`KernelThunk` + numerics tests.
 2. **Epilogue fusion.** Fold elementwise neighbors onto the tile; add bf16.
 3. **Packing.** Compile-time prepack of constant weights.
-4. **Coverage.** More tile shapes/ISAs; conv (stencil_copy + dot); evaluate
-   asm-kernel gaps; Option-A fallback where needed.
-5. **Fidelity/autotuning.** Optional fork hook to use ynnpack's own selection;
-   expose driver tiles to `LlvmKernelAutotuner`.
+4. **Selection hook + tiers.** Add the ynnpack fork hook (§5.4); add an AVX2/256
+   tier; runtime tier selection.
+5. **Coverage / fidelity.** conv (stencil_copy + dot); ARM NEON intrinsic
+   kernels; Option-A fallback where asm-only; expose tiles to
+   `LlvmKernelAutotuner`.
 
 ## 9. Risks / open questions
 
-- **Asm-only ukernels (§5.3).** Hard cap on bitcode coverage, arch-dependent;
-  mitigated by fallback but limits the win on those ISAs.
-- **Selection without a fork hook (§5.3).** XLA-side selection may diverge from
-  ynnpack's; a fork `ynn_query_*` closes the gap if we want exact parity.
-- **Packing-layout coupling (§5.3/§7.2).** Driver tied to XNNPACK pack/ukernel
-  versions in the pinned dep.
-- **Build complexity.** Compiling the right XNNPACK TUs to bitcode (include
-  paths, `-D` configs, per-arch intrinsics) is the main new build machinery.
-- **Two paths to maintain** until codegen reaches parity; flag + fallback keep
-  it reversible.
-- *(Resolved)* **LLVM pinning** — eliminated by in-build bitcode (§6).
+- **Granularity tradeoff (§5.3).** Portable-C is bounded but modest perf;
+  intrinsic kernels preserve tuning but multiply variants and exclude asm.
+- **Asm-only ukernels (§5.6).** Hard, arch-dependent cap on bitcode coverage;
+  mitigated by fallback but limits the win on ARM especially.
+- **Fork hook maintenance (§5.4).** A patch to the XNNPACK fork to expose
+  selection (+ pack identity).
+- **Packed-layout coupling (§5.6/§7.2).**
+- **Build complexity.** Picking the right XNNPACK TUs and `-D`/`-m` flags so
+  they compile to clean bitcode through `cc_ir_header`.
+- *(Resolved)* **LLVM pinning** — eliminated by in-build bitcode (§6); the
+  tanh/Eigen precedent proves it.
 
 ## 10. Decisions needed
 
-1. **Selection ownership:** XLA-side table (no fork change) to start, vs a small
-   ynnpack fork hook to expose its own ukernel/tiling choice.
-2. **First target ISA + ukernel** for the Phase-1 slice (suggest x86 AVX-512
-   `f32` GEMM, where XNNPACK is intrinsic-C and bitcode extraction is cleanest).
-3. **Scope of this task:** design only, or land the Phase-1 slice (full
-   build/benchmark happens in a complete build env, not this session).
+1. **Source granularity (§5.3):** portable XNNPACK C (bounded, modest perf) vs
+   ISA-specific intrinsic kernels (tuned, more variants, asm excluded).
+   Recommendation: intrinsic kernels for x86 AVX-512 `f32` GEMM first.
+2. **First target tier + kernel** for Phase 1 (recommend x86 AVX-512 `f32` GEMM).
+3. **Scope:** design only, or land the Phase-1 slice (build/benchmark happens in
+   a full env, not this session).
+
+*Decided:* runtime model = `KernelThunk` (not slinky); selection = ynnpack fork
+hook (§5.4).
