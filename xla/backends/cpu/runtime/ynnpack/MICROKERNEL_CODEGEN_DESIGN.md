@@ -1,297 +1,231 @@
 # Design: LLVM-IR microkernel codegen for the XLA:CPU ynnpack path
 
-Status: draft / RFC (v5)
+Status: draft / RFC (v6 — grounded in the ynnpack source at the pinned commit)
 Scope: XLA:CPU backend, `__ynn_fusion` path
 
 > Terminology: **ynnpack** is a from-scratch successor to XNNPACK (a "spiritual
-> successor", per its README), living in the `ynnpack/` tree of the
-> `google/XNNPACK` repo. It has **its own** kernels in `ynnpack/kernels/`
-> (generated C++ with SIMD intrinsics), a subgraph API (`ynnpack/include/
-> ynnpack.h`), and uses **slinky** for loop fusion/scheduling. It does **not**
-> reuse classic XNNPACK microkernels (`src/…`, `xnn_*_ukernel`), and neither
-> does this design — everything below is ynnpack-only.
+> successor", per its README), in the `ynnpack/` tree of the `google/XNNPACK`
+> repo. It has **its own** kernels in `ynnpack/kernels/` (generated C++ with SIMD
+> intrinsics), a subgraph API (`ynnpack/include/ynnpack.h`), and uses **slinky**
+> for cross-node loop fusion. It does **not** reuse classic XNNPACK microkernels
+> (`src/…`, `xnn_*_ukernel`), and neither does this design.
 
 ## 1. Goal
 
-Today XLA:CPU offloads matched fusions (dot / conv / reduce / elementwise) to
-ynnpack and lets ynnpack *execute* them at runtime (subgraph → slinky loops →
-ynnpack kernels). This proposal changes the back half: **emit the ynnpack
-kernels as LLVM IR** into a fused driver kernel that XLA JIT-compiles, and run it
-with a plain `KernelThunk` — instead of handing the subgraph to ynnpack's
-runtime. The extract→embed→link→inline machinery already exists in-tree
-(`xla/codegen/intrinsic/cpp/`, used for `tanh` and Eigen unary ops); ynnpack
-kernels are generated intrinsic-C++, so they lift to bitcode through it.
+Today XLA:CPU offloads matched fusions to ynnpack and lets it *execute* them
+(subgraph → slinky loops → ynnpack kernels). This proposal changes the back
+half: **emit the ynnpack kernels as LLVM IR** into a fused driver kernel that XLA
+JIT-compiles, run via a plain `KernelThunk`. The extract→embed→link→inline
+machinery already exists in-tree (`xla/codegen/intrinsic/cpp/`, used for `tanh` /
+Eigen unary); ynnpack kernels are generated intrinsic-C++, so they lift to
+bitcode through it.
 
-The win is not "LLVM beats ynnpack's kernels" — we *keep* ynnpack's kernels, now
-as IR. The win is what the offload model hides from the compiler once the kernel
-is IR in our module:
-
-- **Epilogue/prologue fusion** — fold surrounding elementwise ops (ynnpack's
-  unary/binary kernels, or XLA's elemental emitter) onto each output tile *in
-  registers* before the store, instead of separate slinky pipeline stages over
-  materialized buffers.
-- **Shape/target specialization** — the kernel inlines into a driver with
-  compile-time loop bounds; K unrolls; the exact `-mcpu`/feature set XLA tracks
-  (`TargetMachineFeatures`) is applied.
-- **One runtime, one threadpool** — parallelism is XLA's workgroup grid
-  (`KernelThunk` → Eigen pool), not slinky bridged through `SlinkyThreadPool`.
-- **AOT + object cache** — the kernel is ordinary XLA object code; the current
-  path rebuilds a ynn subgraph + runtime per executable.
-- **Autotuning** — driver tile params can feed `LlvmKernelAutotuner`.
+The win is what the offload model hides from the compiler once the kernel is IR:
+- **Epilogue fusion** — ynnpack's dot kernel has no fused activation (it computes
+  `C_out = C_in + A·B`); the bias is just `C_in`, and activations are *separate*
+  elementwise nodes today. With the kernel inlined, fold those onto the output
+  tile **in registers** before the store.
+- **Shape/target specialization** — compile-time loop bounds; K unrolls; exact
+  `-mcpu`/features (`TargetMachineFeatures`).
+- **One runtime/threadpool** — XLA workgroup grid (`KernelThunk` → Eigen pool),
+  not slinky via `SlinkyThreadPool`.
+- **AOT + object cache**; **autotuning** of driver tiles.
 
 ## 2. How the path works today
 
 ```
-HLO module
-  │  LibraryRewriter (HLO pass) + YnnMatcher
-  │    matches kDot/kConvolution/kReduce/kReduceWindow + elementwise neighbors,
-  │    wraps them in HloFusionInstruction (kCustom),
-  │    FusionBackendConfig.kind = "__ynn_fusion"  (kYnnFusionKind)
-  ▼
-HLO fusion (__ynn_fusion)
-  │  ThunkEmitter::EmitYnnFusionThunk()
-  │    collects arg/result slices, marks constant operands "captured",
-  │    EmitYnnFusionBuilder(computation, captured_ids) → subgraph builder
-  ▼
-YnnFusionThunk (Thunk::Kind::kYnnFusion)
-  │  Execute():
-  │    EmitYnnSubgraph(): post-order walk → ynn_define_{tensor,dot,unary,...},
-  │                       ynn_optimize_subgraph()
-  │    ynn_create_runtime() → ynn_reshape_runtime()
-  │    ynn_set_external_value_data() (bind buffers)
-  │    ynn_invoke_runtime()  ← slinky fuses/schedules the loops and calls
-  │                            ynnpack kernels, parallel via SlinkyThreadPool
-  ▼
-results
+HLO → LibraryRewriter+YnnMatcher → HloFusion(kCustom, "__ynn_fusion")
+    → ThunkEmitter::EmitYnnFusionThunk → YnnFusionThunk
+    → EmitYnnSubgraph (ynn_define_*) → ynn_optimize_subgraph
+    → ynn_create_runtime → ynn_reshape_runtime → ynn_invoke_runtime
+       (slinky fuses/schedules loops, calls ynnpack kernels, SlinkyThreadPool)
 ```
 
-Two facts shape this design:
+Facts that shape the design:
+1. **ynnpack doesn't emit code; slinky is an interpreter.** Per the README,
+   ynnpack = subgraph API + kernels (no operator API); slinky runs the loops
+   "outside the microkernels"; "packing weights is handled by a subgraph node
+   (that may or may not get constant folded)."
+2. **The public API is opaque** (§3).
 
-1. **ynnpack does not emit code; slinky is an interpreter.** ynnpack ships
-   generated intrinsic-C++ kernels in `ynnpack/kernels/`; slinky is a runtime
-   that fuses/schedules loops across subgraph nodes and calls those kernels as
-   callbacks. ynnpack's "optimize" is graph optimization + kernel selection +
-   inserting nodes (e.g. **packing is a subgraph node**), not codegen. Per the
-   README, "most of the work that the operator API in XNNPACK performed has been
-   moved into subgraph nodes, e.g. packing weights is handled by a subgraph
-   node."
-2. **The ynnpack public API is opaque** (verified against
-   `ynnpack/include/ynnpack.h` at the pinned commit — see §3).
+## 3. The ynnpack layers we depend on (read from source)
 
-## 3. What the ynnpack public API exposes — and the constraint it imposes
+Public API (`ynnpack/include/ynnpack.h`): ~30 `ynn_define_*` ops;
+`ynn_optimize_subgraph` (status only, **no plan introspection**);
+`ynn_create_runtime/reshape/invoke`; `ynn_query_runtime` (only `concurrency`).
+No packing or codegen in the public API. So we reach to the **kernel layer**:
 
-From the pinned `ynnpack/include/ynnpack.h`:
+**Dot kernel ABI** — `ynnpack/kernels/dot/dot.h`:
+```cpp
+// C_out(i,j) = C_in(i,j) + sum_{k3,k2,k1} A(i,k3,k2,k1) * B(k3,k2,k1,j)
+typedef void (*dot_kernel_fn)(size_t m, size_t n, size_t k3, size_t k2, size_t k1,
+    size_t a_stride_m, size_t a_stride_k3, size_t a_stride_k2, const void* a,
+    size_t b_stride_k3, size_t b_stride_k2, size_t b_stride_k1, const void* b,
+    size_t c_in_stride_m, const void* c_in,
+    size_t c_out_stride_m, void* c_out);
+```
+K is split 3 ways (k3,k2,k1); `m ≤ block_m` (caller loops); B is **packed**;
+`c_in` is the accumulator/bias; **no activation/clamp in the kernel**. Some
+kernels set `dot_flag::transpose_a` (e.g. SME) requiring a transposed A layout.
 
-- **Graph builders:** ~30 `ynn_define_*` ops (`tensor, dot, reduce, unary,
-  binary, convert, quantize, dequantize, lut, stencil_copy, static_pad,
-  static_transpose, broadcast, concatenate, ...`).
-- **Optimize:** `ynn_optimize_subgraph(subgraph, threadpool, flags)` — status
-  only. **No introspection** of the chosen schedule/kernel/tiling.
-- **Runtime:** `ynn_create_runtime`, `ynn_reshape_runtime`, `ynn_invoke_runtime`,
-  `ynn_set_external_value_data`, `ynn_query_runtime` (only property:
-  `ynn_runtime_property_concurrency`).
-- **Packing:** none (it's a subgraph node, internal). **Codegen/JIT/LLVM:** none.
+**Selection** — `ynn::get_dot_kernel(const dot_type&, const dot_shape&,
+const dot_packed_shape*, uint32_t required_flags, optional<bool> transpose_a,
+uint64_t arch_flags)` returns:
+```cpp
+struct dot_kernel { dot_kernel_fn kernel; int block_m, block_n, block_k,
+                    tile_n, tile_k; uint32_t flags; float cost; };
+```
+`arch_flags` (`ynnpack/base/arch.h`: `arch_flag::{avx512f,fma3,avx2,amxbf16,
+amxint8,sme,sme2,…}`) constrains the choice to a target ISA — pass the XLA
+target's flags, not the host's.
 
-**Consequence:** the public API will not tell us which kernel/tiling it picked or
-give us IR. "Get the IR out of ynnpack" therefore means reaching to the kernel
-**sources** in `ynnpack/kernels/` and emitting the loop nest ourselves (the role
-slinky plays at runtime), with a small **fork-side hook** to recover ynnpack's
-own kernel/schedule selection (decided in §5.4).
+**Scheduling** — `ynnpack/kernels/dot/schedule.h` (header-only templates):
+`schedule_dot(cache_sizes, m, n, ks, block_m, block_n, block_k, …)` returns
+`dot_loop{dim∈{m,n,k}, blocks}`; `run_dot(...)` / `block_dot_{m,n,k}` drive the
+cache-blocked loop nest and chain `c_in→c_out` for split-K. This is ynnpack's
+*own* dot tiling (slinky only fuses across nodes).
+
+**Packing** — `ynnpack/kernels/dot/pack.{h,cc}`: `class packer(bool transpose,
+size_t elem_size_bits, size_t tile_m, size_t tile_n)` + `pack(m, n, in_stride,
+in, out_stride, out_block_stride, out)`. `packed(mi,ni,mo,no) =
+input(mo*tile_m+mi, no*tile_n+ni)`, padded to tiles.
+
+**Kernels are generated & per-arch** — `ynnpack/kernels/dot/kernels.inc`
+`#include`s generated `.inc` files (e.g. `x86_avx512_fp32.inc`, `x86_fma3_fp32.inc`)
+produced by `ynnpack/kernels/dot/generator/*.py` via `ynn_generate_srcs`, and
+compiled into `dot.cc` per-arch with `ynn_kernel_copts`. So one ISA tier =
+`dot.cc` built with one arch define (`YNN_ARCH_X86_AVX512`) + `-mavx512f`.
 
 ## 4. Target architecture
 
-Keep the front half (detection + the `__ynn_fusion` grouping). Replace the back
-half with an emitter that produces a fused LLVM kernel whose inner loops are
-ynnpack's kernels-as-IR, feeding XLA's existing JIT + kernel runtime.
-
 ```
 HLO fusion (__ynn_fusion)                         ← unchanged front half
-  │  ThunkEmitter: if microkernel-codegen enabled, route here ...
   ▼
 YnnKernelEmitter : KernelEmitter<LlvmKernelSource>    ← NEW
-  │  - EmitKernelPrototype() via KernelApiIrBuilder → XLA_CPU kernel ABI
-  │  - emit the loop nest (the role slinky plays at runtime), partitioned by
-  │    workgroup_id
-  │  - per tile: call the ynnpack kernel(s) (linked in from embedded bitcode),
-  │    then the fused elementwise epilogue in registers
-  │  - link kernel IR via CppGenIntrinsicLibrary, inline + specialize
-  │  - return KernelDefinition{ KernelSpec(name, NumWorkGroups, buffers),
-  │                             LlvmKernelSource(module) }
+  - EmitKernelPrototype() via KernelApiIrBuilder → XLA_CPU kernel ABI
+  - select kernel: ynn::get_dot_kernel(type, shape, arch_flags) → block/tile/sym
+  - pack constant B at compile time (ynn::packer) → baked constant
+  - emit the schedule.h loop nest (or call run_dot), partitioned by workgroup_id;
+    per block call the dot kernel (bias via c_in), then the fused elementwise
+    epilogue in registers
+  - link the dot-kernel bitcode (CppGenIntrinsicLibrary), inline + specialize
+  - return KernelDefinition{ KernelSpec, LlvmKernelSource }
   ▼
-JitCompiler (+ IrCompiler: opt level, target features, fast-math)
-  │  → ObjectLoader → CompiledFunctionLibrary (symbol → XLA_CPU_Kernel*)
-  ▼
-KernelThunk (Thunk::Kind::kKernel)                ← reuses XLA's kernel runtime
-  ▼
-results
+JitCompiler (IrCompiler: opt/target/fast-math) → KernelThunk (Eigen workgroups)
 ```
+Everything from `JitCompiler` down already exists (`DotKernelEmitter` /
+`ElementalKernelEmitter` use it). The genuinely new work is **reproducing the
+loop nest slinky+schedule.h produce at runtime** — trivial for one dot
+(`schedule.h` is reusable header-only code), harder for fused subgraphs (the impl
+slice starts with one dot, falls back otherwise).
 
-Everything from `JitCompiler` down already exists and is what
-`DotKernelEmitter`/`ElementalKernelEmitter` use. New surface = `YnnKernelEmitter`
-+ the ynnpack-kernel bitcode targets (§5). Anything not covered falls back to
-`YnnFusionThunk`, so rollout is incremental and reversible. The kernel ABI
-(`KernelApiIrBuilder::EmitKernelPrototype`) and workgroup-grid parallelism
-(`NumWorkGroups`, as in `DotKernelEmitter`) are reused unchanged.
+## 5. The core plan
 
-The genuinely new responsibility is **emitting the loop nest that slinky
-computes at runtime** (bounds, tiling, the order kernels are called). For a
-single dot this is a simple M/N/K nest; general fused subgraphs would need to
-reproduce more of slinky's fusion/tiling, which is why the slice (impl doc)
-starts with one dot and falls back otherwise.
+### 5.1 Reuse the in-tree extract→embed→link machinery
+`cc_ir_header` (`xla/codegen/intrinsic/cpp/cc_to_llvm_ir.bzl`) compiles a TU with
+`-emit-llvm -O3 …` and embeds the `.llvmbc` as `inline const std::string k<Name>Ir`;
+`CppGenIntrinsicLibrary::LinkIntoModule` links it into the kernel module with
+`InternalLinkage + AlwaysInline`; `IrCompiler` inlines + specializes. We add a
+`cc_ir_header` target that builds the ynnpack `dot.cc` for one ISA tier (§3,
+generated sources + `ynn_kernel_copts` + arch define).
 
-## 5. The core plan: extract ynnpack kernels as IR and stitch them
+### 5.2 Variant count: bounded ISA tiers, runtime-selected
+ynnpack already compiles per-arch; we mirror the Eigen precedent (ship a few
+tiers, select at runtime by `TargetMachineFeatures`, as `GetCppGenIrString`
+does). The compiled kernel keeps only the selected symbol (linker pulls only
+referenced functions). For AOT, embed only the target tier.
 
-### 5.1 Reuse the existing extract→embed→link machinery
-XLA already compiles C++ to embedded LLVM IR and links it into JIT modules for
-intrinsics. ynnpack kernels are generated intrinsic-C++, so the same path works:
+### 5.3 Selection: a ynnpack fork hook (decided, now concrete)
+`get_dot_kernel` returns a function *pointer*, but codegen needs the kernel's
+**symbol name** to declare + link. Minimal fork patch: add `const char* name;`
+to `struct dot_kernel` (populated from the `YNN_DOT_KERNEL` macro / generator)
+so XLA can call `ynn::get_dot_kernel(...)` at compile time and learn the symbol
++ `block_*`/`tile_*` to emit against. (Until then, a slice can hardcode one
+kernel symbol — §5.5.)
 
-- **Build:** `cc_ir_header` (`xla/codegen/intrinsic/cpp/cc_to_llvm_ir.bzl`)
-  compiles a `.cc`/`.c` with `-emit-llvm -O3 -mprefer-vector-width=… [-m<isa>]`,
-  extracts `.llvmbc`, and embeds it as `inline const std::string k<Name>Ir` via
-  the `embed_bitcode` tool + `//xla/util:embedded_constant_buffers`. We add
-  `cc_ir_header` targets for the ynnpack kernel TUs from `ynnpack/kernels/`
-  (e.g. `ynnpack/kernels/dot/…`). **Generated in-build, never checked in.**
-- **Consume:** `CppGenIntrinsicLibrary::LinkIntoModule(dst)` parses the embedded
-  bitcode, sets the host datalayout, links into the kernel module, and marks each
-  linked def `InternalLinkage + AlwaysInline`. `GetCppGenFunction(module, name)`
-  fetches a kernel for inlining; empty-bitcode guards fall back. (All in
-  `xla/codegen/intrinsic/cpp/cpp_gen_intrinsics.{h,cc}`.)
-- **Specialize:** `IrCompiler`'s pipeline inlines the kernel into the driver,
-  constant-folds dims, unrolls, **fuses the epilogue into the kernel's store**,
-  vectorizes, emits the object.
-
-Because ynnpack kernels are generated intrinsic-C++ (not hand asm), the
-"can't lift assembly" problem that dogs classic XNNPACK is largely absent here.
-For any kernel that is *not* available as liftable IR, an **extern call** to a
-precompiled ynnpack kernel from the same driver is a fallback tier (XLA already
-does this shape for the `kEigen` dot strategy): it keeps the optimized driver +
-`KernelThunk` runtime but, being an opaque call, gives no epilogue fusion or
-constant-prop. Inline-asm would only elide the (amortized, negligible) call and
-stays equally opaque, so it is not worth it.
-
-### 5.2 The variant-count question: bounded ISA tiers, runtime-selected
-For Eigen unary, XLA ships **two** tiers (`eigen_unary_32_ll` 256-bit,
-`eigen_unary_64_ll` AVX-512) and `GetCppGenIrString(options)` picks one **at
-runtime from the JIT target's features**. We do the same: embed a **small set of
-ISA tiers** of the ynnpack kernel (not a blob per micro-arch) and select by
-`TargetMachineFeatures`. The compiled kernel contains only the selected one (the
-linker pulls only referenced symbols). For AOT, embed only the target tier.
-
-### 5.3 Open decision: which ynnpack kernel form to feed `cc_ir_header`?
-ynnpack kernels are generated; pick the granularity:
-- **(I) ISA-specialized intrinsic kernels** (the tuned `ynnpack/kernels/dot`
-  variants) → one bitcode per ISA tier; preserves the tuning; variant count =
-  tiers × kernels.
-- **(P) A portable/scalar generated variant** → 1–2 tiers, lean on LLVM to
-  vectorize; bounded but less tuned.
-Recommendation: **(I)** for x86 AVX-512 `f32` dot first.
-
-### 5.4 Selection: a ynnpack fork hook (decided)
-The public API won't reveal ynnpack's choice (§3). Add a small hook to the
-ynnpack fork that, given a node + target, returns the chosen kernel **identity**
-— the `ynnpack/kernels/` symbol, its tile/blocking params, required ISA tier,
-and the associated packing-node kernel. XLA maps the ISA tier → embedded bitcode
-variant (à la `GetCppGenIrString`) and links that symbol.
+### 5.4 Reuse vs re-emit the schedule
+Two ways to get the loop nest:
+- **(reuse)** compile a thin driver TU that calls `ynn::schedule_dot` +
+  `ynn::run_dot` with the selected kernel, and extract *that* (driver + kernel)
+  as one bitcode blob via `cc_ir_header`; XLA wraps it with the kernel ABI
+  prototype + workgroup partition + epilogue. Maximizes reuse of ynnpack's
+  tiling.
+- **(re-emit)** emit the `block_dot_{m,n,k}` blocking directly in LLVM IR for
+  finer control / fusion. More work.
+Recommend **reuse** first.
 
 ### 5.5 Option A (XLA emits its own microkernel) — fallback only
-Have XLA write the dot microkernel itself in IR (extend `tiled_dot_emitter`/
-`VectorIrBuilder`). Kept only as a fallback where a ynnpack kernel can't be
-extracted, since alone it doesn't deliver ynnpack's tuned performance.
+Extend `tiled_dot_emitter`/`VectorIrBuilder`; kept only where a ynnpack kernel
+can't be extracted. Doesn't deliver ynnpack's tuning.
 
-### 5.6 Honest gaps / things to read from ynnpack source
-These were **not** verifiable remotely; the implementer must read them from the
-ynnpack checkout (`ynnpack/kernels/`, `ynnpack/subgraph/`):
-- **Kernel ABI.** ynnpack kernels may take raw pointer+stride+tile-dim args, or
-  slinky-style buffer descriptors (slinky calls kernels as buffer callbacks).
-  This determines what the driver must construct per call. Read
-  `ynnpack/kernels/dot/` (and the "headers describing the kernels" the README
-  mentions) to get the exact signature and symbol naming.
-- **Packing.** Packing is a subgraph node, not a public API. For constant
-  weights, replicate/extract that node's kernel to prepack at compile time; read
-  `ynnpack/subgraph/` for the pack node and which `ynnpack/kernels/` kernel it
-  uses.
-- **Loop structure.** XLA must emit the loop nest slinky would compute. Trivial
-  for one dot; broader subgraphs need more of slinky's fusion/tiling logic.
+### 5.6 Honest gaps (now small)
+- **Reproducing slinky's cross-node schedule** for fused subgraphs (one dot is
+  fine via `schedule.h`).
+- **A-transpose kernels** (`dot_flag::transpose_a`, e.g. SME) need a transposed A
+  layout — restrict the slice to non-transpose kernels (x86 f32 AVX-512).
+- **Generated-source build wiring** into `cc_ir_header` (the main build task).
+- *(was a worry, now minor)* **asm** — f32 x86 dot kernels are generated AVX-512
+  intrinsics (liftable); only exotic paths (some AMX/SME) might not be, and those
+  use the extern-call fallback.
 
 ## 6. LLVM version: no pinning, by construction
-`cc_ir_header` compiles with the build's own clang/LLVM and embeds the result;
-`LinkIntoModule` links it into the JIT module built by the same LLVM. Since the
-bitcode is regenerated every build (never checked in), the embedded IR always
-matches the LLVM the JIT links — nothing to pin. The Eigen/tanh precedent works
-exactly this way today.
+`cc_ir_header` compiles with the build's clang and embeds the result;
+`LinkIntoModule` links into the JIT module built by the same LLVM; bitcode is
+regenerated every build (never checked in). Nothing to pin — the tanh/Eigen
+precedent works this way today.
 
 ## 7. Supporting design points
 
-### 7.1 Epilogue / prologue fusion (the main payoff)
-`__ynn_fusion` already groups the contraction with its elementwise neighbors in
-one HLO computation. Once the dot kernel is inlined IR, emit the elementwise
-chain on the output tile (via ynnpack's unary/binary kernels inlined the same
-way, or XLA's `CpuElementalIrEmitter` generators) before the store; LLVM fuses
-it into the kernel's epilogue.
+### 7.1 Epilogue / bias fusion (clean here)
+- **Bias** is `c_in` to the dot kernel (`C_out = C_in + A·B`) — pass the bias
+  buffer (or zero) as `c_in`; no separate pass.
+- **Activation/clamp/other elementwise** are separate nodes today; with the dot
+  kernel inlined, emit them on the `c_out` tile (ynnpack `kernels/elementwise`
+  inlined the same way, or XLA `CpuElementalIrEmitter`) before the store. LLVM
+  fuses them in.
 
-### 7.2 Packing (a ynnpack subgraph node)
-Packing weights is a ynnpack subgraph node, so there is no public pack call.
-- **Constant weights:** run the packing node's kernel at compile time (extracted
-  as bitcode or replicated) to materialize a packed constant; the dot kernel
-  reads it directly. No per-call repack.
-- **Non-constant operands:** emit a prologue pack stage, or gate to
-  `YnnFusionThunk` first.
+### 7.2 Packing (ynn::packer at compile time)
+For constant B, call `ynn::packer(transpose=false, elem_bits=32, tile_m, tile_n)`
++ `pack(...)` at emit time (ynnpack is linked into XLA) with the kernel's
+`tile_n`/`tile_k` (and `dot_packed_shape`), materialize the packed bytes as a
+constant the kernel reads. Non-constant B → prologue pack or fall back.
 
 ### 7.3 Selection, gating, fallback
-- Reuse `YnnMatcher`/`ynn_support` for *what* fuses, unchanged.
-- Add a flag (e.g. `xla_cpu_experimental_ynn_codegen`) selecting runtime vs
-  codegen per fusion type; default off.
-- Emitter returns `absl::Status`; on any unsupported construct **fall back to
-  `YnnFusionThunk`**. Both thunks coexist.
+Reuse `YnnMatcher`/`ynn_support` for *what* fuses. Add a default-off flag
+(`xla_cpu_experimental_ynn_codegen`). Emitter returns `absl::Status`; on anything
+unsupported **fall back to `YnnFusionThunk`**.
 
-### 7.4 Dynamic shapes
-Single fused static kernel assumes compile-time shapes (the common case).
-Otherwise emit runtime loop bounds (less unrolling) or fall back initially.
-
-### 7.5 Threading
-Drop `SlinkyThreadPool` from the hot path; parallelism is the `KernelThunk`
-workgroup launch over the Eigen pool. The driver picks a workgroup partition over
-output tiles (mirrors slinky's parallel dim). Keep the slinky shim only for
-fallback fusions.
+### 7.4 Dynamic shapes / 7.5 Threading
+Static shapes first (else runtime bounds or fall back). Drop `SlinkyThreadPool`
+from the hot path; parallelism = `KernelThunk` workgroups over output tiles
+(mirrors `schedule.h`'s outer loop); keep slinky only for fallback fusions.
 
 ## 8. Phasing
 
-1. **Skeleton + fallback.** `YnnKernelEmitter` wired end-to-end on a naive XLA-
-   emitted `f32` matmul (no ynnpack kernel yet) behind a default-off flag;
-   route in `ThunkEmitter`; everything else falls back. Validates the
-   emitter→JIT→`KernelThunk` seam.
-2. **ynnpack dot kernel.** Extract the `ynnpack/kernels/dot` intrinsic-C++ kernel
-   for x86 AVX-512 as bitcode; inline it into the driver; constant-weight pack at
-   compile time.
-3. **Epilogue fusion.** Fold elementwise neighbors onto the tile; add bf16.
-4. **Selection hook + tiers.** Add the ynnpack fork hook (§5.4); add an AVX2/256
-   tier; runtime tier selection.
-5. **Coverage / fidelity.** reduce/conv via the corresponding `ynnpack/kernels/`;
-   non-constant packing; expose tiles to `LlvmKernelAutotuner`.
+1. **Seam.** `YnnKernelEmitter` end-to-end on a naive XLA-emitted `f32` matmul
+   (no ynnpack kernel), default-off flag, route in `ThunkEmitter`, else fall
+   back. Validates emitter→JIT→`KernelThunk`.
+2. **ynnpack dot kernel.** `cc_ir_header` for x86 AVX-512 `f32` `dot.cc`; select
+   via `get_dot_kernel`; pack constant B with `ynn::packer`; drive via `run_dot`
+   (reuse) or emitted blocking; inline.
+3. **Epilogue fusion.** bias via `c_in`; fold elementwise neighbors; add bf16.
+4. **Fork hook + tiers.** add `dot_kernel.name`; AVX2/FMA3 tiers; runtime select.
+5. **Coverage.** reduce/conv via the corresponding `ynnpack/kernels/`; SME (with
+   A-transpose); autotuning.
 
 ## 9. Risks / open questions
-
-- **ynnpack kernel ABI + loop structure (§5.6).** Must be read from source;
-  shapes the driver. Biggest unknown.
-- **Reproducing slinky's schedule.** Easy for one dot; harder for fused
-  subgraphs — bounds the near-term scope.
-- **Fork hook maintenance (§5.4).**
-- **Packing (§7.2).** Replicating/extracting the pack node correctly.
-- **Build complexity.** Getting ynnpack kernel TUs to emit clean bitcode through
-  `cc_ir_header` (include paths, generated-source config).
-- *(Resolved)* **LLVM pinning** — eliminated by in-build bitcode (§6).
-- *(Largely moot for ynnpack)* **asm lifting** — kernels are generated
-  intrinsic-C++; extern-call is the fallback for any non-liftable kernel (§5.1).
+- **Reproducing slinky's schedule** for fused subgraphs (bounds near-term scope).
+- **Generated-source → cc_ir_header** build wiring (main build task).
+- **Fork hook** maintenance (tiny: expose the symbol name).
+- **A-transpose kernels** (avoid in the slice).
+- *(Resolved)* LLVM pinning; *(minor for ynnpack)* asm.
 
 ## 10. Decisions needed
+1. **Schedule strategy (§5.4):** reuse `run_dot` (recommended) vs re-emit
+   blocking in IR.
+2. **First tier + op:** x86 AVX-512 `f32` dot (recommended).
+3. **Scope:** design only vs land the Phase-1/2 slice.
 
-1. **Kernel form (§5.3):** ISA-specialized intrinsic ynnpack kernels (tuned,
-   more variants) vs a portable variant (bounded, less tuned). Rec: intrinsic,
-   x86 AVX-512 `f32` dot first.
-2. **First target tier + op** for Phase 2 (rec: x86 AVX-512 `f32` dot).
-3. **Scope:** design only, or land the Phase-1 slice (build/benchmark in a full
-   env, not this session).
-
-*Decided:* runtime model = `KernelThunk` (not slinky); selection = ynnpack fork
-hook (§5.4); microkernel source = ynnpack's own kernels (`ynnpack/kernels/`),
-**not** classic XNNPACK.
+*Decided:* runtime = `KernelThunk`; selection = ynnpack fork hook exposing the
+kernel symbol (§5.3); kernel source = ynnpack's own `ynnpack/kernels/`, not
+classic XNNPACK.
