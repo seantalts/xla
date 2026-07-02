@@ -194,6 +194,7 @@ limitations under the License.
 #include "xla/service/cpu/metrics.h"
 #include "xla/service/cpu/parallel_task_assignment.h"
 #include "xla/service/cpu/small_region_hoisting_pass.h"
+#include "xla/service/cpu/small_scatter_expander.h"
 #include "xla/service/cpu/small_while_loop_hoisting_pass.h"
 #include "xla/service/cpu/thunk_emitter.h"
 #include "xla/service/cpu_gpu_shape_verifier.h"
@@ -926,6 +927,23 @@ absl::Status CpuCompiler::RunHloPassesThroughLayoutAssn(
   }
   if (!use_fusion_emitters || !kFusionEmitterScatterEnabled) {
     pipeline.AddPass<ScatterExpander>(ScatterExpander::kEliminateAllScatters);
+  }
+  if (use_fusion_emitters && kFusionEmitterScatterEnabled) {
+    // Small scatters fragment hoistable regions: SmallRegionHoistingPass
+    // treats scatter as a region boundary (the legacy kernel emitter cannot
+    // emit it), so scatter-heavy small models shatter into many per-thunk
+    // regions. Expand scatters below the region byte gate into
+    // while+gather+DUS loops -- the expanded loops are themselves region
+    // eligible, so region hoisting can fold them (and their surroundings)
+    // into single kernels. Same option, sentinel-0 disable, and 64KB floor
+    // as the SmallRegionHoistingPass gate below.
+    ASSIGN_OR_RETURN(
+        int64_t small_scatter_byte_threshold,
+        xla::cpu::options::SmallWhileLoopByteThreshold(module->config()));
+    if (small_scatter_byte_threshold != 0) {
+      pipeline.AddPass<SmallScatterExpander>(
+          std::max<int64_t>(small_scatter_byte_threshold, int64_t{1} << 16));
+    }
   }
 
   pipeline.AddPass(CreateSimplificationPipeline(

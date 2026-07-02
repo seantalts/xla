@@ -148,6 +148,7 @@ cc_library(
         ":metrics",
         ":parallel_task_assignment",
         ":small_region_hoisting_pass",
+        ":small_scatter_expander",
         ":small_while_loop_hoisting_pass",
         ":thunk_emitter",
         "//xla:debug_options_flags",
@@ -1728,6 +1729,33 @@ xla_cc_test(
         "//xla/hlo/testlib:test",
         "//xla/tsl/platform:statusor",
         "@com_google_absl//absl/algorithm:container",
+        "@com_google_absl//absl/status:statusor",
+        "@com_google_absl//absl/strings:string_view",
+        "@com_google_googletest//:gtest_main",
+    ],
+)
+
+cc_library(
+    name = "small_scatter_expander",
+    srcs = ["small_scatter_expander.cc"],
+    hdrs = ["small_scatter_expander.h"],
+    deps = [
+        "//xla:shape_util",
+        "//xla/hlo/ir:hlo",
+        "//xla/service:scatter_expander",
+        "@com_google_absl//absl/strings:string_view",
+    ],
+)
+
+xla_cc_test(
+    name = "small_scatter_expander_test",
+    srcs = ["small_scatter_expander_test.cc"],
+    deps = [
+        ":small_scatter_expander",
+        "//xla/hlo/ir:hlo",
+        "//xla/hlo/testlib:hlo_hardware_independent_test_base",
+        "//xla/hlo/testlib:test",
+        "//xla/tsl/platform:statusor",
         "@com_google_absl//absl/status:statusor",
         "@com_google_absl//absl/strings:string_view",
         "@com_google_googletest//:gtest_main",
