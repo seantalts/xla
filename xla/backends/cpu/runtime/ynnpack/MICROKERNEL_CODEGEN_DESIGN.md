@@ -135,6 +135,30 @@ tiers, select at runtime by `TargetMachineFeatures`, as `GetCppGenIrString`
 does). The compiled kernel keeps only the selected symbol (linker pulls only
 referenced functions). For AOT, embed only the target tier.
 
+**How many tiers?** The cost of an extra tier is *binary size only* — at runtime
+the linker pulls just the one selected kernel, and AOT embeds only the target
+tier. So the question is "smallest set that covers the hardware without leaving
+tuned performance on the table." For the `f32` dot, ynnpack's x86 kernel ladder
+(from `kernels.inc`) is SSE2 → AVX → FMA3 → AVX-512, and ARM is NEON → SME/SME2.
+A good starting set — mirroring the 2-tier Eigen precedent, plus ARM:
+
+| Tier | `arch_flags` | Covers | Notes |
+|---|---|---|---|
+| **AVX-512** | `avx512f\|bw\|vl\|dq` | Skylake-SP+, Zen4+ (cloud servers) | top x86 `f32` tier; the big win |
+| **AVX2+FMA3** | `avx2\|fma3` | Haswell..client, Zen1-3, no-AVX512 | broad x86 tier (ynnpack `f32` dot uses **FMA3**, not plain AVX2) |
+| **NEON** | `neon` | ARM (Graviton, Apple, mobile) | broad ARM tier |
+
+So **3 tiers (AVX-512, AVX2+FMA3, NEON)** is "pretty good" — it covers the bulk
+of deployments. Refinement vs the intuitive "avx2/avx512/neon": the useful x86
+*middle* tier for `f32` dot is **FMA3** (implies AVX2 on all real CPUs), not
+plain AVX2. Add the **tuned extremes only when you expand past `f32`**: **AMX**
+(x86 `bf16`/`int8`; not applicable to `f32`) and **SME/SME2** (ARM; needs the
+`dot_flag::transpose_a` path, §5.6). Skip SSE2/AVX baseline and WASM/Hexagon
+unless a target demands them — fall back to `YnnFusionThunk` / the existing XLA
+dot for anything below the lowest tier. Selection dispatch and the `arch_flags`
+passed to `get_dot_kernel` must agree (pick the tier from `TargetMachineFeatures`,
+then select a kernel constrained to that tier's flags).
+
 ### 5.3 Selection: a ynnpack fork hook (decided, now concrete)
 `get_dot_kernel` returns a function *pointer*, but codegen needs the kernel's
 **symbol name** to declare + link. Minimal fork patch: add `const char* name;`
@@ -229,3 +253,34 @@ from the hot path; parallelism = `KernelThunk` workgroups over output tiles
 *Decided:* runtime = `KernelThunk`; selection = ynnpack fork hook exposing the
 kernel symbol (§5.3); kernel source = ynnpack's own `ynnpack/kernels/`, not
 classic XNNPACK.
+
+## 11. Alternatives considered
+
+### 11.1 Have ynnpack emit LLVM IR at XLA JIT time (rejected for now)
+Rather than extracting kernel bitcode at build time (`cc_ir_header`), could we
+call ynnpack at JIT time to *generate* IR specialized to the exact shape/target?
+Split into two parts:
+
+- **Planning is already JIT-time.** `get_dot_kernel`, `schedule_dot`, and
+  `ynn::packer` are plain C++ linked into XLA; the emitter calls them at
+  JIT/compile time with the exact shape + target, so kernel choice, tiling, and
+  packed layout are already specialized at runtime. This is the valuable,
+  cheap part and we keep it.
+- **Body generation is not available.** ynnpack has **no LLVM-IR emitter** — it
+  generates *C++ source* at build time (C++ templates, a python dot generator,
+  and an "elementwise compiler" that emits C++ with SIMD intrinsics). Getting IR
+  from that at runtime would need either (a) a C++ frontend in the XLA runtime
+  (XLA's JIT compiles IR→machine code, not C++→IR; embedding clang is enormous),
+  or (b) a new `llvm::IRBuilder` backend inside ynnpack — the heaviest option,
+  with LLVM-version coupling. If ever pursued, the elementwise compiler is the
+  most amenable to an IR backend (it is already a python→C++ translation); the
+  AMX/SME C++ template kernels are the least.
+
+**What we do instead** (§5.1): build-time bitcode as a *template*, JIT-time
+specialization by LLVM. The emitter calls the ynnpack planner at JIT time, emits
+the driver with the resulting shapes/strides/tiles as compile-time **constants**,
+links the (alwaysinline) kernel bitcode, and lets `IrCompiler`'s inliner + SCCP +
+unroller produce the specialized instance — per-shape "generated" IR without a
+runtime compiler. The only thing this cannot do that a true runtime generator
+could is invent a *new* tile shape / intrinsic sequence outside the build-time
+catalog, which is a discrete space best baked at build time anyway.
