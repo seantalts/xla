@@ -142,16 +142,19 @@ tuned performance on the table." For the `f32` dot, ynnpack's x86 kernel ladder
 (from `kernels.inc`) is SSE2 → AVX → FMA3 → AVX-512, and ARM is NEON → SME/SME2.
 A good starting set — mirroring the 2-tier Eigen precedent, plus ARM:
 
-| Tier | `arch_flags` | Covers | Notes |
+| Tier | `arch_flags` | Compiled with (`build_defs.bzl`) | Covers |
 |---|---|---|---|
-| **AVX-512** | `avx512f\|bw\|vl\|dq` | Skylake-SP+, Zen4+ (cloud servers) | top x86 `f32` tier; the big win |
-| **AVX2+FMA3** | `avx2\|fma3` | Haswell..client, Zen1-3, no-AVX512 | broad x86 tier (ynnpack `f32` dot uses **FMA3**, not plain AVX2) |
-| **NEON** | `neon` | ARM (Graviton, Apple, mobile) | broad ARM tier |
+| **AVX-512** | composite `avx512` (`avx512f\|bw\|vl\|dq`) | `-mavx512f -mavx512bw -mavx512vl -mavx512dq` | Skylake-SP+, Zen4+ (cloud servers); the big win |
+| **FMA3** | `fma3` | `-mavx -mfma -mno-avx2` | Haswell→client, Zen1-3, even AVX2-less AMD Piledriver — everything x86 below AVX-512 |
+| **NEON** | `neon` | *(baseline arm64)* | ARM (Graviton, Apple, mobile) |
 
-So **3 tiers (AVX-512, AVX2+FMA3, NEON)** is "pretty good" — it covers the bulk
-of deployments. Refinement vs the intuitive "avx2/avx512/neon": the useful x86
-*middle* tier for `f32` dot is **FMA3** (implies AVX2 on all real CPUs), not
-plain AVX2. Add the **tuned extremes only when you expand past `f32`**: **AMX**
+So **3 tiers (AVX-512, FMA3, NEON)** is "pretty good" — it covers the bulk
+of deployments. Refinement vs the intuitive "avx2/avx512/neon": ynnpack's x86
+`f32` middle tier is literally **`fma3`**, compiled as AVX+FMA with AVX2
+*disabled* (`generator/x86_fp32.py` class `x86_fma3_fp32`; runtime detection is
+just `cpuinfo_has_x86_fma3()` in `base/arch.cc`) — so it reaches *below* AVX2
+rather than requiring it. Add the **tuned extremes only when you expand past
+`f32`**: **AMX**
 (x86 `bf16`/`int8`; not applicable to `f32`) and **SME/SME2** (ARM; needs the
 `dot_flag::transpose_a` path, §5.6). Skip SSE2/AVX baseline and WASM/Hexagon
 unless a target demands them — fall back to `YnnFusionThunk` / the existing XLA
@@ -159,13 +162,25 @@ dot for anything below the lowest tier. Selection dispatch and the `arch_flags`
 passed to `get_dot_kernel` must agree (pick the tier from `TargetMachineFeatures`,
 then select a kernel constrained to that tier's flags).
 
-### 5.3 Selection: a ynnpack fork hook (decided, now concrete)
+### 5.3 Selection: symbol names come for free (fork hook now optional)
 `get_dot_kernel` returns a function *pointer*, but codegen needs the kernel's
-**symbol name** to declare + link. Minimal fork patch: add `const char* name;`
-to `struct dot_kernel` (populated from the `YNN_DOT_KERNEL` macro / generator)
-so XLA can call `ynn::get_dot_kernel(...)` at compile time and learn the symbol
-+ `block_*`/`tile_*` to emit against. (Until then, a slice can hardcode one
-kernel symbol — §5.5.)
+**symbol name** to declare + link. Reading the generator resolved this without
+a fork: every kernel is named deterministically
+(`generator/dot_base.py generate_dot`)
+
+```
+ynn::dot_{kind}_{block_m}x{block_n}x{block_k}_{tile_m}x{tile_n}x{tile_k}_{arch}
+```
+
+e.g. `ynn::dot_fp32_5x64x1_1x16x1_avx512`. The returned `dot_kernel` struct
+carries `block_*`/`tile_n`/`tile_k`; `tile_m = 1` for every non-`transpose_a`
+f32 kernel; `kind`/`arch` are known from the `dot_type` and the tier's
+`arch_flags` XLA itself passes. So the emitter reconstructs the symbol from
+the selection result alone. The fork hook (add `const char* name;` to
+`struct dot_kernel`) is demoted to an optional hardening patch — it would
+survive upstream renames of the naming scheme, and it's nearly free because
+`get_dot_kernel`'s optimizer already tracks each candidate's name for debug
+logging (`kernel_used` in `kernels/dot/dot.cc`); the patch just exposes it.
 
 ### 5.4 Reuse vs re-emit the schedule
 Two ways to get the loop nest:
@@ -187,7 +202,11 @@ can't be extracted. Doesn't deliver ynnpack's tuning.
   fine via `schedule.h`).
 - **A-transpose kernels** (`dot_flag::transpose_a`, e.g. SME) need a transposed A
   layout — restrict the slice to non-transpose kernels (x86 f32 AVX-512).
-- **Generated-source build wiring** into `cc_ir_header` (the main build task).
+- *(was the main build task, now resolved)* **Generated-source build wiring**:
+  the `ynn_generate_srcs` genrule outputs (e.g. `x86_avx512_fp32.cc`) are
+  self-contained (only `<immintrin.h>` + std headers, no `#if` guards for x86
+  f32), so `cc_ir_header` compiles them directly; what remains is a one-line
+  visibility `patch_file` on `@XNNPACK` (impl guide §7.4).
 - *(was a worry, now minor)* **asm** — f32 x86 dot kernels are generated AVX-512
   intrinsics (liftable); only exotic paths (some AMX/SME) might not be, and those
   use the extern-call fallback.
@@ -201,18 +220,28 @@ precedent works this way today.
 ## 7. Supporting design points
 
 ### 7.1 Epilogue / bias fusion (clean here)
-- **Bias** is `c_in` to the dot kernel (`C_out = C_in + A·B`) — pass the bias
-  buffer (or zero) as `c_in`; no separate pass.
+- **Bias** is `c_in` to the dot kernel (`C_out = C_in + A·B`), and the
+  generated kernels make this free: accumulators are zero-initialized in
+  registers and `C_in` is added at store time inside an `if (C_in)` guard
+  (`generator/dot_base.py`). No bias → `c_in = null` (natively supported);
+  bias `[N]` → pass the bias buffer with `c_in_stride_m = 0` (row-broadcast);
+  full `(M,N)` addend → normal strides. No zero buffer, no separate pass.
 - **Activation/clamp/other elementwise** are separate nodes today; with the dot
   kernel inlined, emit them on the `c_out` tile (ynnpack `kernels/elementwise`
   inlined the same way, or XLA `CpuElementalIrEmitter`) before the store. LLVM
   fuses them in.
 
 ### 7.2 Packing (ynn::packer at compile time)
-For constant B, call `ynn::packer(transpose=false, elem_bits=32, tile_m, tile_n)`
-+ `pack(...)` at emit time (ynnpack is linked into XLA) with the kernel's
-`tile_n`/`tile_k` (and `dot_packed_shape`), materialize the packed bytes as a
-constant the kernel reads. Non-constant B → prologue pack or fall back.
+For constant B, call `ynn::packer(transpose=false, elem_bits=32,
+/*tile_m=*/tile_k, /*tile_n=*/block_n)` + `pack(...)` at emit time (ynnpack is
+linked into XLA), exactly as the subgraph's pack node does
+(`subgraph/dot.cc:417`), and materialize the packed bytes as an LLVM constant.
+Layout: `packed(ki, ni, ko, no) = B(ko*tile_k+ki, no*block_n+ni)`, size
+`roundup(K,tile_k) × roundup(N,block_n)` floats. A useful degenerate case: all
+x86/NEON f32 dot kernels have **`tile_k = 1`**, so requesting
+`dot_packed_shape{block_n, 1}` gives no K-interleave, no K-tail, and packing =
+"column-block + zero-pad N". Full formulas and strides are in the
+implementation guide §7.3. Non-constant B → prologue pack or fall back.
 
 ### 7.3 Selection, gating, fallback
 Reuse `YnnMatcher`/`ynn_support` for *what* fuses. Add a default-off flag
@@ -233,16 +262,19 @@ from the hot path; parallelism = `KernelThunk` workgroups over output tiles
    via `get_dot_kernel`; pack constant B with `ynn::packer`; drive via `run_dot`
    (reuse) or emitted blocking; inline.
 3. **Epilogue fusion.** bias via `c_in`; fold elementwise neighbors; add bf16.
-4. **Fork hook + tiers.** add `dot_kernel.name`; AVX2/FMA3 tiers; runtime select.
+4. **Tiers.** fma3 + NEON bitcode targets; runtime select (`GetCppGenIrString`
+   pattern); optional `dot_kernel.name` fork hook for hardening.
 5. **Coverage.** reduce/conv via the corresponding `ynnpack/kernels/`; SME (with
    A-transpose); autotuning.
 
 ## 9. Risks / open questions
 - **Reproducing slinky's schedule** for fused subgraphs (bounds near-term scope).
-- **Generated-source → cc_ir_header** build wiring (main build task).
-- **Fork hook** maintenance (tiny: expose the symbol name).
+- **Symbol-name formula stability** across ynnpack updates (mitigation: the
+  optional `dot_kernel.name` fork hook, §5.3; a build-time check that each
+  reconstructed symbol exists in the embedded bitcode catches drift).
 - **A-transpose kernels** (avoid in the slice).
-- *(Resolved)* LLVM pinning; *(minor for ynnpack)* asm.
+- *(Resolved)* LLVM pinning; generated-source → `cc_ir_header` wiring
+  (self-contained sources + visibility patch); *(minor for ynnpack)* asm.
 
 ## 10. Decisions needed
 1. **Schedule strategy (§5.4):** reuse `run_dot` (recommended) vs re-emit
@@ -250,9 +282,10 @@ from the hot path; parallelism = `KernelThunk` workgroups over output tiles
 2. **First tier + op:** x86 AVX-512 `f32` dot (recommended).
 3. **Scope:** design only vs land the Phase-1/2 slice.
 
-*Decided:* runtime = `KernelThunk`; selection = ynnpack fork hook exposing the
-kernel symbol (§5.3); kernel source = ynnpack's own `ynnpack/kernels/`, not
-classic XNNPACK.
+*Decided:* runtime = `KernelThunk`; selection = `get_dot_kernel` at compile
+time + symbol reconstruction from the generator's naming formula (fork hook
+optional, §5.3); kernel source = ynnpack's own `ynnpack/kernels/`, not classic
+XNNPACK.
 
 ## 11. Alternatives considered
 
