@@ -53,9 +53,19 @@ Upstream as a replacement for `SmallWhileLoopHoistingPass`, which it strictly ge
 
 ## Alternatives considered
 
+Strategy:
+
 - Faster thunk dispatch: already ~18 ns; ceiling ~10% on the affected models.
 - Bigger fusions instead of regions: fusion cannot cross control flow or multi-output boundaries, which is exactly where the cost lives; and measured intra-kernel gains at these sizes are ~1%.
 - Tiled/MLIR region emission as the v1 backend: built behind a flag, measured neutral at small sizes; kept as the long-term backend, not a v1 dependency.
+
+Implementation:
+
+- **Extend `SmallWhileLoopHoistingPass` in place.** The while pass is an instruction matcher: find a small while, outline it. Region formation is a schedule partitioner with liveness-derived interfaces, a different skeleton, so extending the matcher would have rewritten it anyway. A new pass that subsumes the old (its tests and option port over) also kept a byte-identical fallback available during development.
+- **Outline as `kFusion` instead of `kCall`.** A fusion wrapper would reuse the fusion ABI, but fusion semantics do not admit control flow or multi-shape bodies, and downstream passes assume fusions are elementally emittable. `kCall` plus the `xla_cpu_small_call` attribute is the interface the while pass already shipped; buffer assignment and scheduling understand calls. The experimental MLIR emitter builds a throwaway fusion view at emission time, which gets ABI reuse without changing the HLO.
+- **Merge kernels at the thunk layer instead of the HLO layer.** An emission-time pass could concatenate adjacent kernel thunks into one kernel with no HLO change, but it cannot swallow loops (control flow lives in `WhileThunk`, so crossing it means reimplementing loop codegen at the thunk layer) and it forfeits HLO-level verification, testing, and buffer-assignment coordination.
+- **Run earlier in the pipeline.** Probed and rejected: placed before instruction fusion, the fusion pass runs over all non-fusion computations including the outlined callee and re-fragments the region body; fencing regions off would also require blocking the single-call-site call inliner and re-tuning fusion cost models, all in shared backend-agnostic passes. Running last, after copy insertion, sees final program structure and touches nothing shared.
+- **Dataflow clustering instead of schedule runs.** Growing regions over the dependence graph could capture non-adjacent instructions, but it must re-schedule region internals and reason about interleaved side effects. Maximal runs over the existing order are order-preserving by construction, and the measured wins did not need more.
 
 ## Open questions
 
