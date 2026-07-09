@@ -37,6 +37,8 @@ Apple M3, single thread, seed-matched bitwise parity against the sentinel config
 | jax#26145 step | 1.531 ms | 1.09-1.12 ms | 0.354-0.377 ms with the scatter expander; legacy-runtime reference is 0.372 ms |
 | rolled loop microbenchmark, per iteration | ~70-90 ns | ~25 ns | loop folds into one kernel; compile time flat in trip count |
 
+Compile-time cost: the fold is not free. jax#26145's whole-program fold raises compile time from ~0.27 s to ~0.60 s (2.2x), which is the LLVM cost of optimizing one large function instead of many small ones. On small rolled loops the effect reverses, since there are fewer kernel functions to emit: 16.9 ms down to 12.7 ms at trip count 512. The straight-line cap bounds the pathological (unrolled-chain) cases; the loop-fold inflation above is inherent to the trade and is the basis for the preset gating below.
+
 ## Testing
 
 14+ unit tests: partitioning and outlining, boundary ops stay outside regions, token threading (infeed/outfeed in loop bodies), crossing control dependencies block hoisting, multi-output tuples, and regression tests shaped like the three reported issues. Every benchmark run doubles as a correctness check via `--print_result --seed` bitwise diffs. The unrolled-N compile-time matrix from the [re-rolling spike](https://github.com/seantalts/xla/tree/notes/cpu-small-model-regression-findings/reroll-spike) becomes a regression test for the size cap.
@@ -44,6 +46,8 @@ Apple M3, single thread, seed-matched bitwise parity against the sentinel config
 ## Rollout
 
 Upstream as a replacement for `SmallWhileLoopHoistingPass`, which it strictly generalizes: port its tests, keep its option and default-on posture, raise the region gate to 64KB (the 1KB default remains the option floor for anyone who set it). Ships together with the straight-line cap. Escape hatch documented on the option.
+
+Gate on the CPU optimization preset: skip the pass under `CPU_OPT_PRESET_FAST_COMPILE`, since it deliberately spends compile time to buy runtime, the opposite of that preset's contract (measured: 2.2x compile on the jax#26145 fold). Proposed scope is `CPU_OPT_PRESET_DEFAULT` and `CPU_OPT_PRESET_FAST_RUNTIME`, keeping the issue fixes flag-free and matching the while-pass precedent; restricting to `FAST_RUNTIME` only is the conservative variant (open question 3).
 
 ## Risks
 
@@ -71,3 +75,4 @@ Implementation:
 
 1. Cap value: 48 proposed; the compile-cost curve says 32 is already 3x in the worst case, but the runtime cost of splitting is negligible either way.
 2. Cap vs reduced opt level for oversized straight-line regions: data supports both; the cap is simpler to reason about, opt-level tiering can come later with the MLIR emitter.
+3. Preset scope: enable under `DEFAULT` + `FAST_RUNTIME` (proposed) or `FAST_RUNTIME` only. `FAST_COMPILE` is excluded either way.
