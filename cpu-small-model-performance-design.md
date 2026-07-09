@@ -40,7 +40,7 @@ Each conclusion below came from a measurement, after several early inferences pr
 
 **jax#26145.** A census of the optimized module gives ~22,400 kernel executions per step for 1.109 ms of wall time, ~50 ns each. An IR audit of the hottest region kernels found mediocre code (unforwarded loads, scalar loops), but hand-merging fusions inside kernels moved end-to-end time by ~1% (Appendix A.3), so kernel quality is not the cost at these sizes. Replacing scatters with placeholders let the region pass fold the entire program into one kernel at 0.238 ms (Appendix A.5), which located the rest of the win behind scatter boundaries.
 
-**jax#37465.** The `jnp.sum(d*d)` reductions get split by the tree-reduction rewriter into reduce-window(32x32, stride 32x32) plus a small reduce, and the reduce-window kernels are emitted as scalar loops (~3.2 us each, four of them). Re-checked at head this week because [openxla/xla@5f26078f](https://github.com/openxla/xla/commit/5f26078f7cb2c6b8872c87e43fe6906923396c23) taught YNNPACK reductions to bypass the tree rewriter: the fix does not apply here. YNN only claims ops with at least 4096 elements in some operand or result (`kMinElements` in [`ynn_support.cc`](https://github.com/openxla/xla/blob/main/xla/backends/cpu/ynn_support.cc), `IsInstructionPreferredByYnn`), and the diff outputs are 63x64 = 4032 and 62x64 = 3968. The repro sits just under the gate, so the reduce is declined, the tree rewriter splits it, and the scalar reduce-windows remain. Verified empirically at our base: the compiled module still contains all four reduce-window ops as scalar kernels and zero YNN fusions, at 33 us per call. Region hoisting does not rescue this model either (verified: no region forms, because the 16 KB arrays exceed the summed-bytes gate), and reduce-window would emit scalar inside a region anyway. This issue needs its own fix (see M3 and the fix map).
+**jax#37465.** The `jnp.sum(d*d)` reductions get split by the tree-reduction rewriter into reduce-window(32x32, stride 32x32) plus a small reduce, and the reduce-window kernels are emitted as scalar loops (~3.2 us each, four of them). Re-checked at head this week because [openxla/xla@5f26078f](https://github.com/openxla/xla/commit/5f26078f7cb2c6b8872c87e43fe6906923396c23) taught YNNPACK reductions to bypass the tree rewriter: the fix does not apply here. YNN only claims ops with at least 4096 elements in some operand or result (`kMinElements` in [`ynn_support.cc`](https://github.com/openxla/xla/blob/main/xla/backends/cpu/ynn_support.cc), `IsInstructionPreferredByYnn`), and the diff outputs are 63x64 = 4032 and 62x64 = 3968. The repro sits just under the gate, so the reduce is declined, the tree rewriter splits it, and the scalar reduce-windows remain. We are deliberately not touching the YNN gate; the fix stays in XLA's own codegen (see Alternatives). Verified empirically at our base: the compiled module still contains all four reduce-window ops as scalar kernels and zero YNN fusions, at 33 us per call. Region hoisting does not rescue this model either (verified: no region forms, because the 16 KB arrays exceed the summed-bytes gate), and reduce-window would emit scalar inside a region anyway. This issue needs its own fix (see M3 and the fix map).
 
 **jax#33666.** The regression is confined to the stiff solver path. Each Newton iteration issues LAPACK custom calls and a Python callback; these are on the region boundary list, so no folding is possible today. The mechanism to lift this exists in the legacy emitter: `IrEmitter` can emit runtime calls (`allow_runtime_calls`), but region kernels disable it ([`computation_kernel_emitter.cc:248`](https://github.com/seantalts/xla/blob/feat/cpu-small-region-hoisting/xla/backends/cpu/codegen/computation_kernel_emitter.cc)) because their ABI carries no runtime context. M2 below is the plan to thread it.
 
@@ -95,7 +95,7 @@ Three levers, in order of cost:
 | issue | fix | milestone | status |
 |---|---|---|---|
 | [jax#26145](https://github.com/jax-ml/jax/issues/26145) | region hoisting + scatter expansion | M1 | landed on branch, 1.53 -> 0.36 ms bitwise |
-| [jax#37465](https://github.com/jax-ml/jax/issues/37465) | near term: rewrite non-overlapping reduce-window (size == stride) to reshape+reduce at the HLO level, sized so YNN or the vectorized reduce emitters take it; also measure a one-line YNN experiment (relax `kMinElements` for reduce-like ops, the repro misses the gate by 64 elements). Durable: M3 vectorized reduce-window | M3 (near-term fix independent) | scoped; YNN decline reason verified this week |
+| [jax#37465](https://github.com/jax-ml/jax/issues/37465) | near term: rewrite non-overlapping reduce-window (size == stride) to reshape+reduce at the HLO level, handled by XLA's own vectorized reduce emitters. Durable: M3 vectorized reduce-window. A YNN gate change could also catch this case; rejected as a direction (see Alternatives) | M3 (near-term fix independent) | scoped; YNN decline reason verified this week |
 | [jax#33666](https://github.com/jax-ml/jax/issues/33666) | runtime calls inside regions; fold the Newton loop, call LAPACK from inside the kernel | M2 | design above; A/B gate on the real repro |
 | [jax#26021](https://github.com/jax-ml/jax/issues/26021) | finish the DUS in-place diagnosis (compare update-chain kernels old vs new; confirm or refute the copy hypothesis); then DUS emission fix under M3, plus M4 batching upstream | M3 + M4 | diagnosis task defined; root cause partially unconfirmed |
 | TORAX | prevention lever (M4.2) | M4 | out of scope here; census done (533 sites -> 11 shapes) |
@@ -156,16 +156,16 @@ Details and numbers in Appendix A.
 - Faster dispatch: ceiling ~10%, rejected (A.1).
 - Tiled region emission as its own track: built, measured neutral at small sizes, folded into M3 (A.2).
 - Merging fusions inside regions: ~1%; 24% slower with duplication (A.3).
-- In-kernel scatter codegen: strictly worse than expansion for M1; revisit inside M3 (A.4).
+- In-kernel scatter codegen: worse than expansion for M1 on every axis; revisit inside M3 (A.4).
 - The four-phase tiled coverage plan: superseded by measurement; its findings feed M3 (A.2).
+- Widening YNNPACK coverage for small reduce-like ops (jax#37465 misses the `kMinElements` gate by 64 elements, so a one-line relaxation would catch it): rejected as a direction. We prefer to keep small-op performance in XLA's own codegen rather than grow the library dispatch surface, and the YNN size gate exists precisely because library dispatch loses at small sizes.
 
 ## Open questions
 
 1. P3 cap value (proposal: 48 straight-line members; compile cost is 3x at 32 in the worst synthetic case, and splitting costs tens of nanoseconds per boundary).
 2. Split oversized regions vs compile them at reduced opt level (data says either works; splitting is easier to reason about).
 3. M2 context threading: ABI parameter vs thunk-installed thread-local. ABI parameter is cleaner; needs a kernel-signature change.
-4. Whether the YNN `kMinElements` experiment is worth shipping versus keeping the fix purely in XLA (the gate exists because YNN dispatch loses at small sizes; #37465 sits 64 elements under it, which suggests per-op-type gates rather than a global constant).
-5. Upstream default-on vs staged flip.
+4. Upstream default-on vs staged flip.
 
 ## References
 
@@ -275,7 +275,7 @@ XLA_FLAGS="--xla_backend_extra_options=xla_cpu_small_while_loop_byte_threshold=0
 
 - [ ] P3 cap; re-run matrix and jaxley
 - [ ] Large-model verification run
-- [ ] jax#37465: reshape+reduce rewrite for size == stride reduce-window; YNN `kMinElements` experiment alongside
+- [ ] jax#37465: reshape+reduce rewrite for size == stride reduce-window, targeting XLA's own reduce emitters
 - [ ] jax#33666: M2 design review (context ABI, FFI frames, error paths), then A/B on the repro
 - [ ] jax#26021: DUS in-place diagnosis to confirmation or refutation, then M3 DUS work item; file the MJX batching issue with spike numbers
 - [ ] M3 design review (region driver, op coverage order, compile-time tiering)
