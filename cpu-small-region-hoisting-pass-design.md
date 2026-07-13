@@ -47,12 +47,12 @@ Compile-time cost: the fold is not free. jax#26145's whole-program fold raises c
 
 Upstream as a replacement for `SmallWhileLoopHoistingPass`, which it strictly generalizes: port its tests, keep its option and default-on posture, raise the region gate to 64KB (the 1KB default remains the option floor for anyone who set it). Ships together with the straight-line cap. Escape hatch documented on the option.
 
-Gate on the CPU optimization preset: skip the pass under `CPU_OPT_PRESET_FAST_COMPILE`, since it deliberately spends compile time to buy runtime, the opposite of that preset's contract (measured: 2.2x compile on the jax#26145 fold). Proposed scope is `CPU_OPT_PRESET_DEFAULT` and `CPU_OPT_PRESET_FAST_RUNTIME`, keeping the issue fixes flag-free and matching the while-pass precedent; restricting to `FAST_RUNTIME` only is the conservative variant (open question 3).
+Gate on the CPU optimization preset: skip the pass under `CPU_OPT_PRESET_FAST_COMPILE`, since it deliberately spends compile time to buy runtime, the opposite of that preset's contract (measured: 2.2x compile on the jax#26145 fold, +13% on the Gemma3 1B benchmark). Proposed scope is `CPU_OPT_PRESET_DEFAULT` and `CPU_OPT_PRESET_FAST_RUNTIME`, keeping the issue fixes flag-free and matching the while-pass precedent; restricting to `FAST_RUNTIME` only is the conservative variant (open question 3).
 
 ## Risks
 
 - Compile time on unrolled input: covered by the cap above; regression-tested.
-- Large-model interference: byte gate keeps the pass inert; verified on the large-model proxies we ran, with a full suite run scheduled before the upstream PR.
+- Large-model interference: measured on the in-tree Gemma3 1B benchmark, the pass is not fully inert. 26 regions form on per-layer KV/mask/rope bookkeeping, with bit-identical output and runtime a wash; the cost is +13% compile time, which feeds the preset gating above. Re-measure on the deeper in-tree Gemma configs before the upstream PR.
 - Codegen quality inside regions: the legacy emitter emits scalar loops for some ops. Measured irrelevant at small sizes (hand-merging fusions inside regions moved end-to-end time ~1%), and the region boundary is where a future MLIR emitter slots in.
 
 ## Alternatives considered

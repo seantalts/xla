@@ -144,7 +144,7 @@ Worst case for P2's predicate (a lone small scatter with no neighbors to fold wi
 |---|---|---|
 | compile-time blowup on large straight-line regions | ~N^1.8 measured; 11x at 128 ops | P3 cap; optional reduced opt level (O0 keeps ~90% of the win, 73 ms vs 2.17 s) |
 | expanded scatter that never joins a region | +1-2 us measured on the lone-scatter case | conservative gate; expanded loop folds alone; possible v2 predicate that dry-runs region eligibility |
-| large-model interference | gates inert on everything we ran | 64KB gates; explicit large-model suite run before upstreaming |
+| large-model interference | measured on the in-tree Gemma3 1B benchmark (`gemma3_1b_flax_call`, 1.86 GB of weights): the passes are not inert. 26 regions form on per-layer KV/mask/rope bookkeeping and all 22 tiny attention index scatters expand, yet output is bit-identical, runtime is a wash (164 vs 171 ms), and compile time rises 13% (+95 ms) | 64KB gates bound what can fire; preset gating excludes FAST_COMPILE; re-measure on the deeper in-tree configs (gemma2_2b_keras_jax, gemma4_2b_bf16) before upstreaming |
 | numerics | none observed; all results bitwise | parity checks in tests and in the measurement loop; P2 uses XLA's reference scatter lowering |
 | M2 re-entrancy and error paths | n/a (design stage) | scope M2 to static FFI call frames first; status propagation designed before code |
 | M3 scope creep | four-phase plan history (Appendix A.2) | op coverage strictly issue-driven; measurement gate per op |
@@ -274,7 +274,7 @@ XLA_FLAGS="--xla_backend_extra_options=xla_cpu_small_while_loop_byte_threshold=0
 ### B.6 Work checklist
 
 - [ ] P3 cap; re-run matrix and jaxley
-- [ ] Large-model verification run
+- [x] Large-model verification, first pass: Gemma3 1B (`gemma3_1b_flax_call`) shows the passes firing on per-layer bookkeeping with bit-identical output, runtime wash, compile +13% ([record](https://github.com/seantalts/xla/blob/notes/cpu-small-model-regression-findings/gemma3-1b-large-model-verification.md)); extend to gemma2_2b_keras_jax and gemma4_2b_bf16
 - [ ] jax#37465: reshape+reduce rewrite for size == stride reduce-window, targeting XLA's own reduce emitters
 - [ ] jax#33666: M2 design review (context ABI, FFI frames, error paths), then A/B on the repro
 - [ ] jax#26021: DUS in-place diagnosis to confirmation or refutation, then M3 DUS work item; file the MJX batching issue with spike numbers
