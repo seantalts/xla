@@ -295,3 +295,30 @@ module {
 // CHECK-NOT: math.atan2
 // CHECK: %[[RESULT:.*]] = call @xla.atan.v8f32(%arg0) : (vector<8xf32>) -> vector<8xf32>
 // CHECK: return %[[RESULT]] : vector<8xf32>
+
+// -----
+
+module {
+  func.func @sin_f32(%arg0: f32) -> f32 {
+    %ret = math.sin %arg0 : f32
+    return %ret : f32
+  }
+}
+
+// CHECK-LABEL: @sin_f32
+// CHECK-NOT: math.sin
+// CHECK: %[[SIN_CALL:.*]] = call @xla.sin.f32(%arg0) : (f32) -> f32
+// CHECK: return %[[SIN_CALL]] : f32
+
+// -----
+
+module {
+  func.func @sin_v4f32(%arg0: vector<4xf32>) -> vector<4xf32> {
+    %ret = math.sin %arg0 : vector<4xf32>
+    return %ret : vector<4xf32>
+  }
+}
+
+// CHECK-LABEL: @sin_v4f32
+// CHECK-NOT: math.sin
+// CHECK: call @xla.sin.v4f32
