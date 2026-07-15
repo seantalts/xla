@@ -40,6 +40,8 @@ typedef float Vec16f __attribute__((vector_size(64)));
 typedef double Vec2d __attribute__((vector_size(16)));
 typedef double Vec4d __attribute__((vector_size(32)));
 typedef double Vec8d __attribute__((vector_size(64)));
+// 16-wide double, used only as the double-promotion target for 16-lane f32 sin.
+typedef double Vec16d __attribute__((vector_size(128)));
 
 // Corresponding integer types
 typedef uint32_t Vec4i __attribute__((vector_size(16)));
@@ -47,6 +49,7 @@ typedef uint32_t Vec8i __attribute__((vector_size(32)));
 typedef uint64_t Vec2q __attribute__((vector_size(16)));
 typedef uint64_t Vec4q __attribute__((vector_size(32)));
 typedef uint64_t Vec8q __attribute__((vector_size(64)));
+typedef uint64_t Vec16q __attribute__((vector_size(128)));
 
 namespace internal {
 // Helper type to select the corresponding integer vector type.
@@ -72,6 +75,10 @@ struct MakeIntVec<uint64_t, 4> {
 template <>
 struct MakeIntVec<uint64_t, 8> {
   using type = Vec8q;
+};
+template <>
+struct MakeIntVec<uint64_t, 16> {
+  using type = Vec16q;
 };
 
 // This trait takes a float vector and provides its integer vector partner.

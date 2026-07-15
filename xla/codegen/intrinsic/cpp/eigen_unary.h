@@ -43,6 +43,20 @@ double atan_f64(double x) asm("xla.atan.f64");
 Vec4d atan_v4f64(Vec4d x) asm("xla.atan.v4f64");
 Vec8d atan_v8f64(Vec8d x) asm("xla.atan.v8f64");
 
+// Vectorized sin, custom clang-vector-extension implementation (Cephes/SLEEF-
+// style). f64 uses a 4-part Cody-Waite reduction + minimax polys reaching
+// <= 2 ULP, which Eigen's generic double sin cannot. f32 promotes each lane to
+// double and reuses that f64 kernel (<= 1 ULP), because Eigen's f32 sin does
+// not vectorize at the v4/v8 widths that ARM NEON and AVX2 actually use.
+float sin_f32(float x) asm("xla.sin.f32");
+Vec4f sin_v4f32(Vec4f x) asm("xla.sin.v4f32");
+Vec8f sin_v8f32(Vec8f x) asm("xla.sin.v8f32");
+Vec16f sin_v16f32(Vec16f x) asm("xla.sin.v16f32");
+
+double sin_f64(double x) asm("xla.sin.f64");
+Vec4d sin_v4f64(Vec4d x) asm("xla.sin.v4f64");
+Vec8d sin_v8f64(Vec8d x) asm("xla.sin.v8f64");
+
 }  // namespace xla::codegen
 
 #endif  // XLA_CODEGEN_INTRINSIC_CPP_EIGEN_UNARY_H_

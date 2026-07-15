@@ -119,8 +119,26 @@ cc_library(
     name = "eigen_unary_lib",
     srcs = ["eigen_unary.cc"],
     hdrs = ["eigen_unary.h"],
+    # Match the defines used by the eigen_unary_64_ll cc_to_llvm_ir target
+    # (OSS 64-byte/512-bit path) so this library -- which the test links
+    # directly -- exercises the same Eigen GENERIC packet path as the shipped
+    # embedded bitcode.  Without these, on aarch64 the native build silently
+    # takes Eigen's NEON packet path, a different (and differently-accurate)
+    # tanh/atan than what ships, masking the real generic-path ULP behavior
+    # under test.  (sin no longer uses Eigen at all -- f64 and f32 are both the
+    # custom clang-vector-extension kernel -- but tanh and atan still do.)
+    #
+    # EIGEN_VECTORIZE_GENERIC is load-bearing here even though
+    # EIGEN_GENERIC_VECTOR_SIZE_BYTES is already set: cc_ir_header (in
+    # cc_to_llvm_ir.bzl) always injects -DEIGEN_VECTORIZE_GENERIC into
+    # compile_flags for _ll targets, but eigen_unary_lib is a plain cc_library
+    # that does not go through that macro and must set the flag explicitly to
+    # activate Eigen's clang-vector-extension path instead of NEON.
     copts = [
         "-Wno-psabi",
+        "-DEIGEN_VECTORIZE_GENERIC",
+        "-DEIGEN_GENERIC_VECTOR_SIZE_BYTES=64",
+        "-mprefer-vector-width=512",
     ],
     deps = [
         ":vector_ops",
