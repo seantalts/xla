@@ -101,21 +101,25 @@ struct Region {
 // region"). Fusion computations and generic call/map/reduce to_apply bodies
 // are never enqueued: only control-flow bodies, whose per-op dispatch cost
 // scales with trip count.
-void EnqueueControlFlowBodies(HloComputation* comp,
-                              std::vector<HloComputation*>& worklist,
-                              absl::flat_hash_set<HloComputation*>& seen) {
+// Worklist entries carry whether the computation executes in a dispatch-
+// amplified context: inside a while loop (directly, or transitively through
+// nested control flow), every thunk dispatch is paid once per iteration.
+void EnqueueControlFlowBodies(
+    HloComputation* comp, bool comp_amplified,
+    std::vector<std::pair<HloComputation*, bool>>& worklist,
+    absl::flat_hash_set<HloComputation*>& seen) {
   for (HloInstruction* instr : comp->instructions()) {
-    auto enqueue = [&](HloComputation* c) {
+    auto enqueue = [&](HloComputation* c, bool amplified) {
       if (seen.insert(c).second) {
-        worklist.push_back(c);
+        worklist.push_back({c, amplified});
       }
     };
     if (instr->opcode() == HloOpcode::kWhile) {
-      enqueue(instr->while_body());
-      enqueue(instr->while_condition());
+      enqueue(instr->while_body(), /*amplified=*/true);
+      enqueue(instr->while_condition(), /*amplified=*/true);
     } else if (instr->opcode() == HloOpcode::kConditional) {
       for (HloComputation* branch : instr->branch_computations()) {
-        enqueue(branch);
+        enqueue(branch, comp_amplified);
       }
     }
   }
@@ -144,20 +148,28 @@ static bool IsExcludedNonscalarConstant(const HloInstruction* instr,
 }
 
 static absl::StatusOr<bool> PartitionComputation(
-    HloModule* module, HloComputation* comp, int64_t small_buffer_access_size,
-    int64_t min_region_size, bool exclude_nonscalar_constants,
+    HloModule* module, HloComputation* comp, bool amplified,
+    int64_t small_buffer_access_size, int64_t min_region_size,
+    bool exclude_nonscalar_constants,
     absl::flat_hash_map<const HloInstruction*, bool>& unavailable_memo) {
-  // Partition the computation's topological order into maximal runs of
-  // region-eligible instructions, split at unavailable instructions.
-  // Parameters are region inputs, not members, and do not break a run.
-  std::vector<Region> regions;
-  Region current;
-  auto close_region = [&]() {
+  // Phase 1: partition the computation's topological order into maximal runs
+  // of region-eligible instructions, split at unavailable instructions, with
+  // per-member byte footprints. Parameters are region inputs, not members,
+  // and do not break a run.
+  struct Run {
+    std::vector<HloInstruction*> members;
+    std::vector<int64_t> bytes;
+    int64_t total_bytes = 0;
+  };
+  std::vector<Run> runs;
+  Run current;
+  auto close_run = [&]() {
     if (!current.members.empty()) {
-      regions.push_back(std::move(current));
-      current = Region{};
+      runs.push_back(std::move(current));
+      current = Run{};
     }
   };
+  HloCostAnalysis cost_analysis(&CpuExecutable::ShapeSizeBytes);
   for (HloInstruction* instr : comp->MakeInstructionPostOrder()) {
     if (instr->opcode() == HloOpcode::kParameter) {
       continue;
@@ -170,12 +182,57 @@ static absl::StatusOr<bool> PartitionComputation(
       continue;
     }
     if (ContainsUnavailableInstruction(instr, unavailable_memo)) {
-      close_region();
+      close_run();
       continue;
     }
+    RETURN_IF_ERROR(cost_analysis.RevisitInstruction(instr));
     current.members.push_back(instr);
+    current.bytes.push_back(cost_analysis.bytes_accessed(*instr));
+    current.total_bytes += current.bytes.back();
   }
-  close_region();
+  close_run();
+
+  // Phase 2: apply the byte budget. A run that fits becomes one region, as
+  // before. An over-budget run is greedily segmented at oversized members and
+  // at budget overflow — but a segment is only KEPT where a loop amplifies
+  // its dispatch savings: in a while-amplified computation, or when the
+  // segment itself contains control flow. A once-per-call straight-line
+  // segment saves only nanoseconds of dispatch while serializing thunks the
+  // executor could have overlapped (measured -13% on the Gemma3 1B benchmark
+  // when such segments were folded), so those runs stay all-or-nothing.
+  // Segmentation is what rescues a cheap million-iteration loop whose
+  // neighbors are large loop-invariant fusions (jax-ml/jax discussion
+  // #24501): the loop's segment survives the cut around the big neighbors.
+  std::vector<Region> regions;
+  for (Run& run : runs) {
+    if (run.total_bytes < small_buffer_access_size) {
+      regions.push_back(Region{std::move(run.members)});
+      continue;
+    }
+    Region segment;
+    int64_t segment_bytes = 0;
+    auto flush_segment = [&]() {
+      if (!segment.members.empty() &&
+          (amplified || absl::c_any_of(segment.members, IsControlFlow))) {
+        regions.push_back(std::move(segment));
+      }
+      segment = Region{};
+      segment_bytes = 0;
+    };
+    for (size_t i = 0; i < run.members.size(); ++i) {
+      const int64_t member_bytes = run.bytes[i];
+      if (member_bytes >= small_buffer_access_size) {
+        flush_segment();
+        continue;
+      }
+      if (segment_bytes + member_bytes >= small_buffer_access_size) {
+        flush_segment();
+      }
+      segment.members.push_back(run.members[i]);
+      segment_bytes += member_bytes;
+    }
+    flush_segment();
+  }
 
   bool changed = false;
   for (const Region& region : regions) {
@@ -194,15 +251,7 @@ static absl::StatusOr<bool> PartitionComputation(
       continue;
     }
 
-    HloCostAnalysis cost_analysis(&CpuExecutable::ShapeSizeBytes);
-    int64_t bytes_accessed = 0;
-    for (HloInstruction* member : region.members) {
-      RETURN_IF_ERROR(cost_analysis.RevisitInstruction(member));
-      bytes_accessed += cost_analysis.bytes_accessed(*member);
-    }
-    if (bytes_accessed >= small_buffer_access_size) {
-      continue;
-    }
+    // The byte budget was already enforced during run construction above.
 
     // Conservative correctness guard: don't hoist a region whose members carry
     // control dependencies that CROSS the region boundary — outlining would
@@ -335,20 +384,21 @@ absl::StatusOr<bool> SmallRegionHoistingPass::RunImpl(
   // partition the called computations of an already-hoisted region). The
   // `_region` computations we create are never enqueued because we only
   // descend through control-flow ops, never through the small_call kCall.
-  std::vector<HloComputation*> worklist = {entry};
+  std::vector<std::pair<HloComputation*, bool>> worklist = {
+      {entry, /*amplified=*/false}};
   absl::flat_hash_set<HloComputation*> seen = {entry};
 
   absl::flat_hash_map<const HloInstruction*, bool> unavailable_memo;
   bool changed = false;
   for (size_t i = 0; i < worklist.size(); ++i) {
-    HloComputation* comp = worklist[i];
+    auto [comp, amplified] = worklist[i];
     ASSIGN_OR_RETURN(
         bool comp_changed,
-        PartitionComputation(module, comp, small_buffer_access_size_,
-                             min_region_size_, exclude_nonscalar_constants_,
-                             unavailable_memo));
+        PartitionComputation(module, comp, amplified,
+                             small_buffer_access_size_, min_region_size_,
+                             exclude_nonscalar_constants_, unavailable_memo));
     changed |= comp_changed;
-    EnqueueControlFlowBodies(comp, worklist, seen);
+    EnqueueControlFlowBodies(comp, amplified, worklist, seen);
   }
   return changed;
 }

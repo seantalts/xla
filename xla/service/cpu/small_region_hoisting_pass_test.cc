@@ -417,6 +417,175 @@ TEST_F(SmallRegionHoistingPassTest, SmallWhileLoopHoisting) {
   EXPECT_TRUE(CalledComputationContains(call, HloOpcode::kWhile));
 }
 
+// jax-ml/jax discussion #24501: a cheap million-iteration accumulation loop
+// sits next to large loop-invariant fusions that LICM hoisted into the entry.
+// An all-or-nothing byte gate on maximal runs drops the whole run and starves
+// the loop of hoisting (and the body-partitioning fallback then wraps the
+// loop *body* in a kernel, paying call ABI per iteration on top of the
+// executor). Budgeted segmentation must instead cut around the large
+// neighbors and hoist the loop itself.
+TEST_F(SmallRegionHoistingPassTest, LargeNeighborsDontStarveSmallLoop) {
+  constexpr absl::string_view hlo_string = R"(
+    HloModule large_neighbors
+
+    add_fn {
+      x = f32[] parameter(0)
+      y = f32[] parameter(1)
+      ROOT add = f32[] add(x, y)
+    }
+
+    while_body {
+      p = (s32[], f32[]) parameter(0)
+      iter = s32[] get-tuple-element(p), index=0
+      acc = f32[] get-tuple-element(p), index=1
+      one = s32[] constant(1)
+      nexti = s32[] add(iter, one)
+      cf = f32[] convert(iter)
+      nacc = f32[] add(acc, cf)
+      ROOT t = (s32[], f32[]) tuple(nexti, nacc)
+    }
+
+    while_condition {
+      p = (s32[], f32[]) parameter(0)
+      iter = s32[] get-tuple-element(p), index=0
+      limit = s32[] constant(1000)
+      ROOT lt = pred[] compare(iter, limit), direction=LT
+    }
+
+    ENTRY main {
+      x = f32[100000] parameter(0)
+      bigmul = f32[100000] multiply(x, x)
+      bigadd = f32[100000] add(bigmul, x)
+      zero = f32[] constant(0)
+      invariant = f32[] reduce(bigadd, zero), dimensions={0}, to_apply=add_fn
+      iz = s32[] constant(0)
+      init = (s32[], f32[]) tuple(iz, invariant)
+      wl = (s32[], f32[]) while(init), condition=while_condition, body=while_body
+      ROOT out = f32[] get-tuple-element(wl), index=1
+    }
+    )";
+
+  TF_ASSERT_OK_AND_ASSIGN(std::unique_ptr<HloModule> m,
+                          ParseAndReturnVerifiedModule(hlo_string));
+  TF_ASSERT_OK_AND_ASSIGN(bool changed, RunPass(m.get(), /*=*/1 << 16));
+  EXPECT_TRUE(changed);
+
+  // The while itself must be hoisted (not merely its body wrapped).
+  const HloInstruction* call = SoleSmallCall(m.get());
+  ASSERT_NE(call, nullptr);
+  EXPECT_TRUE(CalledComputationContains(call, HloOpcode::kWhile));
+
+  // The large invariant chain stays at per-op granularity in the entry.
+  bool big_in_entry = false;
+  for (const HloInstruction* instr :
+       m->entry_computation()->instructions()) {
+    if (instr->opcode() == HloOpcode::kMultiply ||
+        instr->opcode() == HloOpcode::kReduce) {
+      big_in_entry = true;
+    }
+  }
+  EXPECT_TRUE(big_in_entry);
+}
+
+TEST_F(SmallRegionHoistingPassTest, OverBudgetStraightLineRunIsNotSplit) {
+  // A once-per-call straight-line run whose aggregate exceeds the byte budget
+  // stays at per-op granularity: splitting it would save only nanoseconds of
+  // dispatch while serializing thunks the executor can overlap (measured -13%
+  // on the Gemma3 1B benchmark when such segments were folded).
+  constexpr absl::string_view hlo_string = R"(
+    HloModule split_run
+
+    ENTRY main (x: f32[2048]) -> f32[2048] {
+      x = f32[2048]{0} parameter(0)
+      a0 = f32[2048]{0} add(x, x)
+      a1 = f32[2048]{0} multiply(a0, a0)
+      a2 = f32[2048]{0} add(a1, a1)
+      a3 = f32[2048]{0} multiply(a2, a2)
+      a4 = f32[2048]{0} add(a3, a3)
+      a5 = f32[2048]{0} multiply(a4, a4)
+      a6 = f32[2048]{0} add(a5, a5)
+      a7 = f32[2048]{0} multiply(a6, a6)
+      a8 = f32[2048]{0} add(a7, a7)
+      a9 = f32[2048]{0} multiply(a8, a8)
+      a10 = f32[2048]{0} add(a9, a9)
+      ROOT a11 = f32[2048]{0} multiply(a10, a10)
+    }
+    )";
+
+  TF_ASSERT_OK_AND_ASSIGN(std::unique_ptr<HloModule> m,
+                          ParseAndReturnVerifiedModule(hlo_string));
+  // Each op accesses 3 * 8KB = 24KB; twelve ops aggregate to 288KB > 128KB.
+  TF_ASSERT_OK_AND_ASSIGN(bool changed, RunPass(m.get(), /*=*/128 * 1024));
+  EXPECT_FALSE(changed);
+}
+
+TEST_F(SmallRegionHoistingPassTest, OverBudgetWhileBodyRunIsSplit) {
+  // Inside a while body every dispatch is paid per iteration, so an
+  // over-budget straight-line run there IS worth segmenting into multiple
+  // budget-sized regions instead of being dropped wholesale.
+  constexpr absl::string_view hlo_string = R"(
+    HloModule body_split
+
+    while_body {
+      p = (s32[], f32[2048]) parameter(0)
+      iter = s32[] get-tuple-element(p), index=0
+      v = f32[2048]{0} get-tuple-element(p), index=1
+      a0 = f32[2048]{0} add(v, v)
+      a1 = f32[2048]{0} multiply(a0, a0)
+      a2 = f32[2048]{0} add(a1, a1)
+      a3 = f32[2048]{0} multiply(a2, a2)
+      a4 = f32[2048]{0} add(a3, a3)
+      a5 = f32[2048]{0} multiply(a4, a4)
+      a6 = f32[2048]{0} add(a5, a5)
+      a7 = f32[2048]{0} multiply(a6, a6)
+      a8 = f32[2048]{0} add(a7, a7)
+      a9 = f32[2048]{0} multiply(a8, a8)
+      a10 = f32[2048]{0} add(a9, a9)
+      a11 = f32[2048]{0} multiply(a10, a10)
+      one = s32[] constant(1)
+      nexti = s32[] add(iter, one)
+      ROOT t = (s32[], f32[2048]) tuple(nexti, a11)
+    }
+
+    while_condition {
+      p = (s32[], f32[2048]) parameter(0)
+      iter = s32[] get-tuple-element(p), index=0
+      limit = s32[] constant(100)
+      ROOT lt = pred[] compare(iter, limit), direction=LT
+    }
+
+    ENTRY main (v0: f32[2048]) -> f32[2048] {
+      v0 = f32[2048]{0} parameter(0)
+      iz = s32[] constant(0)
+      init = (s32[], f32[2048]) tuple(iz, v0)
+      wl = (s32[], f32[2048]) while(init), condition=while_condition, body=while_body
+      ROOT out = f32[2048]{0} get-tuple-element(wl), index=1
+    }
+    )";
+
+  TF_ASSERT_OK_AND_ASSIGN(std::unique_ptr<HloModule> m,
+                          ParseAndReturnVerifiedModule(hlo_string));
+  // The while's one-iteration footprint (~288KB) exceeds the 128KB budget, so
+  // the while cannot hoist at the entry; its body run must then split.
+  TF_ASSERT_OK_AND_ASSIGN(bool changed, RunPass(m.get(), /*=*/128 * 1024));
+  EXPECT_TRUE(changed);
+
+  const HloComputation* body = nullptr;
+  for (const HloComputation* c : m->computations()) {
+    if (c->name().find("while_body") != std::string::npos) {
+      body = c;
+    }
+  }
+  ASSERT_NE(body, nullptr);
+  int64_t call_count = 0;
+  for (const HloInstruction* instr : body->instructions()) {
+    if (instr->opcode() == HloOpcode::kCall) {
+      ++call_count;
+    }
+  }
+  EXPECT_GE(call_count, 2);
+}
+
 TEST_F(SmallRegionHoistingPassTest, NoBigWhileLoopHoisting) {
   constexpr absl::string_view hlo_string = R"(
     HloModule simple_while_loop
