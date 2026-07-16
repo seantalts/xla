@@ -1,7 +1,7 @@
 # XLA:CPU kernel emission modernization: roadmap and design
 
 **Author:** seantalts · **Date:** 2026-07-16 · **Status:** Draft for review
-**Scope:** everything between current head and the end state: no legacy emitters, no fixed fusion blockers, libraries callable from inside kernels, kernel boundaries chosen by a cost model, and the small-model performance class fixed along the way. Written as a delta from current XLA head; prototype measurements come from a development branch ([`feat/cpu-small-region-hoisting`](https://github.com/seantalts/xla/tree/feat/cpu-small-region-hoisting)) and are labeled as such. This doc is self-contained; a glossary is at the end.
+**Scope:** everything between current XLA head and the end state: no legacy emitters, no fixed fusion blockers, libraries callable from inside kernels, kernel boundaries chosen by a cost model, and the small-model performance class fixed along the way. Prototype measurements come from a development branch ([`feat/cpu-small-region-hoisting`](https://github.com/seantalts/xla/tree/feat/cpu-small-region-hoisting)) and are labeled as such.
 
 ## 1. Summary
 
