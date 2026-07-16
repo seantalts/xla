@@ -1,105 +1,126 @@
-# Modernizing XLA:CPU kernel emission: large, cost-modeled kernels without the legacy emitter
+# XLA:CPU kernel emission modernization: roadmap and design
 
-**Author:** seantalts · **Date:** 2026-07-16 · **Status:** Draft for review (scoping)
-**Prior docs:** [small-model performance](https://github.com/seantalts/xla/blob/design/cpu-stage1-region-compilation/cpu-small-model-performance-design.md) (analysis + M1/M2/M3 sketch) · [region hoisting pass](https://github.com/seantalts/xla/blob/design/cpu-stage1-region-compilation/cpu-small-region-hoisting-pass-design.md) (includes glossary) · [scatter expander](https://github.com/seantalts/xla/blob/design/cpu-stage1-region-compilation/cpu-small-scatter-expander-design.md) · [gating experiment brief](https://github.com/seantalts/xla/blob/design/cpu-stage1-region-compilation/cpu-region-gating-experiment-brief.md) · [tiled coverage findings](https://github.com/seantalts/xla/blob/design/cpu-stage1-region-compilation/cpu-tiled-region-coverage-design.md)
+**Author:** seantalts · **Date:** 2026-07-16 · **Status:** Draft for review
+**Scope:** everything between current head and the end state: no legacy emitters, no fixed fusion blockers, libraries callable from inside kernels, kernel boundaries chosen by a cost model, and the small-model performance class fixed along the way. Written as a delta from current XLA head; prototype measurements come from a development branch ([`feat/cpu-small-region-hoisting`](https://github.com/seantalts/xla/tree/feat/cpu-small-region-hoisting)) and are labeled as such. This doc is self-contained; a glossary is at the end.
 
-## Summary
+## 1. Summary
 
-The small-model work has so far been a retrofit: region hoisting plus scatter expansion recover pre-thunk performance (jax#26145: 1.53 to 0.36 ms, bitwise), but the region backend is the legacy `IrEmitter`, the boundary list is a fixed op-capability table, libraries are unreachable from inside kernels, and fusion sizing is heuristic. This doc scopes the end state and the path to it:
+XLA:CPU finished one modernization (the thunk runtime) and is midway through several others (MLIR fusion emitters, the xtile tiled emitter, library integration). The unfinished state has a measurable cost. Small scientific models regressed 2x to 10x against the pre-thunk runtime because they execute tens of thousands of tiny kernels per step at ~50 ns of fixed overhead each; reported instances include [jax-ml/jax#26145](https://github.com/jax-ml/jax/issues/26145), [jax-ml/jax#37465](https://github.com/jax-ml/jax/issues/37465), [jax-ml/jax#33666](https://github.com/jax-ml/jax/issues/33666), [jax-ml/jax#26021](https://github.com/jax-ml/jax/issues/26021), and [jax-ml/jax discussions#24501](https://github.com/jax-ml/jax/discussions/24501). Meanwhile the legacy pre-thunk emitter is still load-critical: it is the backend for hoisted-region kernels and several op fallbacks, so it cannot be deleted, and every improvement built on it deepens the dependency.
 
-- **One kernel construct.** A "large fusion with materialized intermediates" and a "region" are the same object. The end state stops distinguishing them: a kernel is a set of instructions emitted as one function, where a cost model decides per producer-consumer edge whether a value is rematerialized, kept in a tile-sized stack allocation, or materialized to a scratch buffer. Multi-output fusion becomes one point on that spectrum rather than a special mechanism.
-- **No fixed blockers.** Every op today classed "unavailable" either gains a modern emission path, an HLO expansion, or a mid-kernel library/runtime call. The only permanent boundaries are ops that suspend execution (infeed/outfeed, collectives).
-- **Libraries callable mid-kernel.** A runtime-context kernel ABI lets emitted code call YNNPACK, oneDNN, Eigen, LAPACK/FFI, and host callbacks from inside a kernel, the way the pre-thunk emitter called Eigen inline for years. Per project direction, the cost model defaults to native codegen and reaches for a library only where it is clearly better (large dots/convs); this work makes placement possible, not more library-hungry.
-- **xtile as the only backend.** The region driver, op-coverage completion, and intra-kernel parallelism land on the xtile/MLIR path, after which `IrEmitter`, `IrEmitter2`, and `ComputationKernelEmitter` are deleted.
-- **Decisions by cost model.** The static, machine-parameterized model (dispatch and ABI savings amplified by trip count, recompute, overlap loss, register pressure, stream count, working set, library deltas, code size) replaces the byte gates, the amplification boolean, the min-size counter, fusion-pass duplication caps, and module gates. Every term is order-of-magnitude computable from the graph plus a machine description; the model's job is to avoid the catastrophic corners we have cataloged, all of which it catches.
+The end state this doc proposes:
 
-## Where emission stands today
+1. **One kernel construct.** A fusion and a compiled region are the same thing: a set of instructions emitted as one function, where a cost model decides per producer-consumer edge whether a value is recomputed at each use, kept in a tile-sized stack allocation, or materialized to a scratch buffer. Multi-output fusion becomes one point on that spectrum rather than a special mechanism.
+2. **No fixed blockers.** Every op that today cannot join a kernel either gains a modern emission path, an HLO expansion, or a mid-kernel library/runtime call. The only permanent boundaries are ops that suspend execution (infeed/outfeed, collectives).
+3. **Libraries callable mid-kernel.** A runtime-context kernel ABI lets emitted code call oneDNN, Eigen, YNNPACK, LAPACK/FFI handlers, and host callbacks from inside a kernel, as the pre-thunk emitter did with Eigen for years. Design principle: native codegen is the default and a library is chosen only where it is clearly better (large dots and convolutions); this work enables placement decisions, it does not route more work to libraries.
+4. **xtile as the only backend**, after a region driver (control flow, multi-output, materialization) and op-coverage completion land on it. `IrEmitter`, `IrEmitter2`, and `ComputationKernelEmitter` are then deleted.
+5. **Cost-modeled boundaries.** A static, machine-parameterized model replaces the fixed thresholds accumulated along the way (byte budgets, size gates, protection lists, module caps).
 
-| path | used for | status |
+Headline prototype numbers (Apple M3, single thread, bitwise-identical outputs, dev branch): the neuron-simulation workload of [jax#26145](https://github.com/jax-ml/jax/issues/26145) goes from 1.53 ms to 0.36 ms per step, at parity with the pre-thunk runtime; the million-iteration scan of [discussions#24501](https://github.com/jax-ml/jax/discussions/24501) improves 6-18x.
+
+## 2. Background: the cost model of the thunk runtime
+
+The thunk runtime executes one kernel (or copy, or library call) per HLO instruction or fusion, through a dependency-graph executor. Each kernel execution costs about 50 ns at small sizes: ~18 ns of dispatch plus ~30 ns of kernel-call ABI work (measured by a calibrated slope method on the dev branch). The pre-thunk runtime compiled the entire program into one LLVM function and spent roughly 7 ns per op, with while loops as native loops.
+
+For large models the thunk design is right: per-kernel granularity buys intra-op parallelism, inter-kernel overlap, profiling, and library integration, and 50 ns vanishes against millisecond kernels. For a small model whose step is a loop over arrays of tens of elements, the fixed overhead dominates: [jax#26145](https://github.com/jax-ml/jax/issues/26145) executes ~22,400 thunks per 1.1 ms step. The decisive variable is **amplification**: code inside a while loop pays its fixed overheads once per iteration, so a 50 ns saving is worth 50 ms inside a million-iteration scan and nothing measurable in straight-line entry code. Any design in this doc that folds work into bigger kernels is, at bottom, spending compile time and parallelism options to eliminate amplified fixed overhead, and the gating question is always whether the amplification pays for what is given up.
+
+## 3. State of modernization at head
+
+| project | status at head | remaining gap |
 |---|---|---|
-| xtile / fusion emitters (MLIR) | standalone loop fusions, scatter fusions, concat/transpose/etc. | modern; the base to build on |
-| tiled emitter (`EmitTiledComputation`) | experimental; dense-math regions behind `xla_cpu_experimental_region_compilation` | modern; limited op coverage, single-array roots |
-| `ComputationKernelEmitter` -> legacy `IrEmitter` | region kernels (`xla_cpu_small_call`), control flow inside regions | legacy; runtime calls disabled ([`computation_kernel_emitter.cc:248`](https://github.com/seantalts/xla/blob/feat/cpu-small-region-hoisting/xla/backends/cpu/codegen/computation_kernel_emitter.cc)) |
-| legacy `IrEmitter`/`IrEmitter2` elemental paths | reduce-window (scalar, the jax#37465 cost), assorted fallbacks, everything under `--xla_cpu_use_fusion_emitters=false` | legacy; retirement target |
-| library thunks (YNN, oneDNN, Eigen dot, FFI custom calls) | dots, convs, claimed reductions, LAPACK, callbacks | fine as thunks; unreachable from inside kernels |
-| thunk-level control flow (`WhileThunk`, `ConditionalThunk`) | all loops not folded into regions | fine; regions subsume the hot small ones |
+| Thunk runtime | complete, default | none; it is the substrate |
+| MLIR fusion emitters (`--xla_cpu_use_fusion_emitters`, default on) | standalone loop fusions emit through the modern path, including a dedicated MLIR scatter emitter | reduce-window still falls back to the legacy scalar path (the whole cost of [jax#37465](https://github.com/jax-ml/jax/issues/37465), ~12 us of a ~30 us program); the `=false` mode keeps the entire legacy pipeline alive |
+| xtile tiled emitter | analysis and driver exist (`SymbolicTileAnalysis`, `EmitTiledComputation`); dense-math regions compile behind an experimental flag; tile-sized intermediates already become stack allocations via bufferization | op coverage (no reduce-window, gather, reverse, dynamic-update-slice; reverse propagates as a negative stride that emission rejects); multi-output only when one root consumes the others; tiling propagation for dot-containing graphs is experimental; no control flow; single-threaded |
+| Library integration (oneDNN, Eigen, YNNPACK) | thunk-level only: dots, convolutions, and claimed reductions run as library thunks | unreachable from inside any kernel; claiming gates are fixed constants (e.g. a 4096-element minimum that [jax#37465](https://github.com/jax-ml/jax/issues/37465)'s reduction misses by 64 elements) |
+| `SmallWhileLoopHoistingPass` | upstream, default on: outlines a small while (<1 KB accessed) into a call compiled as one kernel | whiles only, 1 KB only; the seed of region compilation |
+| Legacy `IrEmitter` / `IrEmitter2` / `ComputationKernelEmitter` | the backend for hoisted-region kernels and assorted fallbacks | the thing this roadmap deletes |
+| Region compilation (dev branch, not yet upstream) | region hoisting generalizes the while pass to any small run including loop bodies; small-scatter expansion removes the most common boundary; budget segmentation with amplification gating; measured results below | upstreaming (M0); still emits through the legacy backend |
 
-## Blocker inventory and resolutions
+## 4. Design
 
-Every reason an instruction cannot join a kernel today, and how it goes away:
+### 4.1 One kernel construct: fusion = region, materialization per edge
 
-| blocker | today | resolution | phase |
-|---|---|---|---|
-| scatter | expanded when small (shipped); boundary when large | keep expansion; optional in-kernel sequential emission closes the last measured gap (0.352 vs 0.238 ms) | shipped / P3 |
-| custom-call / FFI (LAPACK, callbacks) | boundary; blocks jax#33666 | runtime-context ABI + prebuilt call frames; call mid-kernel | P1 |
-| sort | boundary (runtime KeyValueSort) | library call-out through the same ABI | P1 |
-| fft | boundary (runtime DUCC call) | library call-out | P1 |
-| copies | fold today, losing the memcpy fast path in kernels | emit `llvm.memcpy` for in-kernel copies; classification becomes unnecessary | P1 (trivial) |
-| loop fusions protected for new emitters | amplification-gated availability (internal) | moot once regions emit through the same xtile emitters as standalone fusions | P2 |
-| tuple-rooted (multi-output) regions | tiled path declines; legacy handles | multi-output support in `SymbolicTileAnalysis` (relax the "real root" form for independent roots under whole-shape tiles) and the region driver | P2 |
-| reduce-window | scalar legacy emission (the jax#37465 12 us) | tiled reduce-window (tiling space + propagation + emitter case), or the reshape+reduce rewrite as the interim | P3 |
-| gather / reverse / dynamic-update-slice | tiled path lacks cases | emitter cases per the [coverage findings](https://github.com/seantalts/xla/blob/design/cpu-stage1-region-compilation/cpu-tiled-region-coverage-design.md): gather as per-row dynamic-slice, reverse as negative-stride normalization, DUS with in-place discipline and a latency (not parity) gate | P3 |
-| control flow (while/conditional) inside kernels | legacy emitter only | `scf.while`/`scf.if` region driver on xtile | P2 |
-| big tensors (byte gates) | excluded to preserve parallelism | intra-kernel parallelism via the existing workgroup ABI (tile-to-thread mapping) plus cost model; gates become model outputs, not constants | P4 |
-| infeed/outfeed, collectives | boundary | stays a boundary (execution suspension is a runtime property) | never |
+Today "fusion" means recompute-per-use (elemental emission, no intermediate buffers) and "region" (dev branch) means materialize-everything (each member writes its buffer slice inside one function). Both extremes are measured: recompute of shared chains cost +24% on a hand-edit experiment; full materialization is nearly free at 32-element sizes but leaves medium-size intermediates round-tripping memory. The right answer is per-edge: recompute cheap producers, keep tile-sized values in stack allocations (the xtile bufferization already does this at <=4 KB), and spill larger intermediates to scratch buffers. A multi-output fusion is then just "an edge someone chose to materialize at the kernel boundary." One construct, one emitter, one cost model choosing per edge. This requires a kernel scratch-buffer arrangement (regions get it from buffer assignment recursing into the called computation; pure fusions need an equivalent).
 
-## New emitters and emitter capabilities (the build list)
+### 4.2 The runtime-context kernel ABI and mid-kernel calls
 
-1. **Region driver on xtile (the big one, P2).** A schedule-walking emitter that takes a region computation (the `xla_cpu_small_call` callee) and emits one MLIR function: members emitted in order through the existing xtile per-op emitters, intermediates as tile allocas or scratch-buffer stores, `scf.while`/`scf.if` for control flow with loop-carried values as memrefs, tuple roots mapped to multiple result buffers. Prior work to reuse: `EmitTiledComputation` (schedule walk, per-root tiles), the flag-gated region emitter's fusion-view flattening and constant lifting, `PromoteBuffersToStack` for allocas. Parity bar: bitwise on jaxley, 24501, and Gemma3 region shapes, at equal or better latency and compile time than `ComputationKernelEmitter`.
-2. **Multi-output tiling (P2).** `SymbolicTileAnalysis` accepts independent roots under the region path's whole-shape single-tile strategy (no cross-root tile-consistency problem exists there); the driver already returns per-root values.
-3. **Tiled reduce-window (P3).** Window dims in the tiling space, the windowed affine map in propagation, a masked `stablehlo.reduce` emission case; vectorization then comes free from the existing reduce lowering. Closes jax#37465 permanently (the interim HLO rewrite for size == stride windows can ship earlier and independently).
-4. **Tiled gather, reverse, dynamic-update-slice (P3).** As inventoried above; scope gather to observed forms; gate DUS on latency because the in-place O(n) self-copy trap passes parity checks.
-5. **In-kernel sequential scatter (P3, optional).** A non-tiled loop-over-index-rows emission under whole-shape tiles; only if a workload demands the last 30% on scatter-heavy loops.
-6. **In-kernel library call emission (P1).** Not an emitter for an op class but a capability all emitters share: emit a call to a registered trampoline with operands materialized to buffers, the runtime context threaded as a kernel argument, and results as ordinary buffers. Covers FFI custom calls, sort, fft, Eigen/oneDNN/YNN entry points, and host callbacks.
-7. **Parallel tiles (P4).** Emit tile loops mapped onto the existing kernel workgroup dimensions so one large kernel uses the intra-op pool, replacing `ParallelTaskAssigner`'s per-op partitioning for fused/region kernels. This is what lets the byte gates relax without losing parallelism.
-8. **Memcpy-aware copy emission (P1).** In-kernel copies lower to `llvm.memcpy` instead of loops.
+The kernel calling convention gains one pointer to a per-execution context: run options, intra-op threadpool, allocator, FFI execution context, profiler hooks. Library and FFI call sites are resolved at emission time into prebuilt call frames stored with the executable; emitted code loads the frame, fills operand pointers, and invokes a stable C trampoline. Rules: call-outs from sequential kernel context by default; a library that manages its own parallelism receives the pool from the context rather than nesting; errors propagate through the existing kernel status return. The pre-thunk emitter's `allow_runtime_calls` mechanism (still present in the code, disabled for region kernels precisely because the ABI lacks a context) is the feasibility proof.
 
-## The runtime-context kernel ABI (P1)
+This one capability dissolves several blockers at once: FFI custom calls (the LAPACK factorizations inside [jax#33666](https://github.com/jax-ml/jax/issues/33666)'s Newton loop), host callbacks (the progress-bar variant of [discussions#24501](https://github.com/jax-ml/jax/discussions/24501)), sort and fft (already runtime calls, just unreachable from kernels), and the tension between folding a loop and keeping library-quality kernels inside it. In-kernel copies lower to `llvm.memcpy` so folding never trades away the memcpy fast path.
 
-Extend the host kernel calling convention with one pointer to a per-execution context (run options, intra-op threadpool, allocator, FFI execution context, profiler hooks). The thunk owns it at execute time and passes it through. Library and FFI call sites are resolved at emission time into prebuilt call frames stored with the executable; the emitted call loads the frame, fills operand pointers, and invokes a stable C trampoline. Discipline: call-outs from sequential kernel context by default; a library that manages its own parallelism receives the pool from the context rather than nesting; error status propagates through the existing kernel error return. The pre-thunk emitter's `allow_runtime_calls` path is the feasibility proof; this is its thunk-era replacement, designed once for all libraries rather than per-library.
+### 4.3 The xtile region driver
 
-Measurement gate: the diffrax stiff repro (jax#33666) folds its Newton loop with LAPACK called in-kernel and recovers its regression; host-callback progress bars (the 24501 with-callback variant) stop forcing the loop apart.
+A schedule-walking emitter that takes an outlined region computation and produces one MLIR function: members emitted in order through the existing xtile per-op emitters; `scf.while` and `scf.if` for control flow with loop-carried values as memrefs; tuple roots mapped to multiple result buffers; intermediates placed per 4.1. Reuses the existing tile analysis, the experimental region emitter's fusion-view flattening and constant-lifting mechanics, and the bufferization pipeline. The parity bar for replacing the legacy backend: bitwise-identical outputs at equal-or-better latency AND compile time on the full regression corpus. Compile time is a first-class bar because one large function is the known failure mode: LLVM middle-end cost grows ~N^1.8 in straight-line body size (2.17 s for a 128-step unrolled chain, against 73 ms at opt-level 0 with ~90% of the runtime win retained), so the driver owns emission-size discipline and opt-level tiering.
 
-## The cost model (P4, scaffolded from P0)
+### 4.4 New emitters and capabilities (the build list)
 
-One function, three clients (region former, fusion sizing, library placement), replacing today's constants:
+1. Region driver (4.3): control flow, multi-output, scheduling, materialization. The largest single piece.
+2. Multi-output tiling: `SymbolicTileAnalysis` currently accepts multiple roots only when one "real root" consumes the others; region shapes have independent roots. Under whole-shape single tiles there is no cross-root consistency problem, so the relaxation is contained.
+3. Tiled reduce-window: window dimensions in the tiling space, the windowed affine map in propagation, a masked reduce emission; vectorization then comes free from the existing reduce lowering. Permanently fixes [jax#37465](https://github.com/jax-ml/jax/issues/37465). (An independent interim fix, an HLO rewrite of non-overlapping reduce-window to reshape+reduce, can ship earlier.)
+4. Tiled gather (per output row, a dynamic-slice of the operand at a runtime index; scope to observed forms), reverse (normalize the negative stride the analysis already produces), dynamic-update-slice (write-side dual of the supported dynamic-slice; the in-place case must be gated on latency, not parity, because a naive lowering inserts a full-array self-copy per loop iteration that parity checks cannot see).
+5. In-kernel sequential scatter (optional): a loop over index rows under whole-shape tiles; no tiling relation needed. Only if a workload demands the last measured gap (0.352 vs 0.238 ms on [jax#26145](https://github.com/jax-ml/jax/issues/26145)); small-scatter expansion already covers the class.
+6. Mid-kernel call emission (4.2), shared by all emitters.
+7. Parallel tiles: emit tile loops mapped onto the existing kernel workgroup dimensions, so one large kernel uses the intra-op pool. This is what lets kernel sizes grow without losing parallelism, replacing per-op partitioning for fused work.
+8. Memcpy-aware copy emission.
 
-- benefit: `saved_thunk_executions x ~50ns x amplification` (trip counts from `known_trip_count`, boolean fallback), plus locality gains for materialized-to-tile edges
-- costs: recompute (per shared producer: internal uses x producer cost, exact from the graph), inter-op overlap loss (subgraph work minus critical path, capped by pool width), intra-op parallelism forfeited (would members partition standalone), register pressure (max live cut of the per-element expression vs physical registers; decides rematerialize vs tile-materialize per edge), operand streams vs prefetcher budget, working set vs L1/L2 (decides tile vs scratch), library delta (calibrated table; per project direction the tie goes to native codegen), code size, and a compile-time budget (member and basic-block caps as hard rails)
-- machine description: dispatch constant, ABI constant, register file, cache sizes, stream budget, pool width; calibrated by the slope-method microbenchmarks and pinned by the regression anchors (jaxley, 24501, inference_gym, diffrax, jax.b380442861, the scan-with-protected-fusions case, Gemma3)
+### 4.5 The cost model
 
-Staging: P0 keeps the shipped discrete gates (byte budget, amplification, thunk-generating min size, member cap) and adds fold-classes; P4 swaps them for the quantitative model once the anchors give it a validation surface. The gating experiment brief's corpus is the calibration set; production fold telemetry is the drift alarm.
+One function, three clients (kernel-boundary formation, per-edge materialization, library placement), replacing today's fixed constants. Benefit: saved thunk executions x ~50 ns x amplification (loop trip counts are usually known statically from `known_trip_count`), plus locality gains for tile-materialized edges. Costs: recompute (per shared producer: uses x producer cost, exact from the graph); inter-kernel overlap forfeited (subgraph total work minus critical path, capped by pool width); intra-op parallelism forfeited (would members partition standalone); register pressure (max live cut of the per-element expression vs the physical register file, deciding recompute-vs-materialize per edge); operand stream count vs the hardware prefetcher budget; working set vs cache capacities; library-vs-codegen deltas from a small calibrated table; code size; and a hard compile-time budget (member and basic-block caps as non-negotiable rails).
 
-## Phases
+Every term is computable to order of magnitude from the graph plus a machine description (dispatch constant, ABI constant, register file, cache sizes, stream budget, pool width). The model's job is not precision; it is to avoid catastrophic corners, and every regression found during development is a corner a coarse model catches: hoisting copy-only regions (+633% and +1321% on two workloads; kernel ABI exceeded the dispatch saved), serializing independent once-per-call fusions (-13% on a 1B-parameter transformer), blocking loop hoisting to protect fusions for newer emitters (+550% on a high-trip-count scan), and a whole-module instruction-count gate that disabled hoisting on a 3,011-instruction model (+37%) because it was calibrated on benchmark slices smaller than production modules. Two standing lessons are encoded as constraints: gates must be per-run or per-region properties, never per-module (benchmark HLOs are often partial-model slices, so module-level thresholds do not transfer to production); and the model must be pinned by a continuously-run anchor suite plus production fold telemetry, or it rots.
 
-- **P0 (now, mostly shipped):** region hoisting + segmentation + amplification, scatter expansion, straight-line member cap, fold-classes, fold telemetry, calibration harness. Small-model issue solved on the legacy backend; everything after this improves how, not whether.
-- **P1: runtime-context ABI and call-outs.** New kernel ABI parameter, trampoline registry, FFI frames, memcpy copies. Deliverables: diffrax folds (jax#33666 closed), sort/fft leave the boundary list, callbacks stop splitting loops. Independent of xtile work.
-- **P2: xtile region driver.** Control flow, multi-output, buffer materialization; regions switch backends behind the existing experimental flag, then by default at the parity bar. `ComputationKernelEmitter` becomes dead code.
-- **P3: op coverage.** reduce-window (jax#37465 closed), gather/reverse/DUS (jax#26021 DUS work item), optional in-kernel scatter. Each op lands with a bug-shaped test and a latency gate.
-- **P4: cost-modeled boundaries.** Quantitative model replaces gates; fusion sizing and region formation unify (larger fusions with per-edge materialization); parallel tiles let big kernels keep the pool; module gates and protection lists are deleted.
-- **P5: legacy deletion.** Inventory every remaining route into `IrEmitter`/`IrEmitter2` (reduce-window fallback dies in P3, region backend in P2, `use_fusion_emitters=false` mode retired with a deprecation window), delete the emitters and the `ComputationKernelEmitter`, simplify the scatter-expansion sandwich and the pipeline flags.
+### 4.6 What remains a boundary
 
-Ordering rationale: P1 and P2 are independent and can run in parallel; P3 needs P2's driver for the region cases but the reduce-window interim rewrite does not; P4 needs P1+P2 (the model's choices must all be emittable before it chooses them); P5 is bookkeeping once P2/P3 land.
+Infeed/outfeed and collectives suspend execution and stay at thunk granularity. Everything else is eventually admissible.
 
-## Issue map
+## 5. Milestones
 
-| issue | closed by |
-|---|---|
-| jax#26145 (jaxley) | P0 (shipped, 0.36 ms bitwise) |
-| jax discussion 24501 | P0 (shipped, 6-18x); callback variant improves further at P1 |
-| jax#33666 (diffrax) | P1 |
-| jax#37465 (reduce-window) | interim rewrite anytime; permanently P3 |
-| jax#26021 (MJX) | P3 (DUS) + P4 (fusion sizing) + upstream batching per the M4 notes |
-| TORAX compile time | out of scope here (inliner prevention workstream); P4's compile budget helps at the margin |
+Each milestone states what gets measurably faster when it lands. M1 and M2 are independent and can run in parallel.
 
-## Risks
+**M0: upstream the region-compilation prototype.** Region hoisting (generalizing `SmallWhileLoopHoistingPass`), small-scatter expansion, budget segmentation with amplification gating, the straight-line cap, and the thunk-generating minimum-size gate, sliced as two PRs (hoisting replaces the while pass and ports its tests; expansion stacks on it).
+*Faster:* small stepping models with rolled loops, 3-4x ([jax#26145](https://github.com/jax-ml/jax/issues/26145): 1.53 to 0.36 ms, bitwise); loop-dominated scans up to 18x ([discussions#24501](https://github.com/jax-ml/jax/discussions/24501)); any small `lax.scan`/`while_loop` body drops from ~70-90 ns to ~25 ns per iteration of overhead. User guidance flips to "roll your loops on CPU": on jax 0.4.30 a rolled and an unrolled loop ran at the same speed; at head the unrolled form is 4.5x slower and ~12x slower to compile; with M0 the rolled form wins on both axes at every size. Cost: +14% compile on transformer-shaped models where per-layer bookkeeping folds (bounded, and excluded under the fast-compile preset); large-tensor models unaffected by construction.
 
-- **P2 parity risk:** the legacy emitter is battle-tested on control flow; the xtile driver replays that maturation. Mitigation: bitwise parity harness already exists and every region shape in the corpus is a test; keep the legacy fallback flag until a full release cycle passes clean.
-- **P1 reentrancy and pool discipline:** library calls from kernels can deadlock or oversubscribe if context rules are loose. Mitigation: sequential-context default, explicit pool handoff, the diffrax anchor plus a stress test with nested scans.
-- **Cost model overfit to anchors:** mitigated by keeping hard rails (compile budget, register cap) non-negotiable and by the partial-model-slice rule from the brief: per-run properties only.
-- **Scope creep in P3:** op coverage is issue-driven with per-op gates; the four-phase-plan history is the cautionary tale, and its findings are the reusable inputs.
-- **Parallel tiles (P4) interact with the executor's own parallelism:** decide per kernel, never both; the cost model owns the choice.
+**M1: runtime-context ABI and mid-kernel calls.** The context parameter, trampoline registry, FFI call frames, memcpy copies; sort and fft leave the boundary list.
+*Faster:* stiff ODE solvers and anything with library calls inside hot loops ([jax#33666](https://github.com/jax-ml/jax/issues/33666), a 1.5-2x regression, recovers: the Newton loop folds with LAPACK called in-kernel); loops containing host callbacks (the progress-bar variant of [discussions#24501](https://github.com/jax-ml/jax/discussions/24501), reported at 13 to 25 s, stops splitting at every iteration); loops containing sort or fft fold for the first time.
 
-## Out of scope
+**M2: the xtile region driver.** Control flow, multi-output, per-edge materialization; regions switch backends behind the existing experimental flag, then by default at the parity bar; `ComputationKernelEmitter` becomes dead code.
+*Faster:* modest direct wins only (the legacy backend is already adequate at 32-element sizes; a measured ~35% on a synthetic dense region from vectorization and stack intermediates, more on medium shapes). The real value is what it unlocks: every M3 op lands once instead of twice, the protected-fusion conflict disappears (regions emit through the same modern emitters), and the legacy dependency is broken. Compile-time tiering (opt-level by region size) lands here.
 
-Loop re-rolling and inliner prevention (M4 of the parent doc); GPU-shared tiling productionization beyond what multi-output needs; YNNPACK coverage expansion (project direction is less to the library, not more); collectives/infeed inside kernels.
+**M3: op coverage on the modern path.** Tiled reduce-window, gather, reverse, dynamic-update-slice; optional in-kernel scatter. Each op ships with a bug-shaped test and a latency gate.
+*Faster:* [jax#37465](https://github.com/jax-ml/jax/issues/37465)-class programs ~1.5x (the four scalar reduce-window kernels, ~12 us of ~30 us, become vectorized); [jax#26021](https://github.com/jax-ml/jax/issues/26021)-class dynamic-update-slice-heavy models (its 3.7x regression is DUS-dominated; the DUS work item plus M4 sizing target it); scatter-heavy loops gain the last ~1.5x if in-kernel scatter ships (0.35 to ~0.24 ms on [jax#26145](https://github.com/jax-ml/jax/issues/26145)).
+
+**M4: cost-modeled boundaries and large kernels.** The quantitative model replaces the M0 gates, fusion sizing and region formation unify under it, per-edge materialization activates, parallel tiles let big kernels keep the pool, and the module gate and protection lists are deleted.
+*Faster:* medium models: per-layer chains get properly sized kernels instead of threshold-shaped ones; trace-time-unrolled code (the [jax#26021](https://github.com/jax-ml/jax/issues/26021) shape) folds safely under the compile rails, measured 1.3-1.5x on synthetic unrolled chains; large-tensor fusions grow without serializing (today's byte gates forbid exactly the folds that would pay there). This is also where compile-time regressions become structurally impossible rather than gated: the budget is a model input.
+
+**M5: delete the legacy emitters.** Inventory-driven: the region backend died at M2, the reduce-window fallback at M3, the `use_fusion_emitters=false` mode retires with a deprecation window; then `IrEmitter`, `IrEmitter2`, and `ComputationKernelEmitter` are removed and the pipeline's dual paths (e.g. the unconditional scatter-expansion branch) collapse.
+*Faster:* nothing directly; this is the payoff in maintenance, single-path testing, and the ability to change the kernel ABI (M1's context, M4's scratch buffers) without double implementation.
+
+## 6. Issue map
+
+| issue | mechanism | closed by |
+|---|---|---|
+| [jax-ml/jax#26145](https://github.com/jax-ml/jax/issues/26145) (jaxley neuron sim, 4-5x) | thunk count in a 300-iteration loop; scatters fragment foldable runs | M0 (prototype measured: bitwise, at pre-thunk parity); M3 optional scatter adds ~1.5x |
+| [jax-ml/jax discussions#24501](https://github.com/jax-ml/jax/discussions/24501) (scan + progress bar) | million-iteration scan next to hoisted invariants; callback splits the loop | M0 (6-18x, no-callback); M1 (callback variant) |
+| [jax-ml/jax#33666](https://github.com/jax-ml/jax/issues/33666) (diffrax stiff, 1.5-2x) | LAPACK FFI + Python callback inside the Newton loop | M1 |
+| [jax-ml/jax#37465](https://github.com/jax-ml/jax/issues/37465) (jnp.diff, 1.7-3.2x) | scalar legacy reduce-window emission | interim HLO rewrite any time; permanently M3 |
+| [jax-ml/jax#26021](https://github.com/jax-ml/jax/issues/26021) (MJX mass matrix, 3.7x) | trace-time-unrolled joint loops, DUS-heavy, medium tensors | M3 (DUS) + M4 (sizing); library-side batching is a separate upstream conversation |
+
+## 7. Risks
+
+- **M2 parity:** the legacy emitter is battle-tested on control flow; the xtile driver replays that maturation. Mitigation: the bitwise-parity harness and regression corpus already exist; keep the legacy fallback flag one full release after parity.
+- **M1 reentrancy:** library calls from kernels can nest pools or deadlock. Mitigation: sequential-context default, explicit pool handoff via the context, a nested-scan stress test, and the [jax#33666](https://github.com/jax-ml/jax/issues/33666) repro as the anchor.
+- **Cost-model overfit:** anchors are finite. Mitigation: hard rails (compile budget, register cap) are non-negotiable regardless of model output; per-run-only gate properties; production fold telemetry as the drift alarm.
+- **Coverage scope creep (M3):** op work is issue-driven with per-op measurement gates; an earlier coverage plan on this project was cancelled by measurement after one week of scoping, and its findings are reused here rather than relitigated.
+- **Parallel tiles vs executor parallelism (M4):** one kernel must not be both internally parallel and concurrently overlapped naively; the cost model owns the either/or per kernel.
+
+## 8. Glossary
+
+- **Thunk:** the runtime's unit of execution, roughly one kernel launch per instruction or fusion. A thunk execution costs ~50 ns at small sizes (~18 ns dispatch + ~30 ns kernel-call ABI).
+- **Amplification:** how many times per user-visible call a piece of code executes. While bodies (and anything nested under them) execute trip-count times; entry code executes once. Fixed overheads only matter where amplified, which is the central discriminator for every folding decision here.
+- **Region:** a run of adjacent instructions outlined into a call and compiled as one kernel. On the dev branch these are formed by the region-hoisting pass and emitted by the legacy backend; after M2 they are xtile kernels, and after M4 "region" and "fusion" are the same construct.
+- **Fold:** absorb an instruction into a region/kernel so it stops being a separately dispatched thunk.
+- **Materialize / rematerialize:** whether a producer's value is written somewhere (buffer or stack) and reloaded, or recomputed at each consumer use. Elemental fusion rematerializes; dev-branch regions materialize to buffer slices; the end state chooses per edge.
+- **Boundary:** an op that cannot join a kernel. Today: runtime-service ops plus coverage gaps. End state: only execution-suspending ops.
+- **xtile:** the modern MLIR tiled-emission stack (`SymbolicTileAnalysis`, tile propagation, `EmitTiledComputation`, bufferization to stack allocations).
+- **Fusion emitters:** the MLIR emitters for standalone fusions (`--xla_cpu_use_fusion_emitters`, default on at head), distinct from the xtile tiled path and from the legacy elemental emitters.
+- **Sentinel:** the option value (byte threshold 0) that disables the dev-branch passes entirely; the upstream-equivalent baseline in every A/B measurement quoted here.
+- **Partial-model slice:** a benchmark HLO cut from a larger program. Module-level properties measured on slices do not transfer to production modules; per-run properties do.
