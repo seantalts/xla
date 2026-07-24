@@ -640,6 +640,42 @@ xla_cc_binary(
     ]),
 )
 
+xla_cc_binary(
+    name = "bench_hlo",
+    testonly = True,
+    srcs = ["bench_hlo.cc"],
+    tags = [
+        "noasan",  # Exceeds linker limit.
+    ],
+    deps = [
+        ":run_hlo_module_lib",
+        "//xla:debug_options_flags",
+        "//xla:literal",
+        "//xla/backends/profiler:profiler_backends",
+        "//xla/hlo/ir:hlo",
+        "//xla/hlo/parser:hlo_parser",
+        "//xla/service:cpu_plugin",
+        "//xla/service:hlo_module_config",
+        "//xla/service:hlo_runner_interface",
+        "//xla/service:hlo_runner_pjrt",
+        "//xla/tests:test_utils",
+        "//xla/tsl/util:command_line_flags",
+        "@com_google_absl//absl/container:flat_hash_map",
+        "@com_google_absl//absl/log:check",
+        "@com_google_absl//absl/status:statusor",
+        "@com_google_absl//absl/strings",
+        "@com_google_absl//absl/strings:str_format",
+        "@com_google_absl//absl/time",
+        "@tsl//tsl/platform:env",
+        "@tsl//tsl/platform:platform_port",
+        "@tsl//tsl/profiler/lib:profiler_factory_impl",
+        "@tsl//tsl/profiler/lib:profiler_session",
+        "@tsl//tsl/profiler/lib:profiler_session_impl",
+        "@tsl//tsl/profiler/protobuf:profiler_options_proto_cc",
+        "@tsl//tsl/profiler/protobuf:xplane_proto_cc",
+    ],
+)
+
 xla_cc_test(
     name = "run_hlo_module_bin_test",
     srcs = ["run_hlo_module_bin_test.cc"],
