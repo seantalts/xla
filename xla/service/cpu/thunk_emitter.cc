@@ -841,12 +841,7 @@ absl::StatusOr<ThunkSequence> ThunkEmitter::EmitFusionKernelThunk(
                                    /*min_alignment=*/MinAlign());
   }
 
-  // We currently only support loop fusion & the dot implementation is currently
-  // not efficient compared to the legacy emitter.
-  if (hlo_module_config_.debug_options().xla_cpu_use_fusion_emitters() &&
-      options::UseExperimentalLoopFusion(hlo_module_config_) &&
-      fusion->fusion_kind() == HloFusionInstruction::FusionKind::kLoop &&
-      fusion->fused_expression_root()->opcode() != HloOpcode::kDot) {
+  if (FusionRoutesToMlirEmitter(hlo_module_config_, fusion)) {
     ASSIGN_OR_RETURN(std::string fingerprint,
                      GetFusionFingerprint(*fusion, buffer_assignment_,
                                           GetDefaultBufferAlignment()));
@@ -873,11 +868,31 @@ absl::StatusOr<ThunkSequence> ThunkEmitter::EmitFusionKernelThunk(
                                    /*min_alignment=*/MinAlign());
   }
 
+  // Deprecation probe: this branch routes to the legacy LLVM loop emitter.
+  // Log enough to attribute every remaining use during corpus scans.
+  VLOG(1) << "Fusion routed to legacy emitter: " << fusion->name()
+          << " kind=" << ToString(fusion->fusion_kind())
+          << " root=" << fusion->fused_expression_root()->opcode();
+
   ASSIGN_OR_RETURN(auto kernel, ir_emitter_.EmitFusionHostKernel(fusion));
   ASSIGN_OR_RETURN(auto buffers, GetHostKernelAllocationSlices(instruction));
 
   return MakeKernelThunkSequence(instruction, buffers, kernel,
                                  /*min_alignment=*/MinAlign());
+}
+
+bool ThunkEmitter::FusionRoutesToMlirEmitter(const HloModuleConfig& config,
+                                             const HloFusionInstruction* fusion) {
+  // The MLIR fusion emitters only support loop fusions. This includes
+  // dot-rooted loop fusions: the MLIR elemental dot costs 6.7 ms per call
+  // against under 6 ms for the legacy elemental dot on the gemma3-1b
+  // copy_dot_fusion (measured 2026-07-24), which is acceptable to retire the
+  // legacy route. Do not split these fusions instead: the fusion exists to
+  // avoid materializing the larger dot operand, and splitting costs 71 ms per
+  // call on the same kernel.
+  return config.debug_options().xla_cpu_use_fusion_emitters() &&
+         options::UseExperimentalLoopFusion(config) &&
+         fusion->fusion_kind() == HloFusionInstruction::FusionKind::kLoop;
 }
 
 absl::StatusOr<ThunkSequence> ThunkEmitter::EmitReductionKernelThunk(

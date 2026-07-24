@@ -89,6 +89,12 @@ class ThunkEmitter {
 
   absl::StatusOr<std::vector<EmittedKernel>> ConsumeKernels();
 
+  // Returns true if the fusion is emitted by the MLIR fusion emitters.
+  // Otherwise it is emitted by the legacy LLVM loop emitter
+  // (IrEmitter2::EmitFusionHostKernel).
+  static bool FusionRoutesToMlirEmitter(const HloModuleConfig& config,
+                                        const HloFusionInstruction* fusion);
+
  private:
   struct HostKernelAllocationSlices {
     std::vector<ShapedSlice> arguments;
