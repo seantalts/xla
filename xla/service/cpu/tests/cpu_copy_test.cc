@@ -43,8 +43,7 @@ ENTRY entry {
   TF_ASSERT_OK_AND_ASSIGN(auto module, ParseAndReturnVerifiedModule(hlo_text));
   TargetMachineFeaturesStub target_machine_features(
       [](int64_t size) { return 16; });
-  FusionWrapper fusion_wrapper(/*using_new_fusion_emitter=*/true,
-                               /*use_tiled_emitter=*/true,
+  FusionWrapper fusion_wrapper(/*use_tiled_emitter=*/true,
                                &target_machine_features);
   TF_ASSERT_OK(fusion_wrapper.Run(module.get()));
   TF_ASSERT_OK_AND_ASSIGN(
@@ -74,8 +73,7 @@ ENTRY entry {
   TF_ASSERT_OK_AND_ASSIGN(auto module, ParseAndReturnVerifiedModule(hlo_text));
   TargetMachineFeaturesStub target_machine_features(
       [](int64_t size) { return 16; });
-  FusionWrapper fusion_wrapper(/*using_new_fusion_emitter=*/true,
-                               /*use_tiled_emitter=*/true,
+  FusionWrapper fusion_wrapper(/*use_tiled_emitter=*/true,
                                &target_machine_features);
   TF_ASSERT_OK(fusion_wrapper.Run(module.get()));
   TF_ASSERT_OK_AND_ASSIGN(
