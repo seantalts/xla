@@ -59,7 +59,7 @@ ENTRY entry {
   }
 }
 
-TEST_F(HloTestBase, LayoutChangingSubByteCopyFails) {
+TEST_F(HloTestBase, LayoutChangingSubByteCopy) {
   const std::string hlo_text = R"hlo(
 HloModule module
 
@@ -78,7 +78,16 @@ ENTRY entry {
                                /*use_tiled_emitter=*/true,
                                &target_machine_features);
   TF_ASSERT_OK(fusion_wrapper.Run(module.get()));
-  EXPECT_FALSE(Execute(std::move(module), {}, /*run_hlo_passes=*/false).ok());
+  TF_ASSERT_OK_AND_ASSIGN(
+      const Literal result,
+      Execute(std::move(module), {}, /*run_hlo_passes=*/false));
+
+  absl::Span<const uint8_t> result_data = result.data<uint8_t>();
+  for (int64_t row = 0; row < 20; ++row) {
+    for (int64_t col = 0; col < 20; ++col) {
+      EXPECT_EQ(result_data[row * 20 + col], row % 4);
+    }
+  }
 }
 
 }  // namespace
