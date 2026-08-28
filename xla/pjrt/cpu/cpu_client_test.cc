@@ -1286,6 +1286,50 @@ TEST(PjRtCpuClientTest, CreateViewOfDeviceBufferSubByteRejectsUnpackedLayout) {
       StatusIs(absl::StatusCode::kUnimplemented));
 }
 
+TEST(PjRtCpuClientTest, CreateViewOfDeviceBufferF4E2M1FNPacked) {
+  TF_ASSERT_OK_AND_ASSIGN(std::unique_ptr<PjRtClient> client,
+                          GetXlaPjrtCpuClient(CpuClientOptions()));
+  TF_ASSERT_OK_AND_ASSIGN(
+      PjRtMemorySpace * memory_space,
+      client->addressable_devices().front()->default_memory_space());
+
+  alignas(64) int8_t data[2] = {0x21, 0x43};
+  const Shape shape = ShapeUtil::MakeShapeWithDenseLayout(
+      F4E2M1FN, {4}, {0}, /*tiles=*/{},
+      /*tail_padding_alignment_in_elements=*/1, /*element_size_in_bits=*/4);
+
+  TF_ASSERT_OK_AND_ASSIGN(
+      std::unique_ptr<PjRtBuffer> buffer,
+      client->CreateViewOfDeviceBuffer(data, shape, memory_space, []() {}));
+  TF_ASSERT_OK(buffer->GetReadyFuture().Await());
+
+  TF_ASSERT_OK_AND_ASSIGN(const size_t on_device_size,
+                          buffer->GetOnDeviceSizeInBytes());
+  EXPECT_EQ(on_device_size, 2);
+
+  TF_ASSERT_OK_AND_ASSIGN(auto literal, buffer->ToLiteral().Await());
+  EXPECT_THAT(literal->data<float4_e2m1fn>(),
+              ElementsAre(float4_e2m1fn(0.5), float4_e2m1fn(1.0),
+                          float4_e2m1fn(1.5), float4_e2m1fn(2.0)));
+}
+
+TEST(PjRtCpuClientTest, CreateViewOfDeviceBufferSubByteRejectsUnaligned) {
+  TF_ASSERT_OK_AND_ASSIGN(std::unique_ptr<PjRtClient> client,
+                          GetXlaPjrtCpuClient(CpuClientOptions()));
+  TF_ASSERT_OK_AND_ASSIGN(
+      PjRtMemorySpace * memory_space,
+      client->addressable_devices().front()->default_memory_space());
+
+  alignas(64) int8_t storage[8] = {};
+  const Shape shape = ShapeUtil::MakeShapeWithDenseLayout(
+      S4, {8}, {0}, /*tiles=*/{}, /*tail_padding_alignment_in_elements=*/1,
+      /*element_size_in_bits=*/4);
+
+  EXPECT_THAT(client->CreateViewOfDeviceBuffer(storage + 1, shape, memory_space,
+                                               []() {}),
+              StatusIs(absl::StatusCode::kInvalidArgument));
+}
+
 TEST(PjRtCpuClientTest, AsyncTransferRawDataSubBytePacked) {
   TF_ASSERT_OK_AND_ASSIGN(auto client, GetPjRtCpuClient(CpuClientOptions()));
   const Shape shape = ShapeUtil::MakeShape(S4, {8});
