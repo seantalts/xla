@@ -16,6 +16,7 @@ limitations under the License.
 #include "xla/backends/cpu/codegen/fusion_emitter.h"
 
 #include <cstdint>
+#include <cstdlib>
 #include <functional>
 #include <memory>
 #include <optional>
@@ -287,6 +288,60 @@ EmitDynamicUpdateSliceFusionKernel(MLIRContext& context,
   return mlir_kernel_definition;
 }
 
+// TEMPORARY MEASUREMENT SPIKE. Remove before review.
+//   XLA_SPIKE_CONCAT=off       never use the concatenate emitter
+//   XLA_SPIKE_CONCAT=noepilog  use it only when the hero is the root
+//   XLA_SPIKE_CONCAT=bitcast   use it only when the epilogue is bitcast-only
+// Anything else keeps today's behaviour.
+static bool SpikeAllowsConcatenateEmitter(const HloFusionInstruction& fusion,
+                                          const HloInstruction& hero) {
+  const char* mode = std::getenv("XLA_SPIKE_CONCAT");
+  if (mode == nullptr) {
+    return true;
+  }
+  absl::string_view m(mode);
+  if (m == "off") {
+    return false;
+  }
+  const HloInstruction* root = fusion.fused_expression_root();
+  if (m == "noepilog") {
+    return root == &hero;
+  }
+  if (m == "bitcast") {
+    const HloInstruction* instr = root;
+    while (instr != &hero) {
+      if (instr->operand_count() != 1) {
+        return false;
+      }
+      const Shape& in = instr->operand(0)->shape();
+      bool is_index_preserving = false;
+      switch (instr->opcode()) {
+        case HloOpcode::kBitcast:
+          is_index_preserving = true;
+          break;
+        case HloOpcode::kTranspose:
+          is_index_preserving =
+              ShapeUtil::TransposeIsBitcast(in, instr->shape(),
+                                            instr->dimensions());
+          break;
+        case HloOpcode::kCopy:
+        case HloOpcode::kReshape:
+          is_index_preserving = ShapeUtil::ReshapeIsBitcast(in, instr->shape());
+          break;
+        default:
+          is_index_preserving = instr->IsElementwise();
+          break;
+      }
+      if (!is_index_preserving) {
+        return false;
+      }
+      instr = instr->operand(0);
+    }
+    return true;
+  }
+  return true;
+}
+
 absl::StatusOr<KernelDefinition<MlirKernelSource>> EmitFusionKernel(
     MLIRContext& mlir_context, const HloFusionInstruction& fusion,
     const BufferAssignment* buffer_assignment, bool use_unique_c_name,
@@ -326,7 +381,8 @@ absl::StatusOr<KernelDefinition<MlirKernelSource>> EmitFusionKernel(
   if (fusion.fusion_kind() == HloFusionInstruction::FusionKind::kLoop) {
     const HloInstruction& hero =
         FindNonTrivialHero(*fusion.fused_expression_root());
-    if (hero.opcode() == HloOpcode::kConcatenate) {
+    if (hero.opcode() == HloOpcode::kConcatenate &&
+        SpikeAllowsConcatenateEmitter(fusion, hero)) {
       return EmitConcatenateFusionKernel(mlir_context, fusion,
                                          buffer_assignment, name);
     }
