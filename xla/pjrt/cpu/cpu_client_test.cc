@@ -40,6 +40,7 @@ limitations under the License.
 #include "absl/status/status_matchers.h"
 #include "absl/strings/string_view.h"
 #include "absl/synchronization/notification.h"
+#include "absl/types/span.h"
 #include "mlir/Dialect/Func/IR/FuncOps.h"
 #include "mlir/Parser/Parser.h"
 #include "xla/ffi/ffi.h"
@@ -1229,6 +1230,155 @@ TEST(PjRtCpuClientTest, SubByteLiteralToBufferRoundtrip) {
   TF_ASSERT_OK(buffer->ToLiteralSync(&literal_result));
 
   EXPECT_TRUE(LiteralTestUtil::Equal(literal, literal_result));
+}
+
+constexpr int8_t kPackedS4LowNibbleFirst[4] = {0x10, 0x32, 0x54, 0x76};
+constexpr s4 kUnpackedS4[8] = {s4(0), s4(1), s4(2), s4(3),
+                               s4(4), s4(5), s4(6), s4(7)};
+
+TEST(PjRtCpuClientTest, CreateViewOfDeviceBufferSubBytePacked) {
+  TF_ASSERT_OK_AND_ASSIGN(std::unique_ptr<PjRtClient> client,
+                          GetXlaPjrtCpuClient(CpuClientOptions()));
+  TF_ASSERT_OK_AND_ASSIGN(
+      PjRtMemorySpace * memory_space,
+      client->addressable_devices().front()->default_memory_space());
+
+  alignas(64) int8_t data[4];
+  std::memcpy(data, kPackedS4LowNibbleFirst, sizeof(data));
+
+  const Shape shape = ShapeUtil::MakeShapeWithDenseLayout(
+      S4, {8}, {0}, /*tiles=*/{}, /*tail_padding_alignment_in_elements=*/1,
+      /*element_size_in_bits=*/4);
+
+  bool deleted = false;
+  TF_ASSERT_OK_AND_ASSIGN(
+      std::unique_ptr<PjRtBuffer> buffer,
+      client->CreateViewOfDeviceBuffer(data, shape, memory_space,
+                                       [&deleted]() { deleted = true; }));
+  TF_ASSERT_OK(buffer->GetReadyFuture().Await());
+
+  TF_ASSERT_OK_AND_ASSIGN(const size_t on_device_size,
+                          buffer->GetOnDeviceSizeInBytes());
+  EXPECT_EQ(on_device_size, 4);
+
+  TF_ASSERT_OK_AND_ASSIGN(std::shared_ptr<Literal> literal,
+                          buffer->ToLiteral().Await());
+  EXPECT_THAT(literal->data<s4>(), ElementsAreArray(kUnpackedS4));
+
+  buffer.reset();
+  EXPECT_TRUE(deleted);
+}
+
+TEST(PjRtCpuClientTest, CreateViewOfDeviceBufferSubByteRejectsUnpackedLayout) {
+  TF_ASSERT_OK_AND_ASSIGN(std::unique_ptr<PjRtClient> client,
+                          GetXlaPjrtCpuClient(CpuClientOptions()));
+  TF_ASSERT_OK_AND_ASSIGN(
+      PjRtMemorySpace * memory_space,
+      client->addressable_devices().front()->default_memory_space());
+
+  alignas(64) int8_t data[8] = {};
+  const Shape shape = ShapeUtil::MakeShapeWithDenseLayout(
+      S4, {8}, {0}, /*tiles=*/{}, /*tail_padding_alignment_in_elements=*/1,
+      /*element_size_in_bits=*/0);
+
+  EXPECT_THAT(
+      client->CreateViewOfDeviceBuffer(data, shape, memory_space, []() {}),
+      StatusIs(absl::StatusCode::kUnimplemented));
+}
+
+TEST(PjRtCpuClientTest, AsyncTransferRawDataSubBytePacked) {
+  TF_ASSERT_OK_AND_ASSIGN(auto client, GetPjRtCpuClient(CpuClientOptions()));
+  const Shape shape = ShapeUtil::MakeShape(S4, {8});
+  TF_ASSERT_OK_AND_ASSIGN(auto transfer_manager,
+                          client->CreateBuffersForAsyncHostToDevice(
+                              {shape}, client->memory_spaces()[0]));
+  EXPECT_EQ(transfer_manager->buffer_size(0), 4);
+
+  auto buffer = transfer_manager->RetrieveBuffer(0);
+  TF_ASSERT_OK(transfer_manager->TransferRawDataToSubBuffer(
+      0, kPackedS4LowNibbleFirst, /*offset=*/0,
+      /*transfer_size=*/sizeof(kPackedS4LowNibbleFirst),
+      /*is_last_transfer=*/true, []() {}));
+
+  TF_ASSERT_OK_AND_ASSIGN(auto literal, buffer->ToLiteral().Await());
+  EXPECT_THAT(literal->data<s4>(), ElementsAreArray(kUnpackedS4));
+}
+
+TEST(PjRtCpuClientTest, AsyncTransferRawDataSubByteChunked) {
+  TF_ASSERT_OK_AND_ASSIGN(auto client, GetPjRtCpuClient(CpuClientOptions()));
+  const Shape shape = ShapeUtil::MakeShape(S4, {8});
+  TF_ASSERT_OK_AND_ASSIGN(auto transfer_manager,
+                          client->CreateBuffersForAsyncHostToDevice(
+                              {shape}, client->memory_spaces()[0]));
+  auto buffer = transfer_manager->RetrieveBuffer(0);
+
+  TF_ASSERT_OK(transfer_manager->TransferRawDataToSubBuffer(
+      0, kPackedS4LowNibbleFirst, /*offset=*/0, /*transfer_size=*/2,
+      /*is_last_transfer=*/false, []() {}));
+  TF_ASSERT_OK(transfer_manager->TransferRawDataToSubBuffer(
+      0, kPackedS4LowNibbleFirst + 2, /*offset=*/2, /*transfer_size=*/2,
+      /*is_last_transfer=*/true, []() {}));
+
+  TF_ASSERT_OK_AND_ASSIGN(auto literal, buffer->ToLiteral().Await());
+  EXPECT_THAT(literal->data<s4>(), ElementsAreArray(kUnpackedS4));
+}
+
+TEST(PjRtCpuClientTest, AsyncTransferRawDataF4E2M1FNPacked) {
+  TF_ASSERT_OK_AND_ASSIGN(auto client, GetPjRtCpuClient(CpuClientOptions()));
+  const Shape shape = ShapeUtil::MakeShape(F4E2M1FN, {4});
+  TF_ASSERT_OK_AND_ASSIGN(auto transfer_manager,
+                          client->CreateBuffersForAsyncHostToDevice(
+                              {shape}, client->memory_spaces()[0]));
+  EXPECT_EQ(transfer_manager->buffer_size(0), 2);
+
+  auto buffer = transfer_manager->RetrieveBuffer(0);
+  constexpr int8_t kPacked[2] = {0x21, 0x43};
+  TF_ASSERT_OK(transfer_manager->TransferRawDataToSubBuffer(
+      0, kPacked, /*offset=*/0, /*transfer_size=*/sizeof(kPacked),
+      /*is_last_transfer=*/true, []() {}));
+
+  TF_ASSERT_OK_AND_ASSIGN(auto literal, buffer->ToLiteral().Await());
+  EXPECT_THAT(literal->data<float4_e2m1fn>(),
+              ElementsAre(float4_e2m1fn(0.5), float4_e2m1fn(1.0),
+                          float4_e2m1fn(1.5), float4_e2m1fn(2.0)));
+
+  int8_t read_back[2] = {};
+  TF_ASSERT_OK(buffer->CopyRawToHost(read_back, 0, sizeof(read_back)).Await());
+  EXPECT_THAT(read_back, ElementsAreArray(kPacked));
+}
+
+TEST(PjRtCpuClientTest, AsyncTransferSubByteRejectsExplicitLayout) {
+  TF_ASSERT_OK_AND_ASSIGN(auto client, GetPjRtCpuClient(CpuClientOptions()));
+  PjRtClient::ShapeSpec spec;
+  spec.element_type = S4;
+  spec.dims = {8};
+  const std::optional<Layout> layout = LayoutUtil::MakeLayout({0});
+  EXPECT_THAT(client->CreateBuffersForAsyncHostToDevice(
+                  absl::MakeConstSpan(&spec, 1),
+                  absl::MakeConstSpan(&layout, 1), client->memory_spaces()[0]),
+              StatusIs(absl::StatusCode::kUnimplemented));
+}
+
+TEST(PjRtCpuClientTest, CopyRawToHostSubByteIsPacked) {
+  TF_ASSERT_OK_AND_ASSIGN(std::unique_ptr<PjRtClient> client,
+                          GetXlaPjrtCpuClient(CpuClientOptions()));
+  TF_ASSERT_OK_AND_ASSIGN(
+      PjRtMemorySpace * memory_space,
+      client->addressable_devices().front()->default_memory_space());
+
+  const Literal literal = LiteralUtil::CreateR1<s4>(
+      {s4(0), s4(1), s4(2), s4(3), s4(4), s4(5), s4(6), s4(7)});
+  TF_ASSERT_OK_AND_ASSIGN(std::unique_ptr<PjRtBuffer> buffer,
+                          client->BufferFromHostLiteral(literal, memory_space));
+  TF_ASSERT_OK(buffer->GetReadyFuture().Await());
+
+  TF_ASSERT_OK_AND_ASSIGN(const size_t on_device_size,
+                          buffer->GetOnDeviceSizeInBytes());
+  EXPECT_EQ(on_device_size, 4);
+
+  int8_t read_back[4] = {};
+  TF_ASSERT_OK(buffer->CopyRawToHost(read_back, 0, sizeof(read_back)).Await());
+  EXPECT_THAT(read_back, ElementsAreArray(kPackedS4LowNibbleFirst));
 }
 
 TEST(PjRtCpuClientTest, CustomAllocator) {
