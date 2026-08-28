@@ -31,26 +31,32 @@ func.func @extend_vector(%input: vector<8xbf16>) -> vector<8xf32> {
 // -----
 
 func.func @truncate(%input: f32) -> bf16 {
-  // CHECK-NOT: arith.truncf
   %truncated = arith.truncf %input : f32 to bf16
   func.return %truncated : bf16
 }
 
+// CHECK-LABEL: @truncate
+// CHECK-NOT:     arith.truncf
+
 // -----
 
 func.func @truncate_vector(%input: vector<8xf32>) -> vector<8xbf16> {
-  // CHECK-NOT: arith.truncf
   %truncated = arith.truncf %input : vector<8xf32> to vector<8xbf16>
   func.return %truncated : vector<8xbf16>
 }
 
+// CHECK-LABEL: @truncate_vector
+// CHECK-NOT:     arith.truncf
+
 // -----
 
 func.func @truncate_f64_to_f32(%input: f64) -> f32 {
-  // CHECK: arith.truncf
   %truncated = arith.truncf %input : f64 to f32
   func.return %truncated : f32
 }
+
+// CHECK-LABEL: @truncate_f64_to_f32
+// CHECK:         arith.truncf
 
 // -----
 
