@@ -49,6 +49,12 @@ static std::optional<llvm::SmallVector<int64_t>> GetNativeShape(
   if (!unrollable) {
     return std::nullopt;
   }
+  // Unrolling a transpose along the permuted dimensions turns it into
+  // per-element shuffling. Leave it whole for ConvertVectorToLLVM, which knows
+  // how to lower it with register shuffles.
+  if (mlir::isa<mlir::vector::TransposeOp>(op)) {
+    return std::nullopt;
+  }
   auto shape = unrollable.getShapeForUnroll();
   if (!shape || shape->size() <= 1) {
     return std::nullopt;

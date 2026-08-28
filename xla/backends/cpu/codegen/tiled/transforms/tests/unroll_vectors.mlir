@@ -76,6 +76,26 @@ func.func @unroll_constant_mask_partial(%dest: tensor<2x4xi1>) -> tensor<2x4xi1>
 
 // -----
 
+func.func @no_unroll_transpose(%arg0: vector<32x16xbf16>) -> vector<16x32xbf16> {
+  %0 = vector.transpose %arg0, [1, 0] : vector<32x16xbf16> to vector<16x32xbf16>
+  return %0 : vector<16x32xbf16>
+}
+// CHECK-LABEL: func.func @no_unroll_transpose(
+// CHECK-COUNT-1: vector.transpose %{{.*}} : vector<32x16xbf16> to vector<16x32xbf16>
+// CHECK-NOT:     vector.transpose
+
+// -----
+
+func.func @no_unroll_transpose_unit_leading(%arg0: vector<1x1x32x16xbf16>) -> vector<1x1x16x32xbf16> {
+  %0 = vector.transpose %arg0, [0, 1, 3, 2] : vector<1x1x32x16xbf16> to vector<1x1x16x32xbf16>
+  return %0 : vector<1x1x16x32xbf16>
+}
+// CHECK-LABEL: func.func @no_unroll_transpose_unit_leading(
+// CHECK-COUNT-1: vector.transpose
+// CHECK-NOT:     vector.transpose
+
+// -----
+
 func.func @no_unroll_1d(%arg0: tensor<4xf32>, %arg1: tensor<4xf32>, %dest: tensor<4xf32>) -> tensor<4xf32> {
   %c0 = arith.constant 0 : index
   %pad = arith.constant 0.000000e+00 : f32
