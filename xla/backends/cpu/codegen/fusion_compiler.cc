@@ -16,6 +16,7 @@ limitations under the License.
 #include "xla/backends/cpu/codegen/fusion_compiler.h"
 
 #include <cstdint>
+#include <cstdlib>
 #include <memory>
 #include <optional>
 #include <string>
@@ -218,10 +219,13 @@ void AddScalarOptimizationPasses(mlir::OpPassManager& pm,
   // instructions over ifs.
   pm.addPass(mlir::createLoopInvariantCodeMotionPass());
   // TODO(willfroom): Re-enable vectorization once b/431961172 is fixed.
-  // emitters::VectorizeLoadsAndStoresPassOptions vectorize_options;
-  // vectorize_options.target_type_ = "cpu";
-  // pm.addNestedPass<mlir::func::FuncOp>(
-  //     emitters::createVectorizeLoadsAndStoresPass(vectorize_options));
+  // TEMPORARY MEASUREMENT SPIKE. Remove before review.
+  if (std::getenv("XLA_SPIKE_VECTORIZE") != nullptr) {
+    emitters::VectorizeLoadsAndStoresPassOptions vectorize_options;
+    vectorize_options.target_type_ = "cpu";
+    pm.addNestedPass<mlir::func::FuncOp>(
+        emitters::createVectorizeLoadsAndStoresPass(vectorize_options));
+  }
   pm.addPass(mlir::createCanonicalizerPass());
   pm.addPass(mlir::createCSEPass());
   pm.addNestedPass<mlir::func::FuncOp>(cpu::createAddLoopUnrollFlagsPass());
