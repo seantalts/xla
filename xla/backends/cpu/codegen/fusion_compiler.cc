@@ -460,11 +460,12 @@ void AddVectorToLLVMPasses(mlir::OpPassManager& pm, bool fast_min_max) {
 void AddNewVectorToLLVMPasses(mlir::OpPassManager& pm, bool fast_min_max) {
   // Get rid of 0d vectors.
   pm.addPass(cpu::createVectorToScalarPass());
-  // Get rid of unit dimensions before unrolling, so that a tile whose innermost
-  // dimension is one is not unrolled down to a single element per step.
+  // Get rid of unit dimensions. Also run before unrolling, so that a tile whose
+  // innermost dimension is one is not unrolled down to one element per step.
   pm.addPass(cpu::createDropVectorUnitDimsPass());
   // Get rid of multi-dimensional vectors.
   pm.addPass(cpu::createUnrollVectorsPass());
+  pm.addPass(cpu::createDropVectorUnitDimsPass());
   pm.addPass(mlir::createConvertVectorToSCFPass(
       mlir::VectorTransferToSCFOptions().enableFullUnroll(true)));
   pm.addPass(mlir::createCanonicalizerPass());

@@ -13,10 +13,10 @@ fusion {
 }
 
 // CHECK-LLVM-LABEL: llvm.func internal @wrapped_fusion_impl
-// CHECK-LLVM-NOT:     @xla.fptrunc.f32.to.bf16
 
-// NEW-VECTOR-LLVM-LABEL: llvm.func internal @wrapped_fusion_impl
-// NEW-VECTOR-LLVM-NOT:     @xla.fptrunc.f32.to.bf16
+// NEW-VECTOR-LLVM-LABEL:   llvm.func internal @wrapped_fusion_impl
+// NEW-VECTOR-LLVM-COUNT-2:   llvm.call @xla.fptrunc.v8f32.to.v8bf16
+// NEW-VECTOR-LLVM-NOT:       llvm.call @xla.fptrunc.f32.to.bf16
 
 ENTRY main {
   p0 = f32[16,16] parameter(0)
