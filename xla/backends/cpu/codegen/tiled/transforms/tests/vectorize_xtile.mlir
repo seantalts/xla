@@ -699,7 +699,8 @@ func.func @test_insert_unaligned(%arg0: tensor<8xf32>, %arg1: memref<128xf32>,
 
 // -----
 
-func.func @test_extract_strided(%arg0: memref<12x1xf64>, %arg1: index) -> tensor<2x1xf64> {
+func.func @test_extract_strided(%arg0: memref<12x1xf64>,
+    %arg1: index {xla.range = [0 : index, 8 : index]}) -> tensor<2x1xf64> {
   %c0 = arith.constant 0 : index
   %0 = xtile.extract %arg0[%arg1, %c0] [2, 1] [3, 1] : memref<12x1xf64> -> tensor<2x1xf64>
   return %0 : tensor<2x1xf64>
@@ -718,7 +719,8 @@ func.func @test_extract_strided(%arg0: memref<12x1xf64>, %arg1: index) -> tensor
 
 // -----
 
-func.func @test_insert_strided(%arg0: tensor<2x1xf64>, %arg1: memref<12x1xf64>, %arg2: index) {
+func.func @test_insert_strided(%arg0: tensor<2x1xf64>, %arg1: memref<12x1xf64>,
+    %arg2: index {xla.range = [0 : index, 8 : index]}) {
   %c0 = arith.constant 0 : index
   xtile.insert %arg0 into %arg1[%arg2, %c0] [2, 1] [3, 1] : tensor<2x1xf64> -> memref<12x1xf64>
   return
@@ -736,7 +738,76 @@ func.func @test_insert_strided(%arg0: tensor<2x1xf64>, %arg1: memref<12x1xf64>, 
 
 // -----
 
-func.func @test_extract_multi_strided(%arg0: memref<8x8xf32>, %arg1: index, %arg2: index) -> tensor<2x2xf32> {
+func.func @test_extract_strided_unbounded_offset(%arg0: memref<12x1xf64>,
+    %arg1: index) -> tensor<2x1xf64> {
+  %c0 = arith.constant 0 : index
+  %0 = xtile.extract %arg0[%arg1, %c0] [2, 1] [3, 1] : memref<12x1xf64> -> tensor<2x1xf64>
+  return %0 : tensor<2x1xf64>
+}
+// CHECK-LABEL: @test_extract_strided_unbounded_offset
+// CHECK-DAG: %[[C0:.*]] = arith.constant 0 : index
+// CHECK-DAG: %[[PAD:.*]] = arith.constant 0.000000e+00 : f64
+// CHECK: arith.cmpi sge, %arg1, %{{.*}} : index
+// CHECK: arith.cmpi slt, %arg1, %{{.*}} : index
+// CHECK: %[[V0:.*]] = scf.if %{{.*}} -> (f64) {
+// CHECK:   memref.load %arg0[%arg1, %[[C0]]] : memref<12x1xf64>
+// CHECK: } else {
+// CHECK:   scf.yield %[[PAD]] : f64
+// CHECK: }
+// CHECK: vector.insert %[[V0]], %{{.*}} [0, 0] : f64 into vector<2x1xf64>
+// CHECK: %[[OFF1:.*]] = arith.addi %arg1, %{{.*}} : index
+// CHECK: arith.cmpi slt, %[[OFF1]], %{{.*}} : index
+// CHECK: %[[V1:.*]] = scf.if %{{.*}} -> (f64) {
+// CHECK:   memref.load %arg0[%[[OFF1]], %[[C0]]] : memref<12x1xf64>
+// CHECK: }
+// CHECK: vector.insert %[[V1]], %{{.*}} [1, 0] : f64 into vector<2x1xf64>
+
+// -----
+
+// Only the strided element can leave the memref, so only it is guarded.
+func.func @test_extract_strided_upper_bound_only(%arg0: memref<12x1xf64>,
+    %arg1: index {xla.range = [0 : index, 10 : index]}) -> tensor<2x1xf64> {
+  %c0 = arith.constant 0 : index
+  %0 = xtile.extract %arg0[%arg1, %c0] [2, 1] [3, 1] : memref<12x1xf64> -> tensor<2x1xf64>
+  return %0 : tensor<2x1xf64>
+}
+// CHECK-LABEL: @test_extract_strided_upper_bound_only
+// CHECK: memref.load %arg0[%arg1, %{{.*}}] : memref<12x1xf64>
+// CHECK-NOT: scf.if
+// CHECK: %[[OFF1:.*]] = arith.addi %arg1, %{{.*}} : index
+// CHECK-NOT: arith.cmpi sge
+// CHECK: arith.cmpi slt, %[[OFF1]], %{{.*}} : index
+// CHECK: scf.if
+// CHECK:   memref.load %arg0[%[[OFF1]], %{{.*}}] : memref<12x1xf64>
+
+// -----
+
+func.func @test_insert_strided_unbounded_offset(%arg0: tensor<2x1xf64>,
+    %arg1: memref<12x1xf64>, %arg2: index) {
+  %c0 = arith.constant 0 : index
+  xtile.insert %arg0 into %arg1[%arg2, %c0] [2, 1] [3, 1] : tensor<2x1xf64> -> memref<12x1xf64>
+  return
+}
+// CHECK-LABEL: @test_insert_strided_unbounded_offset
+// CHECK-DAG: %[[C0:.*]] = arith.constant 0 : index
+// CHECK: arith.cmpi sge, %arg2, %{{.*}} : index
+// CHECK: arith.cmpi slt, %arg2, %{{.*}} : index
+// CHECK: %[[E0:.*]] = vector.extract %{{.*}}[0, 0] : f64 from vector<2x1xf64>
+// CHECK: scf.if %{{.*}} {
+// CHECK:   memref.store %[[E0]], %arg1[%arg2, %[[C0]]] : memref<12x1xf64>
+// CHECK: }
+// CHECK: %[[OFF1:.*]] = arith.addi %arg2, %{{.*}} : index
+// CHECK: arith.cmpi slt, %[[OFF1]], %{{.*}} : index
+// CHECK: %[[E1:.*]] = vector.extract %{{.*}}[1, 0] : f64 from vector<2x1xf64>
+// CHECK: scf.if %{{.*}} {
+// CHECK:   memref.store %[[E1]], %arg1[%[[OFF1]], %[[C0]]] : memref<12x1xf64>
+// CHECK: }
+
+// -----
+
+func.func @test_extract_multi_strided(%arg0: memref<8x8xf32>,
+    %arg1: index {xla.range = [0 : index, 5 : index]},
+    %arg2: index {xla.range = [0 : index, 4 : index]}) -> tensor<2x2xf32> {
   %0 = xtile.extract %arg0[%arg1, %arg2] [2, 2] [2, 3] : memref<8x8xf32> -> tensor<2x2xf32>
   return %0 : tensor<2x2xf32>
 }
@@ -759,7 +830,9 @@ func.func @test_extract_multi_strided(%arg0: memref<8x8xf32>, %arg1: index, %arg
 
 // -----
 
-func.func @test_insert_multi_strided(%arg0: tensor<2x2xf32>, %arg1: memref<8x8xf32>, %arg2: index, %arg3: index) {
+func.func @test_insert_multi_strided(%arg0: tensor<2x2xf32>, %arg1: memref<8x8xf32>,
+    %arg2: index {xla.range = [0 : index, 5 : index]},
+    %arg3: index {xla.range = [0 : index, 4 : index]}) {
   xtile.insert %arg0 into %arg1[%arg2, %arg3] [2, 2] [2, 3] : tensor<2x2xf32> -> memref<8x8xf32>
   return
 }

@@ -1,0 +1,40 @@
+// RUN: fusion_to_xtile %s | fusion_compiler_opt --xtile-cpu-xtile-to-vector \
+// RUN:   | FileCheck %s --check-prefix=CHECK-VECTOR
+// RUN: test_correctness %s
+
+// RUN: fusion_to_xtile %s | fusion_compiler_opt \
+// RUN:   --xtile-cpu-new-xtile-to-vector --xla-simplify-arith \
+// RUN:   | FileCheck %s --check-prefix=NEW-VECTOR
+// RUN: test_correctness %s --xla_cpu_use_new_xtile_lowering=true
+
+// The last tile of the output runs off the end of the operand: the tile offset
+// only reaches 960, but its strided elements reach 960 + 75. The elements that
+// the offset range cannot prove in bounds have to be guarded.
+fusion {
+  p0 = f32[1000] parameter(0)
+  ROOT slice = f32[200] slice(p0), slice={[0:1000:5]}
+}
+
+ENTRY main {
+  p0 = f32[1000] parameter(0)
+  ROOT fusion = f32[200] fusion(p0), kind=kLoop, calls=fusion,
+    backend_config={
+      "fusion_backend_config":{
+        "block_level_fusion_config":{
+          "output_tiles":[{"sizes":["16"]}],
+          "num_ctas":"1"
+        }
+      }
+    }
+}
+
+// CHECK-VECTOR-LABEL: func.func @wrapped_fusion_impl
+// CHECK-VECTOR:         memref.subview
+// CHECK-VECTOR:         memref.copy
+
+// NEW-VECTOR-LABEL:    func.func @wrapped_fusion_impl(
+// NEW-VECTOR-COUNT-8:    memref.load {{.*}} : memref<1000xf32>
+// NEW-VECTOR-NOT:        memref.load
+// NEW-VECTOR:            arith.cmpi slt, %{{.*}}, %{{.*}} : index
+// NEW-VECTOR-COUNT-8:    scf.if
+// NEW-VECTOR:            vector.transfer_write

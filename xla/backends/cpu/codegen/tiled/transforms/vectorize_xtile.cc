@@ -155,6 +155,35 @@ mlir::ArrayAttr GetInBoundsAttr(mlir::OpBuilder& builder, int64_t rank,
   return builder.getBoolArrayAttr(llvm::SmallVector<bool>(rank, in_bounds));
 }
 
+// A strided tile is not clamped to the memref the way a contiguous one is, so
+// an element that cannot be placed inside [0, dim_size) statically has to be
+// guarded at runtime.
+struct TileElementBounds {
+  bool out_of_bounds = false;
+  bool check_lower = false;
+  bool check_upper = false;
+};
+
+TileElementBounds GetTileElementBounds(Value offset, int64_t stride_offset,
+                                       int64_t dim_size) {
+  if (std::optional<int64_t> constant = mlir::getConstantIntValue(offset)) {
+    int64_t coord = *constant + stride_offset;
+    return {/*out_of_bounds=*/coord < 0 || coord >= dim_size};
+  }
+  std::optional<Interval> range = GetRange(offset);
+  if (!range.has_value()) {
+    return {/*out_of_bounds=*/false, /*check_lower=*/true,
+            /*check_upper=*/true};
+  }
+  int64_t lower = range->lower + stride_offset;
+  int64_t upper = range->upper + stride_offset;
+  if (lower >= dim_size || upper < 0) {
+    return {/*out_of_bounds=*/true};
+  }
+  return {/*out_of_bounds=*/false, /*check_lower=*/lower < 0,
+          /*check_upper=*/upper >= dim_size};
+}
+
 template <typename EmitFn>
 void EmitElements(mlir::OpBuilder& builder, mlir::Location loc,
                   llvm::ArrayRef<int64_t> shape, ValueRange offsets,
@@ -167,20 +196,14 @@ void EmitElements(mlir::OpBuilder& builder, mlir::Location loc,
   int64_t num_elements = Product(shape);
   for (int64_t idx = 0; idx < num_elements; ++idx) {
     bool in_bounds = true;
+    llvm::SmallVector<TileElementBounds> bounds(rank);
     for (int64_t d = 0; d < rank; ++d) {
       int64_t stride_offset = vector_coords[d] * strides[d];
       if (d < memref_shape.size() &&
           !mlir::ShapedType::isDynamic(memref_shape[d])) {
-        int64_t dim_size = memref_shape[d];
-        std::optional<int64_t> const_offset =
-            mlir::getConstantIntValue(offsets[d]);
-        if (const_offset.has_value()) {
-          int64_t coord = *const_offset + stride_offset;
-          if (coord < 0 || coord >= dim_size) {
-            in_bounds = false;
-            break;
-          }
-        } else if (stride_offset >= dim_size) {
+        bounds[d] =
+            GetTileElementBounds(offsets[d], stride_offset, memref_shape[d]);
+        if (bounds[d].out_of_bounds) {
           in_bounds = false;
           break;
         }
@@ -195,7 +218,23 @@ void EmitElements(mlir::OpBuilder& builder, mlir::Location loc,
           ma::AddIOp::create(builder, loc, offsets[d], delta_val);
     }
     if (in_bounds) {
-      emit_fn(vector_coords, memref_coords);
+      Value predicate;
+      auto add_check = [&](ma::CmpIPredicate pred, Value lhs, int64_t rhs) {
+        Value bound = ma::ConstantIndexOp::create(builder, loc, rhs);
+        Value cmp = ma::CmpIOp::create(builder, loc, pred, lhs, bound);
+        predicate = predicate == nullptr
+                        ? cmp
+                        : ma::AndIOp::create(builder, loc, predicate, cmp);
+      };
+      for (int64_t d = 0; d < rank; ++d) {
+        if (bounds[d].check_lower) {
+          add_check(ma::CmpIPredicate::sge, memref_coords[d], 0);
+        }
+        if (bounds[d].check_upper) {
+          add_check(ma::CmpIPredicate::slt, memref_coords[d], memref_shape[d]);
+        }
+      }
+      emit_fn(vector_coords, memref_coords, predicate);
     }
 
     for (int64_t d = rank - 1; d >= 0; --d) {
@@ -234,9 +273,24 @@ struct ConvertExtractTile
       EmitElements(rewriter, loc, result_vector_type.getShape(), offsets,
                    op.getStrides(), source_memref_type.getShape(),
                    [&](llvm::ArrayRef<int64_t> vector_coords,
-                       llvm::ArrayRef<Value> memref_coords) {
-                     mlir::Value elem = mlir::memref::LoadOp::create(
-                         rewriter, loc, source_memref, memref_coords);
+                       llvm::ArrayRef<Value> memref_coords, Value predicate) {
+                     mlir::Value elem;
+                     if (predicate == nullptr) {
+                       elem = mlir::memref::LoadOp::create(
+                           rewriter, loc, source_memref, memref_coords);
+                     } else {
+                       ms::IfOp if_op = ms::IfOp::create(
+                           rewriter, loc, result_vector_type.getElementType(),
+                           predicate, /*withElseRegion=*/true);
+                       mlir::OpBuilder::InsertionGuard guard(rewriter);
+                       rewriter.setInsertionPointToStart(if_op.thenBlock());
+                       Value loaded = mlir::memref::LoadOp::create(
+                           rewriter, loc, source_memref, memref_coords);
+                       ms::YieldOp::create(rewriter, loc, loaded);
+                       rewriter.setInsertionPointToStart(if_op.elseBlock());
+                       ms::YieldOp::create(rewriter, loc, pad);
+                       elem = if_op.getResult(0);
+                     }
                      res = mv::InsertOp::create(rewriter, loc, elem, res,
                                                 vector_coords);
                    });
@@ -322,9 +376,18 @@ struct ConvertInsertTile
       EmitElements(rewriter, loc, source_vector_type.getShape(), offsets,
                    op.getStrides(), dest_memref_type.getShape(),
                    [&](llvm::ArrayRef<int64_t> vector_coords,
-                       llvm::ArrayRef<Value> memref_coords) {
+                       llvm::ArrayRef<Value> memref_coords, Value predicate) {
                      mlir::Value elem = mv::ExtractOp::create(
                          rewriter, loc, source_vector, vector_coords);
+                     if (predicate == nullptr) {
+                       mlir::memref::StoreOp::create(
+                           rewriter, loc, elem, dest_memref, memref_coords);
+                       return;
+                     }
+                     ms::IfOp if_op = ms::IfOp::create(
+                         rewriter, loc, predicate, /*withElseRegion=*/false);
+                     mlir::OpBuilder::InsertionGuard guard(rewriter);
+                     rewriter.setInsertionPointToStart(if_op.thenBlock());
                      mlir::memref::StoreOp::create(rewriter, loc, elem,
                                                    dest_memref, memref_coords);
                    });
