@@ -195,6 +195,20 @@ cc_ir_header(
 )
 
 xla_cc_test(
+    name = "cpp_gen_intrinsics_test",
+    srcs = ["cpp_gen_intrinsics_test.cc"],
+    deps = [
+        ":_cpp_gen_intrinsics",
+        ":eigen_unary_16_ll",
+        "//xla/codegen/intrinsic:simple_jit_runner",
+        "@com_google_absl//absl/strings:string_view",
+        "@com_google_googletest//:gtest_main",
+        "@llvm-project//llvm:Support",
+        "@llvm-project//llvm:ir_headers",
+    ],
+)
+
+xla_cc_test(
     name = "eigen_unary_test",
     srcs = ["eigen_unary_test.cc"],
     copts = [
@@ -261,7 +275,6 @@ cc_library(
         "//xla/codegen/intrinsic:type",
         "@com_google_absl//absl/log:check",
         "@com_google_absl//absl/status:statusor",
-        "@com_google_absl//absl/strings",
         "@com_google_absl//absl/strings:string_view",
         "@llvm-project//llvm:ir_headers",
     ],

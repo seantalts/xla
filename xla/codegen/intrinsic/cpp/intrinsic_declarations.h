@@ -23,14 +23,21 @@ limitations under the License.
 #include "absl/strings/match.h"
 #include "absl/strings/string_view.h"
 #include "llvm/IR/Attributes.h"
+#include "llvm/IR/DerivedTypes.h"
 #include "llvm/IR/Function.h"
 #include "llvm/IR/Module.h"
+#include "llvm/IR/Type.h"
 #include "xla/codegen/intrinsic/cpp/cpp_gen_intrinsics.h"
 #include "xla/codegen/intrinsic/intrinsic.h"
 #include "xla/codegen/intrinsic/type.h"
 #include "xla/xla_data.pb.h"
 
 namespace xla::codegen::intrinsics {
+
+inline llvm::FunctionType* UnaryFunctionType(llvm::Module* module, Type type) {
+  llvm::Type* ir_type = type.to_ir_type(module->getContext());
+  return llvm::FunctionType::get(ir_type, {ir_type}, /*isVarArg=*/false);
+}
 
 class EigenTanh : public Intrinsic<EigenTanh> {
  public:
@@ -50,7 +57,8 @@ class EigenTanh : public Intrinsic<EigenTanh> {
 
   static absl::StatusOr<llvm::Function*> CreateDefinition(
       llvm::Module* module, const IntrinsicOptions& options, Type type) {
-    return GetCppGenFunction(module, Name(type));
+    return GetCppGenFunction(module, Name(type),
+                             UnaryFunctionType(module, type));
   }
 };
 
@@ -84,7 +92,8 @@ class EigenAtan : public Intrinsic<EigenAtan> {
 
   static absl::StatusOr<llvm::Function*> CreateDefinition(
       llvm::Module* module, const IntrinsicOptions& options, Type type) {
-    return GetCppGenFunction(module, Name(type));
+    return GetCppGenFunction(module, Name(type),
+                             UnaryFunctionType(module, type));
   }
 };
 }  // namespace xla::codegen::intrinsics
