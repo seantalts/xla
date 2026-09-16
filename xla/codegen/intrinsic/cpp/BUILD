@@ -146,16 +146,10 @@ cc_library(
 cc_ir_header(
     name = "eigen_unary_32_ll",
     src = "eigen_unary.cc",
-    copts = if_oss(
-        [
-            "-DEIGEN_GENERIC_VECTOR_SIZE_BYTES=64",
-            "-mprefer-vector-width=512",
-        ],
-        [
-            "-DEIGEN_GENERIC_VECTOR_SIZE_BYTES=32",
-            "-mprefer-vector-width=256",
-        ],
-    ),
+    copts = [
+        "-DEIGEN_GENERIC_VECTOR_SIZE_BYTES=32",
+        "-mprefer-vector-width=256",
+    ],
     deps = [
         ":cpp_context_provider",
         ":eigen_unary_lib",
@@ -200,6 +194,7 @@ xla_cc_test(
         "//xla/codegen/intrinsic",
         "//xla/codegen/intrinsic:test_matchers",
         "@com_google_absl//absl/strings",
+        "@com_google_absl//absl/strings:string_view",
         "@com_google_googletest//:gtest_main",
         "@llvm-project//llvm:Core",
         "@llvm-project//llvm:Support",

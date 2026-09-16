@@ -54,20 +54,22 @@ bool AreEigenIntrinsicsAvailable() {
   return !GetCppGenIrString(intrinsics::IntrinsicOptions()).empty();
 }
 
-llvm::Function* GetCppGenFunction(llvm::Module* module,
-                                  absl::string_view name) {
+llvm::Function* FindCppGenFunction(llvm::Module& module,
+                                   absl::string_view name) {
   llvm::Function* func =
-      module->getFunction(llvm::StringRef(name.data(), name.size()));
+      module.getFunction(llvm::StringRef(name.data(), name.size()));
   if (func == nullptr) {
-    // On Mach-O targets clang prefixes explicit asm() labels (used to name the
-    // intrinsics in eigen_unary.h) with '\01' to suppress the leading-underscore
-    // mangling, so the bitcode compiled on macOS carries that prefix while the
-    // lookup name does not. Retry with the prefix. (No-op on ELF, where the
-    // names already match.)
+    // Mach-O clang prefixes explicit asm() labels with '\01'.
     std::string prefixed = "\01";
     prefixed.append(name.data(), name.size());
-    func = module->getFunction(prefixed);
+    func = module.getFunction(prefixed);
   }
+  return func;
+}
+
+llvm::Function* GetCppGenFunction(llvm::Module* module,
+                                  absl::string_view name) {
+  llvm::Function* func = FindCppGenFunction(*module, name);
   CHECK(func != nullptr)
       << "CppGen function '" << name
       << "' was not found in the module. Ensure the "

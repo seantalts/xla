@@ -23,6 +23,7 @@ limitations under the License.
 #include <gmock/gmock.h>
 #include <gtest/gtest.h>
 #include "absl/strings/match.h"
+#include "absl/strings/string_view.h"
 #include "llvm/IR/LLVMContext.h"
 #include "llvm/IR/Module.h"
 #include "llvm/Support/raw_ostream.h"
@@ -39,8 +40,8 @@ using ::testing::ContainsRegex;
 using ::testing::Not;
 using ::xla::codegen::intrinsic::NearUlps;
 
-std::string GetFunctionIr(const llvm::Module& module, llvm::StringRef name) {
-  llvm::Function* f = module.getFunction(name);
+std::string GetFunctionIr(llvm::Module& module, absl::string_view name) {
+  llvm::Function* f = FindCppGenFunction(module, name);
   if (f == nullptr) {
     return "";
   }

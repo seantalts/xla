@@ -45,6 +45,10 @@ std::unique_ptr<llvm::Module> ParseEmbeddedBitcode(
 // If the compiler does not support vector extensions, this will return false.
 bool AreEigenIntrinsicsAvailable();
 
+// Looks up a CppGen function by its asm() name, or nullptr if absent.
+llvm::Function* FindCppGenFunction(llvm::Module& module,
+                                   absl::string_view name);
+
 // Helper for Intrinsic<T> classes that use CppGen backend for some types.
 // Looks up a function by name in the module (assuming it was linked from
 // a CppGen library) and configures its linkage and attributes for inlining.
