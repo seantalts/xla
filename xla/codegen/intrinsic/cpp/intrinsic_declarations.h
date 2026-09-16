@@ -20,7 +20,6 @@ limitations under the License.
 
 #include "absl/log/check.h"
 #include "absl/status/statusor.h"
-#include "absl/strings/match.h"
 #include "absl/strings/string_view.h"
 #include "llvm/IR/Attributes.h"
 #include "llvm/IR/DerivedTypes.h"
@@ -70,18 +69,6 @@ class EigenAtan : public Intrinsic<EigenAtan> {
       absl::string_view features) {
     if (!AreEigenIntrinsicsAvailable()) {
       return {};
-    }
-    // On ARM NEON, Remez reciprocal division (1.0f / abs_x) can trigger
-    // division traps or underflow near zero under hardware Flush-To-Zero (FTZ)
-    // execution. We advertise scalar support only so that MLIR automatically
-    // unrolls vector lanes to scalar xla.atan.f32/f64, where genuine CPU
-    // short-circuit conditional branching (abs_x < 1e-3) bypasses Remez
-    // approximation.
-    if (absl::StrContains(features, "+neon")) {
-      return {
-          {Type::S(xla::F32)},
-          {Type::S(xla::F64)},
-      };
     }
     return {
         {Type::S(xla::F32)},     {Type::V(xla::F32, 4)}, {Type::V(xla::F32, 8)},

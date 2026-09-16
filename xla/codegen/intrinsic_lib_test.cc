@@ -39,6 +39,7 @@ limitations under the License.
 namespace xla::codegen::intrinsics {
 namespace {
 
+using ::testing::IsSupersetOf;
 using ::testing::UnorderedElementsAre;
 
 std::string ToString(const llvm::VecDesc& vec_desc) {
@@ -85,6 +86,22 @@ TEST(IntrinsicLibTest, AtanVectorizations) {
                            "xla.atan.f64:xla.atan.v2f64:2:_ZGV_LLVM_N2v",
                            "xla.atan.f64:xla.atan.v4f64:4:_ZGV_LLVM_N4v",
                            "xla.atan.f64:xla.atan.v8f64:8:_ZGV_LLVM_N8v"));
+}
+
+TEST(IntrinsicLibTest, AtanVectorizationsOnNeon) {
+  IntrinsicOptions options;
+  options.features = "+neon,+fp-armv8";
+  auto lib = IntrinsicFunctionLib(options);
+  std::vector<std::string> vec_descs_str;
+  for (const auto& vec_desc : lib.Vectorizations()) {
+    if (vec_desc.getScalarFnName().starts_with("xla.atan")) {
+      vec_descs_str.push_back(ToString(vec_desc));
+    }
+  }
+
+  EXPECT_THAT(vec_descs_str,
+              IsSupersetOf({"xla.atan.f32:xla.atan.v4f32:4:_ZGV_LLVM_N4v",
+                            "xla.atan.f64:xla.atan.v2f64:2:_ZGV_LLVM_N2v"}));
 }
 
 TEST(IntrinsicLibTest, DefinesWideEigenAtan) {
