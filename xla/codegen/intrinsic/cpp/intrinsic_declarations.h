@@ -43,8 +43,8 @@ class EigenTanh : public Intrinsic<EigenTanh> {
     }
     return {
         {Type::S(xla::F32)},     {Type::V(xla::F32, 4)}, {Type::V(xla::F32, 8)},
-        {Type::V(xla::F32, 16)}, {Type::S(xla::F64)},    {Type::V(xla::F64, 4)},
-        {Type::V(xla::F64, 8)},
+        {Type::V(xla::F32, 16)}, {Type::S(xla::F64)},    {Type::V(xla::F64, 2)},
+        {Type::V(xla::F64, 4)},  {Type::V(xla::F64, 8)},
     };
   }
 
@@ -77,8 +77,8 @@ class EigenAtan : public Intrinsic<EigenAtan> {
     }
     return {
         {Type::S(xla::F32)},     {Type::V(xla::F32, 4)}, {Type::V(xla::F32, 8)},
-        {Type::V(xla::F32, 16)}, {Type::S(xla::F64)},    {Type::V(xla::F64, 4)},
-        {Type::V(xla::F64, 8)},
+        {Type::V(xla::F32, 16)}, {Type::S(xla::F64)},    {Type::V(xla::F64, 2)},
+        {Type::V(xla::F64, 4)},  {Type::V(xla::F64, 8)},
     };
   }
 

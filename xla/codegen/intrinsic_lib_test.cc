@@ -75,6 +75,7 @@ TEST(IntrinsicLibTest, AtanVectorizations) {
       UnorderedElementsAre("xla.atan.f32:xla.atan.v4f32:4:_ZGV_LLVM_N4v",
                            "xla.atan.f32:xla.atan.v8f32:8:_ZGV_LLVM_N8v",
                            "xla.atan.f32:xla.atan.v16f32:16:_ZGV_LLVM_N16v",
+                           "xla.atan.f64:xla.atan.v2f64:2:_ZGV_LLVM_N2v",
                            "xla.atan.f64:xla.atan.v4f64:4:_ZGV_LLVM_N4v",
                            "xla.atan.f64:xla.atan.v8f64:8:_ZGV_LLVM_N8v"));
 }

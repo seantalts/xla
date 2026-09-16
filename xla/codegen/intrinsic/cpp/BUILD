@@ -144,6 +144,21 @@ cc_library(
 )
 
 cc_ir_header(
+    name = "eigen_unary_16_ll",
+    src = "eigen_unary.cc",
+    copts = [
+        "-DEIGEN_GENERIC_VECTOR_SIZE_BYTES=16",
+        "-mprefer-vector-width=128",
+    ],
+    deps = [
+        ":cpp_context_provider",
+        ":eigen_unary_lib",
+        ":vector_ops",
+        "@eigen_archive//:eigen3",
+    ],
+)
+
+cc_ir_header(
     name = "eigen_unary_32_ll",
     src = "eigen_unary.cc",
     copts = [
@@ -187,6 +202,7 @@ xla_cc_test(
     ],
     deps = [
         ":_cpp_gen_intrinsics",
+        ":eigen_unary_16_ll",
         ":eigen_unary_32_ll",
         ":eigen_unary_64_ll",
         ":eigen_unary_lib",
@@ -218,6 +234,7 @@ cc_library(
     srcs = ["cpp_gen_intrinsics.cc"],
     hdrs = ["cpp_gen_intrinsics.h"],
     deps = [
+        ":eigen_unary_16_ll",
         ":eigen_unary_32_ll",
         ":eigen_unary_64_ll",
         "//xla/codegen/intrinsic",
