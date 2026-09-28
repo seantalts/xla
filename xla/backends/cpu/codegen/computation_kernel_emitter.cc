@@ -242,8 +242,6 @@ absl::StatusOr<llvm::Function*> ComputationKernelEmitter::EmitNestedComputation(
 
   IrEmitter ir_emitter(
       nullptr, *hlo_module, *buffer_assignment_, &llvm_module,
-      /*instruction_to_profile_idx=*/{},
-      /*computation_to_profile_idx=*/{},
       ComputationsTransitivelyContainCustomCall(instr_), target_machine_,
       /*emit_code_for_msan=*/false, std::move(buffer_table_index),
       /*allow_runtime_calls=*/false);

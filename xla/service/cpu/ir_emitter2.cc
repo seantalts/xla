@@ -44,9 +44,6 @@ limitations under the License.
 #include "llvm/Linker/Linker.h"
 #include "llvm/Support/CodeGen.h"
 #include "mlir/IR/MLIRContext.h"
-#include "xla/backends/cpu/codegen/emitters/cpu_fusion_emitter.h"
-#include "xla/backends/cpu/codegen/emitters/cpu_fusion_emitter_config.h"
-#include "xla/backends/cpu/codegen/emitters/cpu_scatter_emitter.h"
 #include "xla/backends/cpu/codegen/fusion_compiler.h"
 #include "xla/backends/cpu/codegen/kernel_api_ir_builder.h"
 #include "xla/backends/cpu/codegen/symbol_name_util.h"
@@ -74,25 +71,6 @@ namespace xla::cpu {
 
 namespace {
 
-// Explicitly in HLO we mostly see "loop" types for fusions.
-// However, internally we pick a fusion kind to pick the appropriate
-// fusion emitter.
-enum class FusionEmitterKind {
-  kLoop,
-  kScatter,
-};
-
-// This is very crude at the moment. Eventually we will need to either have
-// the fusion indicate what emitter it is meant for (e.g. producing this
-// info via a cost model), or heuristics to estimate which emitter is best
-// for the fusion.
-FusionEmitterKind AnalyzeHloFusion(const HloFusionInstruction* fusion) {
-  if (fusion->fused_expression_root()->opcode() == HloOpcode::kScatter) {
-    return FusionEmitterKind::kScatter;
-  }
-  return FusionEmitterKind::kLoop;
-}
-
 std::string SortCsv(absl::string_view csv) {
   std::vector<absl::string_view> v =
       absl::StrSplit(csv, ',', absl::SkipEmpty());
@@ -115,17 +93,6 @@ IrEmitter2::IrEmitter2(const HloModule& hlo_module, llvm::Module* module,
                              KernelApiIrBuilder::Options::FromHloModuleConfig(
                                  hlo_module_.config())) {}
 
-bool IrEmitter2::IsSupportedByFusionEmitter(
-    const HloFusionInstruction* fusion) const {
-  FusionEmitterKind fusion_emitter_kind = AnalyzeHloFusion(fusion);
-  switch (fusion_emitter_kind) {
-    case FusionEmitterKind::kScatter:
-      return kFusionEmitterScatterEnabled;
-    default:
-      return false;
-  }
-}
-
 IrEmitter2::KernelInfo::KernelInfo(KernelPrototype prototype,
                                    const se::BlockDim& block_dims,
                                    const se::ThreadDim& thread_dims)
@@ -144,34 +111,6 @@ IrEmitter2::KernelInfo::KernelInfo(
       thread_dims(thread_dims),
       invariant_arguments(invariant_arguments),
       backend_extra_options(SortCsv(backend_extra_options)) {}
-
-absl::StatusOr<IrEmitter2::KernelInfo> IrEmitter2::EmitPadHostKernel(
-    const HloInstruction* pad) {
-  VLOG(2) << "Emit Pad host kernel.";
-
-  ABSL_ASSIGN_OR_RETURN(KernelPrototype kernel_prototype,
-                        EmitKernelPrototype(pad));
-
-  llvm_ir::IrArray operand_array = kernel_prototype.arguments[0];
-  llvm_ir::IrArray padvalue_array = kernel_prototype.arguments[1];
-  llvm_ir::IrArray output_array = kernel_prototype.results[0];
-
-  llvm::LLVMContext& ctx = module_->getContext();
-  llvm::IRBuilder<> b(ctx);
-  auto builder_overwrite = nested_ir_emitter_->WithBuilder(b);
-
-  nested_ir_emitter_->PushComputeFunction(
-      &b, module_, kernel_prototype.function, kernel_prototype.return_block);
-
-  ABSL_RETURN_IF_ERROR(nested_ir_emitter_->HandlePad(
-      const_cast<HloInstruction*>(pad), operand_array, padvalue_array,
-      output_array));
-
-  nested_ir_emitter_->PopComputeFunction();
-
-  return kernels_.emplace_back(
-      KernelInfo(std::move(kernel_prototype), se::BlockDim(), se::ThreadDim()));
-}
 
 // Dot (fusion) host kernel only supports strategies that emit LLVM IR.
 static bool IsDotCodegenStrategy(DotImplementationStrategy strategy) {

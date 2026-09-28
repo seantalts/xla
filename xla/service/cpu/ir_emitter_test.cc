@@ -124,8 +124,8 @@ TEST_F(IrEmitterTest, ComputeFuncStack) {
 
   TargetMachineFeaturesStub target_machine([](int64_t size) { return 1; });
 
-  IrEmitter ir_emitter(nullptr, *hlo, *buffer_assignment, module.get(), {}, {},
-                       {}, &target_machine, false);
+  IrEmitter ir_emitter(nullptr, *hlo, *buffer_assignment, module.get(), {},
+                       &target_machine, false);
 
   llvm::IRBuilderBase* b = ir_emitter.b();
   ASSERT_NE(b, nullptr);
@@ -306,8 +306,6 @@ CreateIrEmitterForConstantEmissionTests(HloModule& module,
   std::unique_ptr<mlir::MLIRContext> mlir_context;
   auto ir_emitter = std::make_unique<IrEmitter>(
       mlir_context.get(), module, *assignment, &llvm_module,
-      absl::flat_hash_map<const HloInstruction*, int64_t>{},
-      absl::flat_hash_map<const HloComputation*, int64_t>{},
       absl::flat_hash_map<const HloComputation*, bool>{},
       target_machine_features.get(),
       /*emit_code_for_msan=*/false);

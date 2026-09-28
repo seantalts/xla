@@ -20,8 +20,10 @@ limitations under the License.
 #include <memory>
 #include <optional>
 #include <string>
+#include <vector>
 
 #include "absl/status/statusor.h"
+#include "absl/strings/str_cat.h"
 #include "absl/strings/string_view.h"
 #include "xla/hlo/ir/hlo_instruction.h"
 #include "xla/hlo/ir/hlo_module.h"
@@ -262,6 +264,127 @@ TEST_F(SmallWhileLoopHoistingPassTest, NoYnnWhileLoopHoisting) {
                        ParseAndReturnVerifiedModule(hlo_string));
   ASSERT_OK_AND_ASSIGN(bool changed, RunSmallWhileLoopHoistingPass(m.get()));
   EXPECT_FALSE(changed);
+}
+
+TEST_F(SmallWhileLoopHoistingPassTest, UnimplementedOpcodesAreUnavailable) {
+  constexpr HloOpcode kOpcodes[] = {
+      HloOpcode::kBatchNormGrad,
+      HloOpcode::kBatchNormTraining,
+      HloOpcode::kCustomCall,
+      HloOpcode::kFft,
+      HloOpcode::kGetDimensionSize,
+      HloOpcode::kInfeed,
+      HloOpcode::kOutfeed,
+      HloOpcode::kPartitionId,
+      HloOpcode::kRecv,
+      HloOpcode::kRecvDone,
+      HloOpcode::kReplicaId,
+      HloOpcode::kRng,
+      HloOpcode::kRngBitGenerator,
+      HloOpcode::kScatter,
+      HloOpcode::kSend,
+      HloOpcode::kSendDone,
+      HloOpcode::kSetDimensionSize,
+      HloOpcode::kSort,
+      HloOpcode::kStochasticConvert,
+      HloOpcode::kTopK,
+  };
+  for (HloOpcode opcode : kOpcodes) {
+    EXPECT_TRUE(cpu::IsUnavailableOpcodeInHoistedRegion(opcode))
+        << HloOpcodeString(opcode);
+  }
+  EXPECT_FALSE(cpu::IsUnavailableOpcodeInHoistedRegion(HloOpcode::kAdd));
+  EXPECT_FALSE(cpu::IsUnavailableOpcodeInHoistedRegion(
+      HloOpcode::kRngGetAndUpdateState));
+}
+
+TEST_F(SmallWhileLoopHoistingPassTest, UnavailableInstructionsInWhileBody) {
+  struct Case {
+    absl::string_view name;
+    absl::string_view hlo;
+  };
+  const std::vector<Case> kCases = {
+      {"ar", "ar = f32[8] all-reduce(p), to_apply=add"},
+      {"rs",
+       "rs = f32[4] reduce-scatter(p), dimensions={0}, to_apply=add, "
+       "replica_groups={{0,1}}"},
+      {"ag",
+       "ag = f32[16] all-gather(p), dimensions={0}, replica_groups={{0,1}}"},
+      {"a2a",
+       "a2a = f32[8] all-to-all(p), dimensions={0}, replica_groups={{0,1}}"},
+      {"cp",
+       "cp = f32[8] collective-permute(p), source_target_pairs={{0,1},{1,0}}"},
+      {"pid", "pid = u32[] partition-id()"},
+      {"rid", "rid = u32[] replica-id()"},
+      {"cc", "cc = f32[8] custom-call(p), custom_call_target=\"foo\""},
+      {"srt", "srt = f32[8] sort(p), dimensions={0}, to_apply=cmp"},
+      {"infd", "infd = (f32[8], token[]) infeed(tok)"},
+      {"outf", "outf = token[] outfeed(p, tok), outfeed_shape=f32[8]"},
+      {"snd",
+       "snd = (f32[8], u32[], token[]) send(p, tok), channel_id=1\n"
+       "sd = token[] send-done(snd), channel_id=1"},
+      {"rcv",
+       "rcv = (f32[8], u32[], token[]) recv(tok), channel_id=2\n"
+       "rd = (f32[8], token[]) recv-done(rcv), channel_id=2"},
+      {"cf",
+       "cf = f32[8] fusion(p), kind=kCustom, calls=custom_fusion_computation"},
+  };
+  for (const Case& c : kCases) {
+    const std::string hlo = absl::StrCat(R"(
+    HloModule m, replica_count=2
+
+    add {
+      x = f32[] parameter(0)
+      y = f32[] parameter(1)
+      ROOT s = f32[] add(x, y)
+    }
+
+    cmp {
+      x = f32[] parameter(0)
+      y = f32[] parameter(1)
+      ROOT lt = pred[] compare(x, y), direction=LT
+    }
+
+    custom_fusion_computation {
+      x = f32[8] parameter(0)
+      ROOT n = f32[8] negate(x)
+    }
+
+    body {
+      t = (s32[], f32[8]) parameter(0)
+      i = s32[] get-tuple-element(t), index=0
+      p = f32[8] get-tuple-element(t), index=1
+      one = s32[] constant(1)
+      tok = token[] after-all()
+      )",
+                                         c.hlo, R"(
+      inc = s32[] add(i, one)
+      ROOT r = (s32[], f32[8]) tuple(inc, p)
+    }
+
+    cond {
+      t = (s32[], f32[8]) parameter(0)
+      i = s32[] get-tuple-element(t), index=0
+      limit = s32[] constant(10)
+      ROOT lt = pred[] compare(i, limit), direction=LT
+    }
+
+    ENTRY main {
+      zero = s32[] constant(0)
+      arg = f32[8] parameter(0)
+      init = (s32[], f32[8]) tuple(zero, arg)
+      ROOT w = (s32[], f32[8]) while(init), condition=cond, body=body
+    }
+    )");
+    SCOPED_TRACE(c.hlo);
+    ASSERT_OK_AND_ASSIGN(std::unique_ptr<HloModule> m,
+                         ParseAndReturnVerifiedModule(hlo));
+    const HloInstruction* instr = FindInstruction(m.get(), c.name);
+    ASSERT_NE(instr, nullptr);
+    EXPECT_TRUE(cpu::IsUnavailableInHoistedRegion(instr));
+    ASSERT_OK_AND_ASSIGN(bool changed, RunSmallWhileLoopHoistingPass(m.get()));
+    EXPECT_FALSE(changed);
+  }
 }
 
 }  // namespace

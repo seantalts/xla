@@ -39,28 +39,42 @@ limitations under the License.
 
 namespace xla::cpu {
 
-static bool InstructionIsUnavailable(const HloInstruction* instr) {
-  switch (instr->opcode()) {
-    // The following instructions are not currently supported by the call thunk
-    // emitter due to how the legacy & thunk emitters interact; specifically,
-    // how the run options are passed.
+bool IsUnavailableOpcodeInHoistedRegion(HloOpcode opcode) {
+  switch (opcode) {
+    case HloOpcode::kBatchNormGrad:
+    case HloOpcode::kBatchNormTraining:
     case HloOpcode::kCustomCall:
+    case HloOpcode::kFft:
+    case HloOpcode::kGetDimensionSize:
     case HloOpcode::kInfeed:
     case HloOpcode::kOutfeed:
-    case HloOpcode::kScatter:
-    case HloOpcode::kSort:
-    case HloOpcode::kFft:
     case HloOpcode::kPartitionId:
+    case HloOpcode::kRecv:
+    case HloOpcode::kRecvDone:
     case HloOpcode::kReplicaId:
+    case HloOpcode::kRng:
+    case HloOpcode::kRngBitGenerator:
+    case HloOpcode::kScatter:
+    case HloOpcode::kSend:
+    case HloOpcode::kSendDone:
+    case HloOpcode::kSetDimensionSize:
+    case HloOpcode::kSort:
+    case HloOpcode::kStochasticConvert:
+    case HloOpcode::kTopK:
       return true;
-
-    // Legacy call emitter does not support custom fusions.
-    case HloOpcode::kFusion:
-      return instr->fusion_kind() == HloInstruction::FusionKind::kCustom;
-
     default:
-      return IsCollective(instr);
+      return false;
   }
+}
+
+bool IsUnavailableInHoistedRegion(const HloInstruction* instr) {
+  if (IsUnavailableOpcodeInHoistedRegion(instr->opcode())) {
+    return true;
+  }
+  if (instr->opcode() == HloOpcode::kFusion) {
+    return instr->fusion_kind() == HloInstruction::FusionKind::kCustom;
+  }
+  return IsCollective(instr);
 }
 
 // Simple DFS check to see if a computation contains any instructions that are
@@ -73,7 +87,7 @@ static bool ContainsUnavailableInstruction(
     return itr->second;
   }
 
-  if (InstructionIsUnavailable(instr)) {
+  if (IsUnavailableInHoistedRegion(instr)) {
     return has_unavailable_instr.insert({instr, true}).first->second;
   }
 

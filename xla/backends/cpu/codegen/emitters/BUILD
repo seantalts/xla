@@ -30,11 +30,6 @@ package_group(
 )
 
 cc_library(
-    name = "cpu_fusion_emitter_config",
-    hdrs = ["cpu_fusion_emitter_config.h"],
-)
-
-cc_library(
     name = "cpu_fusion_emitters",
     srcs = [
         "cpu_fusion_emitter.cc",

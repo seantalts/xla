@@ -23,6 +23,8 @@ limitations under the License.
 
 #include "absl/strings/str_format.h"
 #include "absl/strings/string_view.h"
+#include "xla/hlo/ir/hlo_computation.h"
+#include "xla/hlo/ir/hlo_instruction.h"
 #include "xla/hlo/ir/hlo_module.h"
 #include "xla/hlo/ir/hlo_opcode.h"
 #include "xla/hlo/testlib/hlo_hardware_independent_test_base.h"
@@ -91,6 +93,63 @@ TEST_F(FusionWrapperTest, TransposeWrappedWithNewFusionEmitters) {
   EXPECT_TRUE(changed);
   EXPECT_EQ(m->entry_computation()->root_instruction()->opcode(),
             HloOpcode::kFusion);
+}
+
+TEST_F(FusionWrapperTest, PadWrapped) {
+  static constexpr absl::string_view hlo_string = R"(
+  HloModule m
+    ENTRY e {
+      p0 = f32[8] parameter(0)
+      z = f32[] constant(0)
+      ROOT pad = f32[12] pad(p0, z), padding=2_2
+    }
+  )";
+  ASSERT_OK_AND_ASSIGN(std::unique_ptr<HloModule> m,
+                       ParseAndReturnVerifiedModule(hlo_string));
+  FusionWrapper wrapper(&target_machine_features_);
+  ASSERT_OK_AND_ASSIGN(bool changed, wrapper.Run(m.get()));
+  EXPECT_TRUE(changed);
+  EXPECT_EQ(m->entry_computation()->root_instruction()->opcode(),
+            HloOpcode::kFusion);
+}
+
+TEST_F(FusionWrapperTest, PadInWhileBodyWrapped) {
+  static constexpr absl::string_view hlo_string = R"(
+  HloModule m
+    body {
+      t = (s32[], f32[12]) parameter(0)
+      i = s32[] get-tuple-element(t), index=0
+      v = f32[12] get-tuple-element(t), index=1
+      s = f32[8] slice(v), slice={[2:10]}
+      z = f32[] constant(0)
+      pad = f32[12] pad(s, z), padding=2_2
+      one = s32[] constant(1)
+      inc = s32[] add(i, one)
+      ROOT r = (s32[], f32[12]) tuple(inc, pad)
+    }
+
+    cond {
+      t = (s32[], f32[12]) parameter(0)
+      i = s32[] get-tuple-element(t), index=0
+      limit = s32[] constant(10)
+      ROOT lt = pred[] compare(i, limit), direction=LT
+    }
+
+    ENTRY e {
+      zero = s32[] constant(0)
+      p0 = f32[12] parameter(0)
+      init = (s32[], f32[12]) tuple(zero, p0)
+      ROOT w = (s32[], f32[12]) while(init), condition=cond, body=body
+    }
+  )";
+  ASSERT_OK_AND_ASSIGN(std::unique_ptr<HloModule> m,
+                       ParseAndReturnVerifiedModule(hlo_string));
+  FusionWrapper wrapper(&target_machine_features_);
+  ASSERT_OK_AND_ASSIGN(bool changed, wrapper.Run(m.get()));
+  EXPECT_TRUE(changed);
+  const HloInstruction* pad = FindInstruction(m.get(), HloOpcode::kPad);
+  ASSERT_NE(pad, nullptr);
+  EXPECT_TRUE(pad->parent()->IsFusionComputation());
 }
 
 TEST_F(FusionWrapperTest, DynamicUpdateSliceWrappedWithNewFusionEmitters) {

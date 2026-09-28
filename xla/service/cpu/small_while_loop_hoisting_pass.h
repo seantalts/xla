@@ -23,8 +23,12 @@ limitations under the License.
 #include "absl/strings/string_view.h"
 #include "xla/hlo/ir/hlo_instruction.h"
 #include "xla/hlo/ir/hlo_module.h"
+#include "xla/hlo/ir/hlo_opcode.h"
 #include "xla/hlo/pass/hlo_pass_interface.h"
 namespace xla::cpu {
+
+bool IsUnavailableOpcodeInHoistedRegion(HloOpcode opcode);
+bool IsUnavailableInHoistedRegion(const HloInstruction* instr);
 
 // Hoists small while loops into a separate function.
 // This pass enables the thunk emitter to emit small while loops as a single

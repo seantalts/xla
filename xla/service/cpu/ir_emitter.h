@@ -41,7 +41,6 @@ limitations under the License.
 #include "llvm/IR/LLVMContext.h"
 #include "llvm/IR/Module.h"
 #include "llvm/IR/Value.h"
-#include "llvm/TargetParser/Triple.h"
 #include "mlir/IR/MLIRContext.h"
 #include "xla/backends/cpu/codegen/target_machine_features.h"
 #include "xla/hlo/ir/dfs_hlo_visitor_with_default.h"
@@ -90,10 +89,6 @@ class IrEmitter : public DfsHloVisitorWithDefault,
   // mlir_context: the MLIR context used for IR emission.
   // llvm_module: the LLVM module to emit IR into. It's built using the LLVM
   //              context inside of mlir_context.
-  // instruction_to_profile_idx: the mapping from HLO instructions to their
-  //              index in the profiling array.
-  // computation_to_profile_idx: the mapping from HLO computations to their
-  //              index in the profiling array.
   // computation_transitively_contains_custom_call: the mapping from HLO
   //   computations to whether or not they transitively contain a custom-call
   //   instruction. All computations in the module must have a key in this
@@ -101,10 +96,6 @@ class IrEmitter : public DfsHloVisitorWithDefault,
   // emit_code_for_msan: whether emitted code should be compatible with msan.
   IrEmitter(mlir::MLIRContext* mlir_context, const HloModule& hlo_module,
             const BufferAssignment& assignment, llvm::Module* llvm_module,
-            absl::flat_hash_map<const HloInstruction*, int64_t>
-                instruction_to_profile_idx,
-            absl::flat_hash_map<const HloComputation*, int64_t>
-                computation_to_profile_idx,
             absl::flat_hash_map<const HloComputation*, bool>
                 computation_transitively_contains_custom_call,
             const TargetMachineFeatures* target_machine,
@@ -323,11 +314,7 @@ class IrEmitter : public DfsHloVisitorWithDefault,
   }
 
  private:
-  absl::Status HandleSliceToDynamic(HloInstruction* hlo);
-  absl::Status HandlePadToStatic(HloInstruction* hlo);
   absl::Status HandleTopK(HloInstruction* hlo) override;
-  absl::Status HandleAllReduceSingleReplica(HloInstruction* crs);
-  absl::Status HandleAllReduceMultipleReplica(HloInstruction* crs);
   // Private helper to initialize an IR function for the computation.
   void InitializeIrFunction(const std::string& function_name);
 
@@ -338,18 +325,6 @@ class IrEmitter : public DfsHloVisitorWithDefault,
   // called in both thread-local and non-thread-local it would be codegen'd
   // twice, and we would know whether it's thread-local at codegen time.
   void EmitThreadLocalFunctionEpilogue(const HloComputation* computation);
-
-  // Convenience functions to generate a GEP into the profile counter parameter
-  // which would correspond to the index for a given HLO instruction or
-  // computation.
-  llvm::Value* GetProfileCounterFor(const HloInstruction& instruction);
-  llvm::Value* GetProfileCounterFor(const HloComputation& computation);
-
-  // Helper function template for the implementation of the above two functions.
-  template <typename T>
-  llvm::Value* GetProfileCounterCommon(
-      const T& hlo,
-      const absl::flat_hash_map<const T*, int64_t>& profile_index_map);
 
   // Gets the IR Value emitted previously for the given hlo.
   //
@@ -559,12 +534,6 @@ class IrEmitter : public DfsHloVisitorWithDefault,
       absl::Span<const llvm_ir::IrArray> source_arrays,
       const llvm_ir::IrArray& target_array);
 
-  // Emits printing during the execution.
-  llvm::Value* EmitPrintf(absl::string_view fmt,
-                          absl::Span<llvm::Value* const> arguments);
-  llvm::Value* EmitPrintfToStderr(absl::string_view fmt,
-                                  absl::Span<llvm::Value* const> arguments);
-
   // Emits a call to a non-variadic function `func_name` with arguments
   // `arguments` assuming C calling convention.
   llvm::Value* EmitCallToFunc(
@@ -573,20 +542,12 @@ class IrEmitter : public DfsHloVisitorWithDefault,
       bool only_accesses_arg_memory = false,
       bool only_accesses_inaccessible_mem_or_arg_mem = false);
 
-  // Emits a call to a proxy that builds an FFI call frame for `custom_call`
-  llvm::Value* EmitCallToFfi(HloCustomCallInstruction* custom_call,
-                             llvm::AllocaInst* results_alloca,
-                             llvm::AllocaInst* operands_alloca);
-
   // Assignment of the buffers needed by the computation and their shape
   // information.
   const BufferAssignment& assignment_;
 
   // The LLVM module into which IR will be emitted.
   llvm::Module* module_;
-
-  // The target architecture.
-  llvm::Triple::ArchType arch_type_;
 
   // Used to produce unique names for generated functions.
   NameUniquer name_uniquer_;
@@ -645,14 +606,6 @@ class IrEmitter : public DfsHloVisitorWithDefault,
   absl::flat_hash_map<BufferAllocation::Index, int64_t>
       computation_parameter_allocations_;
 
-  // Maps HLO instructions to their index into the profile counter array.
-  const absl::flat_hash_map<const HloInstruction*, int64_t>
-      instruction_to_profile_idx_;
-
-  // Maps HLO computations to their index into the profile counter array.
-  const absl::flat_hash_map<const HloComputation*, int64_t>
-      computation_to_profile_idx_;
-
   // Maps HLO computations to whether they contain a custom-call instruction
   // (either directly, or transitively by e.g. calling another computation that
   // does).
@@ -674,49 +627,6 @@ class IrEmitter : public DfsHloVisitorWithDefault,
   absl::flat_hash_map<const HloInstruction*, llvm::Value*> emitted_value_;
 
   llvm_ir::AliasAnalysis alias_analysis_;
-
-  // This struct contains all the state needed to emit instructions for
-  // profiling a computation.
-  class ProfilingState {
-   public:
-    ProfilingState() : use_rdtscp_(false) {}
-    explicit ProfilingState(bool use_rdtscp) : use_rdtscp_(use_rdtscp) {}
-
-    // Record the cycle counter before an HLO executes.
-    void RecordCycleStart(llvm::IRBuilderBase* b, HloInstruction* hlo);
-    // Record the number of cycles it took for an HLO to execute.
-    void RecordCycleDelta(llvm::IRBuilderBase* b, HloInstruction* hlo,
-                          llvm::Value* prof_counter);
-    // Record the number of cycles it took for the entire computation to
-    // execute.
-    void RecordCompleteComputation(llvm::IRBuilderBase* b,
-                                   llvm::Value* prof_counter);
-
-    // Convenience function to generate a call to an intrinsic which reads the
-    // CPU cycle counter.
-    llvm::Value* ReadCycleCounter(llvm::IRBuilderBase* b);
-
-    // Store the cycle counter delta to the per-HLO profile counter.
-    void UpdateProfileCounter(llvm::IRBuilderBase* b, llvm::Value* prof_counter,
-                              llvm::Value* cycle_end, llvm::Value* cycle_start);
-
-   private:
-    // Should we use the x86-specific rdtscp or the generic readcyclecounter
-    // intrinsic?
-    bool use_rdtscp_;
-
-    // The first read cycle counter in the program.
-    llvm::Value* first_read_cycle_start_ = nullptr;
-
-    // The last read cycle counter in the program.
-    llvm::Value* last_read_cycle_end_ = nullptr;
-
-    // Maps HLOs to the value the cycle counter contained right before the HLO
-    // began to execute.
-    absl::flat_hash_map<const HloInstruction*, llvm::Value*> cycle_starts_;
-  };
-
-  ProfilingState profiling_state_;
 
   class TracingState {
    public:
@@ -761,16 +671,6 @@ class IrEmitter : public DfsHloVisitorWithDefault,
 
   // Returns the number of bytes within the shape.
   int64_t ByteSizeOf(const Shape& shape) const;
-
-  enum class XfeedKind {
-    kInfeed,
-    kOutfeed,
-  };
-
-  // Emit IR to transfer between a {infeed,outfeed} buffer and an in-program
-  // address.
-  absl::Status EmitXfeedTransfer(XfeedKind kind, const Shape& shape,
-                                 llvm::Value* program_buffer_address);
 
   // Returns a ConstExpr bitcast.
   llvm::Constant* EmitGlobalForLiteral(const Literal& literal);

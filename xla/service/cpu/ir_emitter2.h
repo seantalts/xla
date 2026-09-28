@@ -104,9 +104,6 @@ class IrEmitter2 {
 
   absl::Span<const ComparatorInfo> comparators() const { return comparators_; }
 
-  // Emits a host kernel for the pad instruction.
-  absl::StatusOr<KernelInfo> EmitPadHostKernel(const HloInstruction* pad);
-
   // Emits a host kernel for the given dot fusion instruction (output fusion).
   absl::StatusOr<KernelInfo> EmitDotFusionHostKernel(
       const HloFusionInstruction* fusion);
@@ -117,8 +114,6 @@ class IrEmitter2 {
 
   // Emits a comparator function for the given sort instruction.
   absl::StatusOr<ComparatorInfo> EmitSortComparator(HloComputation* comparator);
-
-  bool IsSupportedByFusionEmitter(const HloFusionInstruction* fusion) const;
 
  private:
   class ElementalIrEmitter;
