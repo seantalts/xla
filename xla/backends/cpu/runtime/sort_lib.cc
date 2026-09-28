@@ -23,6 +23,7 @@ limitations under the License.
 #include <cstring>
 #include <functional>
 #include <iterator>
+#include <optional>
 #include <type_traits>
 #include <utility>
 #include <vector>
@@ -31,9 +32,31 @@ limitations under the License.
 #include "absl/log/check.h"
 #include "absl/log/log.h"
 #include "absl/types/span.h"
+#include "xla/primitive_util.h"
 #include "xla/types.h"
+#include "xla/xla_data.pb.h"
 
 namespace xla::cpu::internal {
+
+bool CanSortWithBuiltinComparator(const SortDims& sort_dims,
+                                  absl::Span<const PrimitiveType> types,
+                                  std::optional<SortDirection> direction) {
+  if (!direction.has_value() || types.empty() ||
+      !IsBuiltinSortKeyType(types[0])) {
+    return false;
+  }
+  if (types.size() == 1) {
+    return true;
+  }
+  if (types.size() == 2) {
+    size_t value_size = primitive_util::ByteWidth(types[1]);
+    return (sort_dims.inner_dim_size == 1 ||
+            sort_dims.sort_dim_size <= 65536) &&
+           (value_size == 1 || value_size == 2 || value_size == 4 ||
+            value_size == 8);
+  }
+  return false;
+}
 
 namespace {
 

@@ -62,11 +62,16 @@ GetCompiledSymbolsFromProto(
         compiled_symbols.push_back(
             FunctionLibrary::Sym<FunctionLibrary::Kernel>(symbol_proto.name()));
         break;
-      case SymbolProto::COMPARATOR:
+      case SymbolProto::COMPARATOR_V2:
         compiled_symbols.push_back(
             FunctionLibrary::Sym<FunctionLibrary::Comparator>(
                 symbol_proto.name()));
         break;
+      case SymbolProto::COMPARATOR:
+        return InvalidArgument(
+            "Symbol %s was compiled with the legacy sort comparator ABI; the "
+            "AOT result must be recompiled",
+            symbol_proto.name());
       default:
         return Internal(
             "Unknown function type id %s",

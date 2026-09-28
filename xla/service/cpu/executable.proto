@@ -25,7 +25,8 @@ message SymbolProto {
   enum FunctionTypeId {
     UNKNOWN = 0;
     KERNEL = 1;
-    COMPARATOR = 2;
+    COMPARATOR = 2;  // Legacy ABI, rejected by the loader.
+    COMPARATOR_V2 = 3;
   }
   FunctionTypeId function_type_id = 1;
   string name = 2;

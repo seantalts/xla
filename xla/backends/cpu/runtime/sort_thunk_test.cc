@@ -70,15 +70,52 @@ class LessThanComparator : public FunctionLibrary {
   absl::StatusOr<void*> ResolveFunction(TypeId type_id,
                                         absl::string_view name) final {
     DCHECK_EQ(name, "less_than");
-    return reinterpret_cast<void*>(LessThanWrapper);
-  }
-
- private:
-  static void LessThanWrapper(bool* result, const void*, const void** data,
-                              const void*, const void*, const void*) {
-    *result = LessThan(data);
+    return reinterpret_cast<void*>(LessThan);
   }
 };
+
+TEST_P(SortThunkTest, BuiltinComparatorWithoutComparatorName) {
+  auto data = LiteralUtil::CreateR1<float>({2.0, 4.0, 1.0, 3.0});
+  BufferAllocations allocations = CreateBufferAllocations(data);
+  BufferAllocation alloc = CreateBufferAllocation(0, data);
+  BufferAllocation::Slice slice = CreateBufferAllocationSlice(alloc);
+
+  ASSERT_OK_AND_ASSIGN(auto thunk,
+                       SortThunk::Create({"sort"}, {{slice, data.shape()}},
+                                         /*dimension=*/0, GetParam(), "",
+                                         SortThunk::SortDirection::kAscending));
+  EXPECT_TRUE(thunk->use_builtin_comparator());
+
+  Thunk::ExecuteParams params;
+  params.buffer_allocations = &allocations;
+  params.function_library = nullptr;
+  auto execute_event = thunk->Execute(params);
+  tsl::BlockUntilReady(execute_event);
+  ASSERT_FALSE(execute_event.IsError());
+  EXPECT_EQ(data, LiteralUtil::CreateR1<float>({1.0, 2.0, 3.0, 4.0}));
+}
+
+TEST_P(SortThunkTest, ComparatorRequiredWithEmptyName) {
+  auto data = LiteralUtil::CreateR1<float>({2.0, 4.0, 1.0, 3.0});
+  auto indices = LiteralUtil::CreateR1<int32_t>({0, 1, 2, 3});
+  auto [alloc0, alloc1] = CreateBufferAllocation(data, indices);
+  auto [slice0, slice1] = CreateBufferAllocationSlice(alloc0, alloc1);
+
+  auto no_direction =
+      SortThunk::Create({"sort"}, {{slice0, data.shape()}},
+                        /*dimension=*/0, GetParam(), "", std::nullopt);
+  EXPECT_THAT(no_direction.status().message(),
+              testing::HasSubstr("no comparator function"));
+
+  auto three_inputs = SortThunk::Create({"sort"},
+                                        {{slice0, data.shape()},
+                                         {slice1, indices.shape()},
+                                         {slice1, indices.shape()}},
+                                        /*dimension=*/0, GetParam(), "",
+                                        SortThunk::SortDirection::kAscending);
+  EXPECT_THAT(three_inputs.status().message(),
+              testing::HasSubstr("no comparator function"));
+}
 
 TEST_P(SortThunkTest, DescendingSortPlainArray) {
   bool is_stable = GetParam();
@@ -272,13 +309,18 @@ TEST_P(SortThunkTest, Sort2D) {
   auto [alloc0, alloc1] = CreateBufferAllocation(data, indices);
   auto [slice0, slice1] = CreateBufferAllocationSlice(alloc0, alloc1);
 
+  std::vector<SortThunk::Input> inputs = {{slice0, data.shape()},
+                                          {slice1, indices.shape()}};
+  EXPECT_FALSE(
+      SortThunk::UsesBuiltinComparator(inputs, /*dimension=*/0, std::nullopt));
+  EXPECT_TRUE(SortThunk::UsesBuiltinComparator(
+      inputs, /*dimension=*/0, SortThunk::SortDirection::kAscending));
+
   // Sort along the dimension `0`.
-  ASSERT_OK_AND_ASSIGN(
-      auto sort_dim0,
-      SortThunk::Create({"sort"},
-                        {{slice0, data.shape()}, {slice1, indices.shape()}},
-                        /*dimension=*/0, is_stable, "less_than",
-                        SortThunk::SortDirection::kAscending));
+  ASSERT_OK_AND_ASSIGN(auto sort_dim0,
+                       SortThunk::Create({"sort"}, inputs, /*dimension=*/0,
+                                         is_stable, "less_than", std::nullopt));
+  EXPECT_FALSE(sort_dim0->use_builtin_comparator());
 
   Thunk::ExecuteParams params;
   params.buffer_allocations = &allocations;
@@ -297,13 +339,11 @@ TEST_P(SortThunkTest, Sort2D) {
   data = LiteralUtil::CreateR2<float>({{4.0, 3.0}, {2.0, 1.0}});
   indices = LiteralUtil::CreateR2<int32_t>({{0, 1}, {2, 3}});
 
-  ASSERT_OK_AND_ASSIGN(
-      auto sort_dim1,
-      SortThunk::Create({"sort"},
-                        {{slice0, data.shape()}, {slice1, indices.shape()}},
-                        /*dimension=*/1,
-                        /*is_stable=*/false, "less_than",
-                        SortThunk::SortDirection::kAscending));
+  ASSERT_OK_AND_ASSIGN(auto sort_dim1,
+                       SortThunk::Create({"sort"}, inputs, /*dimension=*/1,
+                                         /*is_stable=*/false, "less_than",
+                                         SortThunk::SortDirection::kAscending));
+  EXPECT_TRUE(sort_dim1->use_builtin_comparator());
 
   auto execute_event1 = sort_dim1->Execute(params);
   tsl::BlockUntilReady(execute_event1);

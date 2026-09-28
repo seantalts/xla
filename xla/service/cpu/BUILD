@@ -1817,6 +1817,22 @@ xla_cc_test(
     ],
 )
 
+xla_cc_test(
+    name = "cpu_aot_loader_test",
+    srcs = ["cpu_aot_loader_test.cc"],
+    deps = [
+        ":cpu_aot_loader",
+        ":executable_proto_cc",
+        "//xla/backends/cpu/runtime:function_library",
+        "//xla/tests:xla_internal_test_main",
+        "//xla/tsl/platform:statusor",
+        "@com_google_absl//absl/status",
+        "@com_google_absl//absl/status:status_matchers",
+        "@com_google_absl//absl/status:statusor",
+        "@com_google_googletest//:gtest",
+    ],
+)
+
 cc_library(
     name = "cpu_aot_loader",
     srcs = ["cpu_aot_loader.cc"],

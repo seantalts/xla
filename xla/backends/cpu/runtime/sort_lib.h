@@ -18,10 +18,13 @@ limitations under the License.
 
 #include <cstddef>
 #include <cstdint>
+#include <optional>
 
 #include "absl/functional/any_invocable.h"
 #include "absl/types/span.h"
+#include "xla/primitive_util.h"
 #include "xla/types.h"
+#include "xla/xla_data.pb.h"
 
 namespace xla::cpu::internal {
 
@@ -45,6 +48,21 @@ enum class SortDirection {
   kAscending,
   kDescending,
 };
+
+// Key element types that have builtin comparators.
+constexpr bool IsBuiltinSortKeyType(PrimitiveType type) {
+  return (primitive_util::IsFloatingPointType(type) &&
+          primitive_util::BitWidth(type) >= 16) ||
+         (primitive_util::IsIntegralType(type) &&
+          primitive_util::BitWidth(type) >= 8);
+}
+
+// Returns true if inputs of the given element `types` can be sorted with a
+// builtin comparator for `direction`, i.e. without a compiled comparator
+// function.
+bool CanSortWithBuiltinComparator(const SortDims& sort_dims,
+                                  absl::Span<const PrimitiveType> types,
+                                  std::optional<SortDirection> direction);
 
 // Sorts `data` using `less_than` comparator function for slices in
 // [start_slice, end_slice). Data is sorted in place, and sort dimensions are

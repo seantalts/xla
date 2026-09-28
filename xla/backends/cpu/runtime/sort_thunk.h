@@ -58,6 +58,12 @@ class SortThunk final : public Thunk {
       bool is_stable, std::string comparator_name,
       std::optional<SortDirection> direction);
 
+  // Returns true if the sort runs on a builtin comparator and does not need a
+  // compiled comparator function.
+  static bool UsesBuiltinComparator(absl::Span<const Input> inputs,
+                                    int64_t dimension,
+                                    std::optional<SortDirection> direction);
+
   tsl::AsyncValueRef<ExecuteEvent> Execute(const ExecuteParams& params) final;
 
   BufferUses buffer_uses() const final;
@@ -69,6 +75,7 @@ class SortThunk final : public Thunk {
 
   absl::string_view comparator_name() const { return comparator_name_; }
   bool has_less_than() const { return less_than_.ok(); }
+  bool use_builtin_comparator() const { return use_builtin_comparator_; }
 
   const SortDims& sort_dims() const { return sort_dims_; }
   std::optional<SortDirection> direction() const { return direction_; }
@@ -88,6 +95,7 @@ class SortThunk final : public Thunk {
 
   SortDims sort_dims_;
   std::optional<SortDirection> direction_;
+  bool use_builtin_comparator_;
 
   // Name of the comparator function, lazily resolved to a comparator function
   // pointer using Thunk::FunctionRegistry.

@@ -124,6 +124,24 @@ static absl::StatusOr<SortThunk::SortDims> VerifySortInputs(
   return GetSortDims(inputs[0].shape, dimension);
 }
 
+static bool UseBuiltinComparator(const SortThunk::SortDims& sort_dims,
+                                 absl::Span<const SortThunk::Input> inputs,
+                                 std::optional<SortThunk::SortDirection> dir) {
+  absl::InlinedVector<PrimitiveType, 8> types;
+  types.reserve(inputs.size());
+  for (const SortThunk::Input& input : inputs) {
+    types.push_back(input.shape.element_type());
+  }
+  return internal::CanSortWithBuiltinComparator(sort_dims, types, dir);
+}
+
+bool SortThunk::UsesBuiltinComparator(absl::Span<const Input> inputs,
+                                      int64_t dimension,
+                                      std::optional<SortDirection> direction) {
+  absl::StatusOr<SortDims> sort_dims = VerifySortInputs(inputs, dimension);
+  return sort_dims.ok() && UseBuiltinComparator(*sort_dims, inputs, direction);
+}
+
 absl::StatusOr<std::unique_ptr<SortThunk>> SortThunk::Create(
     Info info, absl::Span<const Input> inputs, int64_t dimension,
     bool is_stable, LessThan less_than,
@@ -139,6 +157,14 @@ absl::StatusOr<std::unique_ptr<SortThunk>> SortThunk::Create(
     bool is_stable, std::string comparator_name,
     std::optional<SortDirection> direction) {
   ABSL_ASSIGN_OR_RETURN(auto sort_dims, VerifySortInputs(inputs, dimension));
+  if (comparator_name.empty() &&
+      !UseBuiltinComparator(sort_dims, inputs, direction)) {
+    return InvalidArgument(
+        "Sort thunk %s has no comparator function and cannot use a builtin "
+        "comparator for %d input(s) of type %s",
+        info.op_name, inputs.size(),
+        PrimitiveType_Name(inputs[0].shape.element_type()));
+  }
   return absl::WrapUnique(new SortThunk(std::move(info), inputs, dimension,
                                         is_stable, std::move(comparator_name),
                                         sort_dims, direction));
@@ -153,6 +179,8 @@ SortThunk::SortThunk(Info info, absl::Span<const Input> inputs,
       is_stable_(is_stable),
       sort_dims_(sort_dims),
       direction_(direction),
+      use_builtin_comparator_(
+          UseBuiltinComparator(sort_dims, inputs, direction)),
       less_than_(std::move(less_than)) {}
 
 SortThunk::SortThunk(Info info, absl::Span<const Input> inputs,
@@ -165,6 +193,8 @@ SortThunk::SortThunk(Info info, absl::Span<const Input> inputs,
       is_stable_(is_stable),
       sort_dims_(sort_dims),
       direction_(direction),
+      use_builtin_comparator_(
+          UseBuiltinComparator(sort_dims, inputs, direction)),
       comparator_name_(std::move(comparator_name)) {}
 
 tsl::AsyncValueRef<SortThunk::ExecuteEvent> SortThunk::Execute(
@@ -199,29 +229,31 @@ tsl::AsyncValueRef<SortThunk::ExecuteEvent> SortThunk::Execute(
   // Because thunks are owned by a parent CpuExecutable, we can safely assume
   // that comparator pointer will not change after we find it the first time,
   // and we can create a comparator adaptor to a LessThan function.
-  absl::call_once(less_than_init_flag_, [&]() {
-    if (less_than_.ok()) {
-      // `less_than_` may already be initialized in the constructor.
-      return;
-    }
-    absl::StatusOr<FunctionLibrary::Comparator*> comparator =
-        params.function_library->ResolveFunction<FunctionLibrary::Comparator>(
-            comparator_name_);
+  LessThan* less_than = nullptr;
+  if (!use_builtin_comparator_) {
+    absl::call_once(less_than_init_flag_, [&]() {
+      if (less_than_.ok()) {
+        // `less_than_` may already be initialized in the constructor.
+        return;
+      }
+      absl::StatusOr<FunctionLibrary::Comparator*> comparator =
+          params.function_library->ResolveFunction<FunctionLibrary::Comparator>(
+              comparator_name_);
 
-    if (ABSL_PREDICT_TRUE(comparator.ok())) {
-      less_than_ = [comparator](const void** data) {
-        bool result;
-        (*comparator)(&result, nullptr, data, nullptr, nullptr, nullptr);
-        ABSL_ANNOTATE_MEMORY_IS_INITIALIZED(&result, sizeof(result));
-        return result;
-      };
-    } else {
-      less_than_ = std::move(comparator.status());
-    }
-  });
+      if (ABSL_PREDICT_TRUE(comparator.ok())) {
+        less_than_ = [comparator](const void** data) {
+          bool result = (*comparator)(data);
+          ABSL_ANNOTATE_MEMORY_IS_INITIALIZED(&result, sizeof(result));
+          return result;
+        };
+      } else {
+        less_than_ = std::move(comparator.status());
+      }
+    });
 
-  ABSL_RETURN_IF_ERROR(less_than_.status());
-  LessThan* less_than = &less_than_.value();
+    ABSL_RETURN_IF_ERROR(less_than_.status());
+    less_than = &less_than_.value();
+  }
 
   int64_t num_slices = sort_dims_.outer_dim_size * sort_dims_.inner_dim_size;
 
@@ -235,78 +267,74 @@ tsl::AsyncValueRef<SortThunk::ExecuteEvent> SortThunk::Execute(
   PrimitiveType first_element_type = inputs_[0].shape.element_type();
   auto sort_slice_range = [raw_data, primitive_sizes, first_element_type,
                            sort_dims = sort_dims_, is_stable = is_stable_,
-                           less_than, direction = direction_](
+                           less_than, direction = direction_,
+                           use_builtin = use_builtin_comparator_](
                               int64_t start_slice, int64_t end_slice) {
-    if (raw_data.size() == 1 && direction.has_value()) {
+    if (!use_builtin) {
+      internal::SortInplace(sort_dims, start_slice, end_slice, raw_data,
+                            primitive_sizes, is_stable, less_than);
+      return;
+    }
+
+    if (raw_data.size() == 1) {
       primitive_util::ArrayTypeSwitch(
           [&](auto type) {
-            if constexpr ((primitive_util::IsFloatingPointType(type) &&
-                           primitive_util::BitWidth(type) >= 16) ||
-                          (primitive_util::IsIntegralType(type) &&
-                           primitive_util::BitWidth(type) >= 8)) {
+            if constexpr (internal::IsBuiltinSortKeyType(type)) {
               using T = primitive_util::NativeTypeOf<type>;
               internal::SortInplace<T>(sort_dims, start_slice, end_slice,
                                        reinterpret_cast<T*>(raw_data[0]),
                                        is_stable, *direction);
             } else {
-              internal::SortInplace(sort_dims, start_slice, end_slice, raw_data,
-                                    primitive_sizes, is_stable, less_than);
+              LOG(FATAL) << "No builtin comparator for "
+                         << PrimitiveType_Name(PrimitiveType{type});
             }
           },
           first_element_type);
-    } else if (raw_data.size() == 2 && direction.has_value() &&
-               (sort_dims.inner_dim_size == 1 ||
-                sort_dims.sort_dim_size <= 65536)) {
-      size_t val_size = primitive_sizes[1];
-      primitive_util::ArrayTypeSwitch(
-          [&](auto key_type) {
-            if constexpr ((primitive_util::IsFloatingPointType(key_type) &&
-                           primitive_util::BitWidth(key_type) >= 16) ||
-                          (primitive_util::IsIntegralType(key_type) &&
-                           primitive_util::BitWidth(key_type) >= 8)) {
-              using Key = primitive_util::NativeTypeOf<key_type>;
-              auto* keys = reinterpret_cast<Key*>(raw_data[0]);
-              switch (val_size) {
-                case 1:
-                  internal::Sort2DKeyValue<Key, uint8_t>(
-                      sort_dims, start_slice, end_slice, keys,
-                      reinterpret_cast<uint8_t*>(raw_data[1]), is_stable,
-                      *direction);
-                  break;
-                case 2:
-                  internal::Sort2DKeyValue<Key, uint16_t>(
-                      sort_dims, start_slice, end_slice, keys,
-                      reinterpret_cast<uint16_t*>(raw_data[1]), is_stable,
-                      *direction);
-                  break;
-                case 4:
-                  internal::Sort2DKeyValue<Key, uint32_t>(
-                      sort_dims, start_slice, end_slice, keys,
-                      reinterpret_cast<uint32_t*>(raw_data[1]), is_stable,
-                      *direction);
-                  break;
-                case 8:
-                  internal::Sort2DKeyValue<Key, uint64_t>(
-                      sort_dims, start_slice, end_slice, keys,
-                      reinterpret_cast<uint64_t*>(raw_data[1]), is_stable,
-                      *direction);
-                  break;
-                default:
-                  internal::SortInplace(sort_dims, start_slice, end_slice,
-                                        raw_data, primitive_sizes, is_stable,
-                                        less_than);
-                  break;
-              }
-            } else {
-              internal::SortInplace(sort_dims, start_slice, end_slice, raw_data,
-                                    primitive_sizes, is_stable, less_than);
-            }
-          },
-          first_element_type);
-    } else {
-      internal::SortInplace(sort_dims, start_slice, end_slice, raw_data,
-                            primitive_sizes, is_stable, less_than);
+      return;
     }
+
+    DCHECK_EQ(raw_data.size(), 2);
+    size_t val_size = primitive_sizes[1];
+    primitive_util::ArrayTypeSwitch(
+        [&](auto key_type) {
+          if constexpr (internal::IsBuiltinSortKeyType(key_type)) {
+            using Key = primitive_util::NativeTypeOf<key_type>;
+            auto* keys = reinterpret_cast<Key*>(raw_data[0]);
+            switch (val_size) {
+              case 1:
+                internal::Sort2DKeyValue<Key, uint8_t>(
+                    sort_dims, start_slice, end_slice, keys,
+                    reinterpret_cast<uint8_t*>(raw_data[1]), is_stable,
+                    *direction);
+                break;
+              case 2:
+                internal::Sort2DKeyValue<Key, uint16_t>(
+                    sort_dims, start_slice, end_slice, keys,
+                    reinterpret_cast<uint16_t*>(raw_data[1]), is_stable,
+                    *direction);
+                break;
+              case 4:
+                internal::Sort2DKeyValue<Key, uint32_t>(
+                    sort_dims, start_slice, end_slice, keys,
+                    reinterpret_cast<uint32_t*>(raw_data[1]), is_stable,
+                    *direction);
+                break;
+              case 8:
+                internal::Sort2DKeyValue<Key, uint64_t>(
+                    sort_dims, start_slice, end_slice, keys,
+                    reinterpret_cast<uint64_t*>(raw_data[1]), is_stable,
+                    *direction);
+                break;
+              default:
+                LOG(FATAL) << "No builtin comparator for value size "
+                           << val_size;
+            }
+          } else {
+            LOG(FATAL) << "No builtin comparator for "
+                       << PrimitiveType_Name(PrimitiveType{key_type});
+          }
+        },
+        first_element_type);
   };
 
   // Target ~32K elements per work chunk to balance thread scheduling overhead
