@@ -1900,6 +1900,8 @@ CpuCompiler::CompileCpuExecutable(
 
   ABSL_ASSIGN_OR_RETURN(std::vector<ThunkEmitter::EmittedKernel> kernels,
                         thunk_emitter.ConsumeKernels());
+  std::vector<ThunkEmitter::EmittedKernel> comparators =
+      thunk_emitter.ConsumeComparators();
 
   std::string ir_module_string;
   if (embed_ir_in_executable) {
@@ -1911,12 +1913,18 @@ CpuCompiler::CompileCpuExecutable(
                       llvm_ir::DumpToString(kernel.module.getModuleUnlocked()));
     };
     std::string thunks_ir = absl::StrJoin(kernels, "\n", thunk_kernel_fmt);
+    std::string comparators_ir =
+        absl::StrJoin(comparators, "\n", thunk_kernel_fmt);
 
-    ir_module_string = absl::StrCat(emitter2_ir, "\n", thunks_ir);
+    ir_module_string =
+        absl::StrCat(emitter2_ir, "\n", thunks_ir, "\n", comparators_ir);
   }
 
   ABSL_RETURN_IF_ERROR(VerifyLlvmModule(*llvm_module));
   for (const auto& [name, module] : kernels) {
+    ABSL_RETURN_IF_ERROR(VerifyLlvmModule(*module.getModuleUnlocked()));
+  }
+  for (const auto& [name, module] : comparators) {
     ABSL_RETURN_IF_ERROR(VerifyLlvmModule(*module.getModuleUnlocked()));
   }
 
@@ -1953,9 +1961,9 @@ CpuCompiler::CompileCpuExecutable(
   // We define the number of module parts based on the total number of
   // compiled functions (kernels and comparators) that are called from thunks,
   // and the maximum number of parts that we want to split the module into.
-  size_t num_compiled_functions = ir_emitter2.kernels().size() +
-                                  ir_emitter2.comparators().size() +
-                                  kernels.size();
+  size_t num_compiled_functions =
+      ir_emitter2.kernels().size() + ir_emitter2.comparators().size() +
+      kernels.size() + comparators.size();
   size_t num_default_parts =
       std::min(num_compiled_functions - num_extra_functions,
                parallel_codegen_split_count - num_extra_parts);
@@ -2088,6 +2096,16 @@ CpuCompiler::CompileCpuExecutable(
       symbol_type_id_to_function_type_id.emplace(
           compiled_symbols.back().type_id, SymbolProto::COMPARATOR);
     }
+  }
+
+  for (auto& [name, module] : comparators) {
+    compiled_symbols.push_back(
+        FunctionLibrary::Sym<FunctionLibrary::Comparator>(name));
+    symbol_type_id_to_function_type_id.emplace(compiled_symbols.back().type_id,
+                                               SymbolProto::COMPARATOR_V2);
+    ABSL_RETURN_IF_ERROR(llvm_module_compiler->AddModule(
+        std::move(module), num_extra_parts + kernel_dylib_index));
+    kernel_dylib_index = (kernel_dylib_index + 1) % num_default_parts;
   }
 
   VLOG(3) << "Collected " << compiled_symbols.size() << " compiled symbols";

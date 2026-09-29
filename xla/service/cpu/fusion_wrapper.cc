@@ -111,7 +111,7 @@ bool FusionWrapper::MustWrapInstruction(const HloInstruction& instruction) {
              primitive_util::IsSubByteNonPredType(
                  instruction.shape().element_type());
     case HloOpcode::kConcatenate:
-      return !CanDoFastConcatenate(instruction).ok();
+      return true;
     case HloOpcode::kConvolution:
       return target_machine_features_ != nullptr &&
              !CanUseEigenConvolution(instruction, *target_machine_features_);

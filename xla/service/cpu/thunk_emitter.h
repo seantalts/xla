@@ -85,6 +85,11 @@ class ThunkEmitter {
 
   absl::StatusOr<std::vector<EmittedKernel>> ConsumeKernels();
 
+  // Returns the sort comparator modules emitted so far, one per comparator
+  // computation. Each module defines one function with the
+  // FunctionLibrary::Comparator signature.
+  std::vector<EmittedKernel> ConsumeComparators();
+
  private:
   struct HostKernelAllocationSlices {
     std::vector<ShapedSlice> arguments;
@@ -257,7 +262,11 @@ class ThunkEmitter {
   absl::flat_hash_map<BufferAllocation::Slice, std::shared_ptr<Resource>>
       token_resources_;
 
+  absl::StatusOr<std::string> EmitSortComparator(
+      const HloComputation* comparator);
+
   std::vector<EmittedKernel> kernels_;
+  std::vector<EmittedKernel> comparators_;
 
   std::unique_ptr<mlir::MLIRContext> mlir_context_;
   FusionCompiler fusion_compiler_;
