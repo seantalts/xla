@@ -106,6 +106,29 @@ cc_library(
 )
 
 cc_library(
+    name = "slice_to_dynamic_thunk_serdes",
+    srcs = ["slice_to_dynamic_thunk_serdes.cc"],
+    hdrs = ["slice_to_dynamic_thunk_serdes.h"],
+    deps = [
+        "//xla/backends/cpu/runtime:slice_to_dynamic_thunk",
+        "//xla/backends/cpu/runtime:thunk",
+        "//xla/backends/cpu/runtime:thunk_proto_cc",
+        "//xla/backends/cpu/runtime:thunk_proto_serdes_impl",
+        "//xla/backends/cpu/runtime:thunk_proto_serdes_utils",
+        "//xla/hlo/ir:hlo",
+        "//xla/runtime:resource_use",
+        "//xla/service:buffer_assignment",
+        "//xla/service:shaped_slice",
+        "@com_google_absl//absl/base",
+        "@com_google_absl//absl/log:check",
+        "@com_google_absl//absl/status",
+        "@com_google_absl//absl/status:status_macros",
+        "@com_google_absl//absl/status:statusor",
+    ],
+    alwayslink = 1,
+)
+
+cc_library(
     name = "ynn_fusion_thunk_serdes",
     srcs = ["ynn_fusion_thunk_serdes.cc"],
     hdrs = ["ynn_fusion_thunk_serdes.h"],
@@ -232,6 +255,7 @@ cc_library(
         ":custom_call_thunk_serdes",
         ":dot_thunk_serdes",
         ":fft_thunk_serdes",
+        ":slice_to_dynamic_thunk_serdes",
         ":ynn_fusion_thunk_serdes",
     ],
     alwayslink = 1,

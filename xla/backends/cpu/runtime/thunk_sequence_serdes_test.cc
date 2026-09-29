@@ -56,6 +56,7 @@ limitations under the License.
 #include "xla/backends/cpu/runtime/rng_seed_thunk.h"
 #include "xla/backends/cpu/runtime/rng_state_thunk.h"
 #include "xla/backends/cpu/runtime/serdes_base.h"
+#include "xla/backends/cpu/runtime/slice_to_dynamic_thunk.h"
 #include "xla/backends/cpu/runtime/sort_thunk.h"
 #include "xla/backends/cpu/runtime/thunk.h"
 #include "xla/backends/cpu/runtime/thunk.pb.h"
@@ -194,6 +195,8 @@ class ThunkSequenceSerdesTest : public ::testing::Test {
                           CreateConvolutionThunk());
     ABSL_ASSIGN_OR_RETURN(thunk_sequence.emplace_back(), CreateSortThunk());
     ABSL_ASSIGN_OR_RETURN(thunk_sequence.emplace_back(), CreateRngSeedThunk());
+    ABSL_ASSIGN_OR_RETURN(thunk_sequence.emplace_back(),
+                          CreateSliceToDynamicThunk());
     return thunk_sequence;
   }
 
@@ -235,6 +238,13 @@ class ThunkSequenceSerdesTest : public ::testing::Test {
 
     return absl::OkStatus();
   }
+  absl::Status AddBufferAllocation(Literal literal) {
+    literals_.push_back(std::move(literal));
+    ABSL_RETURN_IF_ERROR(buffer_allocations_.push_back(
+        CreateBufferAllocation(buffer_allocations_.size(), literals_.back())));
+    return absl::OkStatus();
+  }
+
   absl::Status AddPredBufferAllocation() {
     literals_.push_back(LiteralUtil::CreateFull<bool>({1}, false));
     ABSL_RETURN_IF_ERROR(buffer_allocations_.push_back(
@@ -701,6 +711,28 @@ class ThunkSequenceSerdesTest : public ::testing::Test {
             buffer_allocations_[buffer_allocations_.size() - 1]));
   }
 
+  absl::StatusOr<std::unique_ptr<Thunk>> CreateSliceToDynamicThunk() {
+    ABSL_RETURN_IF_ERROR(AddBufferAllocations(1));
+    size_t source = buffer_allocations_.size() - 1;
+    ABSL_RETURN_IF_ERROR(
+        AddBufferAllocation(LiteralUtil::CreateR0<int32_t>(2)));
+    ABSL_RETURN_IF_ERROR(
+        AddBufferAllocation(LiteralUtil::CreateR0<int32_t>(4)));
+    ABSL_RETURN_IF_ERROR(
+        AddBufferAllocation(LiteralUtil::CreateFull<int32_t>({10}, 0)));
+    size_t destination = buffer_allocations_.size() - 1;
+
+    return SliceToDynamicThunk::Create(
+        Thunk::Info(),
+        ShapedSlice{CreateBufferAllocationSlice(buffer_allocations_[source]),
+                    literals_[source].shape()},
+        {CreateBufferAllocationSlice(buffer_allocations_[source + 1]),
+         CreateBufferAllocationSlice(buffer_allocations_[source + 2])},
+        ShapedSlice{
+            CreateBufferAllocationSlice(buffer_allocations_[destination]),
+            ShapeUtil::MakeShape(F32, {2, 4}, {true, true})});
+  }
+
   bool VerifySliceEquality(const BufferAllocation::Slice& slice_1,
                            const BufferAllocation::Slice& slice_2) {
     return slice_1.offset() == slice_2.offset() &&
@@ -1012,6 +1044,26 @@ class ThunkSequenceSerdesTest : public ::testing::Test {
     return VerifySliceEquality(thunk_1.dest_buffer(), thunk_2.dest_buffer());
   }
 
+  bool VerifyShapedSliceEquality(const ShapedSlice& a, const ShapedSlice& b) {
+    return VerifySliceShapeEquality(a.slice, a.shape, b.slice, b.shape);
+  }
+
+  bool VerifySliceToDynamicThunkEquality(const SliceToDynamicThunk& thunk_1,
+                                         const SliceToDynamicThunk& thunk_2) {
+    if (thunk_1.dim_sizes().size() != thunk_2.dim_sizes().size()) {
+      return false;
+    }
+    for (size_t i = 0; i < thunk_1.dim_sizes().size(); ++i) {
+      if (!VerifySliceEquality(thunk_1.dim_sizes()[i],
+                               thunk_2.dim_sizes()[i])) {
+        return false;
+      }
+    }
+    return VerifyShapedSliceEquality(thunk_1.source(), thunk_2.source()) &&
+           VerifyShapedSliceEquality(thunk_1.destination(),
+                                     thunk_2.destination());
+  }
+
   bool VerifySortThunkEquality(const SortThunk& thunk_1,
                                const SortThunk& thunk_2) {
     return thunk_1.comparator_name() == thunk_2.comparator_name() &&
@@ -1252,6 +1304,10 @@ class ThunkSequenceSerdesTest : public ::testing::Test {
         return VerifyRngSeedThunkEquality(
             absl::down_cast<const RngSeedThunk&>(thunk_1),
             absl::down_cast<const RngSeedThunk&>(thunk_2));
+      case Thunk::Kind::kSliceToDynamic:
+        return VerifySliceToDynamicThunkEquality(
+            absl::down_cast<const SliceToDynamicThunk&>(thunk_1),
+            absl::down_cast<const SliceToDynamicThunk&>(thunk_2));
       case Thunk::Kind::kSort:
         return VerifySortThunkEquality(
             absl::down_cast<const SortThunk&>(thunk_1),

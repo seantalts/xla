@@ -89,6 +89,7 @@ class Thunk {
     kReplicaId,
     kRngGetAndUpdateState,
     kRngSeed,
+    kSliceToDynamic,
     kSort,
     kTopK,
     kWhile,

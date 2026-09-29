@@ -83,6 +83,8 @@ absl::string_view Thunk::KindToString(Kind kind) {
       return "rng-get-and-update-state";
     case Kind::kRngSeed:
       return "rng-seed";
+    case Kind::kSliceToDynamic:
+      return "slice-to-dynamic";
     case Kind::kSort:
       return "sort";
     case Kind::kTopK:

@@ -172,6 +172,8 @@ static absl::StatusOr<Thunk::Kind> ProtoThunkToThunkKind(
       return Thunk::Kind::kYnnFusion;
     case ThunkProto::ImplCase::kRngSeedThunk:
       return Thunk::Kind::kRngSeed;
+    case ThunkProto::ImplCase::kSliceToDynamicThunk:
+      return Thunk::Kind::kSliceToDynamic;
     case ThunkProto::ImplCase::IMPL_NOT_SET:
       return Internal("Thunk kind not set.");
   }

@@ -701,6 +701,53 @@ xla_cc_test(
 )
 
 cc_library(
+    name = "slice_to_dynamic_thunk",
+    srcs = ["slice_to_dynamic_thunk.cc"],
+    hdrs = ["slice_to_dynamic_thunk.h"],
+    deps = [
+        ":buffer_allocations",
+        ":thunk",
+        "//xla:shape_util",
+        "//xla:util",
+        "//xla:xla_data_proto_cc",
+        "//xla/runtime:buffer_use",
+        "//xla/service:buffer_assignment",
+        "//xla/service:shaped_slice",
+        "//xla/stream_executor:device_address",
+        "//xla/tsl/concurrency:async_value",
+        "@com_google_absl//absl/container:inlined_vector",
+        "@com_google_absl//absl/memory",
+        "@com_google_absl//absl/status:status_macros",
+        "@com_google_absl//absl/status:statusor",
+        "@com_google_absl//absl/types:span",
+    ],
+)
+
+xla_cc_test(
+    name = "slice_to_dynamic_thunk_test",
+    srcs = ["slice_to_dynamic_thunk_test.cc"],
+    deps = [
+        ":buffer_allocations",
+        ":slice_to_dynamic_thunk",
+        ":thunk",
+        ":thunk_testlib",
+        "//xla:literal",
+        "//xla:literal_util",
+        "//xla:shape_util",
+        "//xla/runtime:buffer_use",
+        "//xla/service:buffer_assignment",
+        "//xla/service:shaped_slice",
+        "//xla/tsl/concurrency:async_value",
+        "//xla/tsl/platform:statusor",
+        "//xla/tsl/platform:test",
+        "@com_google_absl//absl/status:status_macros",
+        "@com_google_absl//absl/status:statusor",
+        "@com_google_absl//absl/types:span",
+        "@com_google_googletest//:gtest_main",
+    ],
+)
+
+cc_library(
     name = "custom_call_thunk",
     srcs = ["custom_call_thunk.cc"],
     hdrs = ["custom_call_thunk.h"],
@@ -1117,7 +1164,9 @@ cc_library(
     srcs = ["sort_lib.cc"],
     hdrs = ["sort_lib.h"],
     deps = [
+        "//xla:shape_util",
         "//xla:types",
+        "//xla:xla_data_proto_cc",
         "@com_google_absl//absl/base:core_headers",
         "@com_google_absl//absl/functional:any_invocable",
         "@com_google_absl//absl/log",
@@ -1440,6 +1489,7 @@ xla_cc_test(
         ":rng_seed_thunk",
         ":rng_state_thunk",
         ":serdes_base",
+        ":slice_to_dynamic_thunk",
         ":sort_thunk",
         ":thunk",
         ":thunk_executor",

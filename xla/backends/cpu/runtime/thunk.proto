@@ -236,6 +236,13 @@ message CopyThunkProto {
   ShapeBufferAllocationSliceProto dst_buffer_shape = 2;
 }
 
+message SliceToDynamicThunkProto {
+  ShapeBufferAllocationSliceProto source_buffer_shape = 1;
+  repeated xla.buffer_assignment.BufferAllocationSliceProto dim_size_buffers =
+      2;
+  ShapeBufferAllocationSliceProto destination_buffer_shape = 3;
+}
+
 message FftThunkProto {
   bool is_multi_thread_eigen = 1;
   int32 fft_type = 2;
@@ -319,6 +326,7 @@ message ThunkProto {
     ReplicaIdThunkProto replica_id_thunk = 20;
     YnnFusionThunkProto ynn_fusion_thunk = 21;
     RngSeedThunkProto rng_seed_thunk = 22;
+    SliceToDynamicThunkProto slice_to_dynamic_thunk = 23;
   }
 }
 
