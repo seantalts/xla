@@ -94,26 +94,16 @@ class IrEmitter2 {
     std::string backend_extra_options;
   };
 
-  // Emitted comparator function information (for sort operation).
-  struct ComparatorInfo {
-    std::string name;
-  };
 
   // Returns all the kernels emitted so far via this emitter.
   absl::Span<const KernelInfo> kernels() const { return kernels_; }
 
-  absl::Span<const ComparatorInfo> comparators() const { return comparators_; }
 
   // Emits a host kernel for the given dot fusion instruction (output fusion).
   absl::StatusOr<KernelInfo> EmitDotFusionHostKernel(
       const HloFusionInstruction* fusion);
 
-  // Emits a host kernel for the given slice-to-dynamic instruction.
-  absl::StatusOr<KernelInfo> EmitSliceToDynamicHostKernel(
-      const HloInstruction* instr);
 
-  // Emits a comparator function for the given sort instruction.
-  absl::StatusOr<ComparatorInfo> EmitSortComparator(HloComputation* comparator);
 
  private:
   class ElementalIrEmitter;
@@ -140,7 +130,6 @@ class IrEmitter2 {
 
   // Keeps track of all the functions emitted so far.
   std::vector<KernelInfo> kernels_;
-  std::vector<ComparatorInfo> comparators_;
 };
 
 }  // namespace xla::cpu

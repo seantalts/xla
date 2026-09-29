@@ -42,7 +42,6 @@ limitations under the License.
 #include "xla/backends/cpu/alignment.h"
 #include "xla/backends/cpu/codegen/computation_kernel_emitter.h"
 #include "xla/backends/cpu/codegen/dot/dot_kernel_emitter.h"
-#include "xla/backends/cpu/codegen/elemental/concatenate_kernel_emitter.h"
 #include "xla/backends/cpu/codegen/emitters/comparator_emitter.h"
 #include "xla/backends/cpu/codegen/fusion_compiler.h"
 #include "xla/backends/cpu/codegen/fusion_emitter.h"
@@ -344,9 +343,6 @@ absl::StatusOr<ThunkSequence> ThunkEmitter::EmitHloInstruction(
     case HloOpcode::kCollectivePermute:
       return EmitCollectivePermuteThunk(instruction);
 
-    case HloOpcode::kConcatenate:
-      return EmitConcatenateKernelThunk(instruction);
-
     case HloOpcode::kFusion:
       if (instruction->fusion_kind() == HloInstruction::FusionKind::kCustom) {
         // Fusion must have backend config with custom fusion config.
@@ -614,31 +610,6 @@ absl::StatusOr<ThunkSequence> ThunkEmitter::EmitCallThunk(
     return ThunkSequence::Of<CallThunk>(ThunkInfo(instruction),
                                         std::move(called_sequence));
   }
-}
-
-absl::StatusOr<ThunkSequence> ThunkEmitter::EmitConcatenateKernelThunk(
-    const HloInstruction* instruction) {
-  ConcatenateKernelEmitter emitter(instruction, &buffer_assignment_,
-                                   &target_machine_features_);
-  ABSL_ASSIGN_OR_RETURN(KernelDefinition kernel_definition,
-                        emitter.EmitKernelDefinition());
-
-  auto kernel_spec = kernel_definition.spec();
-  auto kernel_source = std::move(kernel_definition).TakeSource();
-
-  ABSL_ASSIGN_OR_RETURN(auto backend_config,
-                        instruction->backend_config<BackendConfig>());
-
-  kernels_.push_back(
-      {kernel_spec.name(), std::move(kernel_source).thread_safe_module()});
-
-  if (backend_config.has_llvm_kernel_options()) {
-    SetXlaCpuBackendOptions(*kernels_.back().module.getModuleUnlocked(),
-                            backend_config.llvm_kernel_options());
-  }
-
-  return MakeKernelThunkSequence(instruction, std::move(kernel_spec),
-                                 /*min_alignment=*/MinAlign());
 }
 
 absl::StatusOr<ThunkSequence> ThunkEmitter::EmitGetDimensionSizeThunk(

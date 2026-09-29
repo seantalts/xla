@@ -117,9 +117,6 @@ class ThunkEmitter {
   absl::StatusOr<ThunkSequence> EmitCallThunk(
       const HloInstruction* instruction);
 
-  absl::StatusOr<ThunkSequence> EmitConcatenateKernelThunk(
-      const HloInstruction* instruction);
-
   absl::StatusOr<ThunkSequence> EmitGetDimensionSizeThunk(
       const HloInstruction* instruction);
 

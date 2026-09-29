@@ -185,62 +185,6 @@ absl::StatusOr<IrEmitter2::KernelInfo> IrEmitter2::EmitDotFusionHostKernel(
       se::BlockDim(num_workgroups.x, num_workgroups.y), se::ThreadDim()));
 }
 
-absl::StatusOr<IrEmitter2::KernelInfo> IrEmitter2::EmitSliceToDynamicHostKernel(
-    const HloInstruction* instr) {
-  VLOG(2) << "Emit slice-to-dynamic host kernel: " << instr->name();
-
-  ABSL_ASSIGN_OR_RETURN(KernelPrototype kernel_prototype,
-                        EmitKernelPrototype(instr));
-  llvm::IRBuilder<> ir_builder(module_->getContext());
-  ir_builder.SetInsertPoint(
-      kernel_prototype.function->getEntryBlock().getTerminator());
-
-  llvm_ir::IrArray output_array = kernel_prototype.results[0];
-  auto guard = nested_ir_emitter_->WithBuilder(ir_builder);
-  ABSL_RETURN_IF_ERROR(nested_ir_emitter_->EmitSliceToDynamic(
-      instr, kernel_prototype.arguments, output_array));
-  return kernels_.emplace_back(
-      KernelInfo(std::move(kernel_prototype), se::BlockDim(), se::ThreadDim()));
-}
-
-absl::StatusOr<IrEmitter2::ComparatorInfo> IrEmitter2::EmitSortComparator(
-    HloComputation* comparator) {
-  std::string comparator_name(comparator->name().data(),
-                              comparator->name().size());
-  if (hlo_module_.config()
-          .debug_options()
-          .xla_cpu_generate_unique_c_style_kernel_entry_points()) {
-    ABSL_ASSIGN_OR_RETURN(comparator_name, ConvertToCName(absl::StrCat(
-                                               comparator->parent()->name(),
-                                               "_", comparator->name())));
-  }
-
-  // Find if we already emitted this comparator.
-  auto info = absl::c_find_if(comparators_, [&](const ComparatorInfo& info) {
-    return info.name == comparator_name;
-  });
-  if (info != comparators_.end()) return *info;
-
-  // We use simple post-order schedule as we are not emitting a "real"
-  // computation that requires buffer assignment.
-  auto schedule = comparator->MakeInstructionPostOrder();
-
-  // Emit LLVM IR for comparator function. We emit it as a top-level computation
-  // to set external linkage and to get a pointer to compiled function later.
-  ABSL_ASSIGN_OR_RETURN(llvm::Function * comparator_function,
-                        nested_ir_emitter_->EmitComputation(
-                            comparator, comparator_name,
-                            /*is_top_level_computation=*/true, schedule,
-                            /*allow_reassociation=*/false));
-
-  // Generate unwind information so that GDB can crawl through the stack frames
-  // created by the JIT compiled code.
-  comparator_function->setUWTableKind(llvm::UWTableKind::Default);
-
-  return comparators_.emplace_back(
-      ComparatorInfo{comparator_function->getName().str()});
-}
-
 //===----------------------------------------------------------------------===//
 // Building HostKernel prototypes.
 //===----------------------------------------------------------------------===//

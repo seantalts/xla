@@ -1359,10 +1359,9 @@ static llvm::orc::ThreadSafeModule CloneAsThreadSafeModule(
 }
 
 namespace {
-// Compiled symbols (kernels and comparators) from a single LLVM module part.
+// Compiled kernel symbols from a single LLVM module part.
 struct CompiledSymbolsPart {
   std::vector<IrEmitter2::KernelInfo> kernels;
-  std::vector<IrEmitter2::ComparatorInfo> comparators;
 };
 }  // namespace
 
@@ -1383,22 +1382,9 @@ static CompiledSymbolsPart CollectCompiledSymbolsPart(
     return std::nullopt;
   };
 
-  auto find_comparator =
-      [&](llvm::StringRef name) -> std::optional<IrEmitter2::ComparatorInfo> {
-    for (auto& c : ir_emitter.comparators()) {
-      if (c.name == name) {
-        return c;
-      }
-    }
-    return std::nullopt;
-  };
-
   for (auto& f : module.functions()) {
     if (auto kernel = find_kernel(f.getName())) {
       syms.kernels.push_back(*kernel);
-    }
-    if (auto comparator = find_comparator(f.getName())) {
-      syms.comparators.push_back(*comparator);
     }
   }
 
@@ -1826,8 +1812,7 @@ CpuCompiler::CompileCpuExecutable(
   // compiled functions (kernels and comparators) that are called from thunks,
   // and the maximum number of parts that we want to split the module into.
   size_t num_compiled_functions =
-      ir_emitter2.kernels().size() + ir_emitter2.comparators().size() +
-      kernels.size() + comparators.size();
+      ir_emitter2.kernels().size() + kernels.size() + comparators.size();
   size_t num_default_parts =
       std::min(num_compiled_functions - num_extra_functions,
                parallel_codegen_split_count - num_extra_parts);
@@ -1844,8 +1829,8 @@ CpuCompiler::CompileCpuExecutable(
   std::vector<CompiledSymbolsPart> compiled_parts;
 
   VLOG(2) << "Compile LLVM module with " << ir_emitter2.kernels().size()
-          << " kernels and " << ir_emitter2.comparators().size()
-          << " comparators";
+          << " kernels, " << kernels.size() << " thunk kernels and "
+          << comparators.size() << " comparators";
 
   int dylib_index = 0;
   auto add_module_for_compilation =
@@ -1953,12 +1938,6 @@ CpuCompiler::CompileCpuExecutable(
           FunctionLibrary::Sym<FunctionLibrary::Kernel>(kernel.name));
       symbol_type_id_to_function_type_id.emplace(
           compiled_symbols.back().type_id, SymbolProto::KERNEL);
-    }
-    for (const IrEmitter2::ComparatorInfo& comparator : part.comparators) {
-      compiled_symbols.push_back(
-          FunctionLibrary::Sym<FunctionLibrary::Comparator>(comparator.name));
-      symbol_type_id_to_function_type_id.emplace(
-          compiled_symbols.back().type_id, SymbolProto::COMPARATOR);
     }
   }
 

@@ -112,22 +112,8 @@ class IrEmitter : public DfsHloVisitorWithDefault,
   // not unique among already emitted functions then a suffix is appended to
   // make the name unique.
   //
-  // 'is_top_level_computation' has the following meanings for each CPU backend:
-  // *) sequential: indicates that this is the entry computation of the HLO
-  //    module.
-  // *) parallel: indices that this is the callee of a kCall HLO in the entry
-  //    computation of the HLO module.
-  //
-  // If 'instruction_order' is not NULL, then the HLO instructions are emitted
-  // in the given order.  In this case, 'instruction_order' must be a
-  // topological sort of the set of nodes accessible from the root of the
-  // computation.
-  //
-  // If 'allow_reassociation' is true, the fast-math reassociation flag will
-  // be enabled in the function's body. This is used when emitting reducers.
   absl::StatusOr<llvm::Function*> EmitComputation(
       const HloComputation* computation, absl::string_view function_name_prefix,
-      bool is_top_level_computation,
       absl::Span<HloInstruction* const> instruction_order,
       bool allow_reassociation,
       absl::Span<const llvm::Attribute::AttrKind> function_attributes = {});
@@ -528,12 +514,6 @@ class IrEmitter : public DfsHloVisitorWithDefault,
                             const llvm_ir::IrArray& target_array,
                             const llvm_ir::IrArray& source_array);
 
-  // Emit slice-to-dynamic.
-  absl::Status EmitSliceToDynamic(
-      const HloInstruction* hlo,
-      absl::Span<const llvm_ir::IrArray> source_arrays,
-      const llvm_ir::IrArray& target_array);
-
   // Emits a call to a non-variadic function `func_name` with arguments
   // `arguments` assuming C calling convention.
   llvm::Value* EmitCallToFunc(
@@ -680,7 +660,6 @@ class IrEmitter : public DfsHloVisitorWithDefault,
   const HloModule& hlo_module_;
   const HloModuleConfig& hlo_module_config_;
 
-  bool is_top_level_computation_;
 
   const TargetMachineFeatures& target_machine_features_;
 

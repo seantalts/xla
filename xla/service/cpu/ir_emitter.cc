@@ -136,7 +136,6 @@ IrEmitter::IrEmitter(mlir::MLIRContext* mlir_context,
       alias_analysis_(hlo_module, assignment, &llvm_module->getContext()),
       hlo_module_(hlo_module),
       hlo_module_config_(hlo_module.config()),
-      is_top_level_computation_(false),
       target_machine_features_(*target_machine_features),
       emit_code_for_msan_(emit_code_for_msan),
       slice_to_buffer_table_index_(std::move(slice_to_buffer_table_index)),
@@ -195,13 +194,11 @@ void IrEmitter::EmitThreadLocalFunctionEpilogue(
 
 absl::StatusOr<llvm::Function*> IrEmitter::EmitComputation(
     const HloComputation* computation, absl::string_view function_name_prefix,
-    bool is_top_level_computation,
     absl::Span<HloInstruction* const> instruction_order,
     bool allow_reassociation,
     absl::Span<const llvm::Attribute::AttrKind> function_attributes) {
   std::string function_name = name_uniquer_.GetUniqueName(function_name_prefix);
   VLOG(2) << "Emitting IR for CPU function [" << function_name_prefix << "]";
-  is_top_level_computation_ = is_top_level_computation;
 
   auto cleanup = absl::MakeCleanup(
       [saved_allow_reassociation = allow_reassociation_, this]() {
@@ -269,9 +266,7 @@ void IrEmitter::InitializeIrFunction(const std::string& function_name) {
   // Functions with local linkage get an inlining bonus.  Because we know
   // a-priori that embedded functions (non-entry functions) will not have its
   // name resolved, give it local linkage.
-  llvm::Function::LinkageTypes linkage =
-      is_top_level_computation_ ? llvm::GlobalValue::ExternalLinkage
-                                : llvm::GlobalValue::InternalLinkage;
+  llvm::Function::LinkageTypes linkage = llvm::GlobalValue::InternalLinkage;
   // Create and initialize new IrFunction.
   compute_function_.emplace(function_name, linkage, hlo_module_config_, module_,
                             b());
@@ -1594,49 +1589,6 @@ absl::Status IrEmitter::HandleCall(HloInstruction* call) {
   return absl::OkStatus();
 }
 
-absl::Status IrEmitter::EmitSliceToDynamic(
-    const HloInstruction* hlo, absl::Span<const llvm_ir::IrArray> source_arrays,
-    const llvm_ir::IrArray& target_array) {
-  std::vector<llvm::Value*> dynamic_dims;
-  int32_t raw_data_size =
-      ShapeUtil::ByteSizeOf(ShapeUtil::MakeStaticShape(hlo->shape()));
-  llvm::Value* dest_buffer = target_array.GetBasePointer();
-  for (int64_t i = 1; i < hlo->operand_count(); ++i) {
-    const int64_t dim_index = i - 1;
-    llvm::Value* source_buffer = source_arrays[i].GetBasePointer();
-    llvm::LoadInst* dyn_dim_size = Load(IrShapeType(hlo->operand(i)->shape()),
-                                        source_buffer, "dyn_dim_size");
-
-    llvm::Value* metadata = b()->CreateConstInBoundsGEP1_32(
-        b()->getInt8Ty(), dest_buffer,
-        raw_data_size + dim_index * sizeof(int32_t));
-    b()->CreateStore(dyn_dim_size, metadata);
-    dynamic_dims.push_back(b()->CreateIntCast(dyn_dim_size, b()->getInt64Ty(),
-                                              /*isSigned=*/true,
-                                              "i64_dyn_dim_size"));
-  }
-
-  // Pseudo code for sliceToDynamic:
-  //
-  //   for (index i in dynamic_dim)
-  //     dest_index = delinearize(linearize(i, dynamic_dim), static_dim)
-  //     dest[dest_index] = source[i]
-  auto loop_body_emitter =
-      [&](const llvm_ir::IrArray::Index& array_index) -> absl::Status {
-    llvm::Value* source_element =
-        source_arrays[0].EmitReadArrayElement(array_index, b());
-    llvm::Value* linear_index = array_index.Linearize(dynamic_dims, b());
-    // Delinearize the index based on the static shape.
-    llvm_ir::IrArray::Index dest_index(linear_index, target_array.GetShape(),
-                                       b());
-    target_array.EmitWriteArrayElement(dest_index, source_element, b());
-    return absl::OkStatus();
-  };
-  return llvm_ir::LoopEmitter(loop_body_emitter, target_array.GetShape(),
-                              dynamic_dims, b())
-      .EmitLoop(IrName(hlo));
-}
-
 absl::Status IrEmitter::HandleTopK(HloInstruction* hlo) {
   return Unimplemented("TopK is not supported in hoisted regions");
 }
@@ -2685,7 +2637,7 @@ absl::StatusOr<llvm::Function*> IrEmitter::EmitNestedComputation(
 
   VLOG(2) << "Emit nested computation: " << callee.name();
   return EmitComputation(
-      const_cast<HloComputation*>(&callee), name, false,
+      const_cast<HloComputation*>(&callee), name,
       hlo_module_.schedule().sequence(&callee).instructions(),
       /*allow_reassociation=*/is_reducer,
       /*function_attributes=*/{llvm::Attribute::AlwaysInline});
