@@ -95,6 +95,22 @@ std::optional<int64_t> LlvmIrGemvTilingFactor(const HloModuleConfig& config) {
   return std::nullopt;
 }
 
+absl::StatusOr<std::optional<int64_t>> IoBoundParallelism(
+    const HloModuleConfig& config) {
+  const auto& extra_options_map =
+      config.debug_options().xla_backend_extra_options();
+  auto itr = extra_options_map.find(kIoBoundParallelism);
+  if (itr == extra_options_map.end()) {
+    return std::nullopt;
+  }
+  int64_t parallelism;
+  if (!absl::SimpleAtoi(itr->second, &parallelism) || parallelism < 1) {
+    return absl::InvalidArgumentError(absl::StrCat(
+        "Failed to parse value for: ", kIoBoundParallelism, "."));
+  }
+  return parallelism;
+}
+
 absl::StatusOr<int64_t> SmallWhileLoopByteThreshold(
     const HloModuleConfig& config) {
   const auto& extra_options_map =

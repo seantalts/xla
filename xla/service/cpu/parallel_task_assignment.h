@@ -48,10 +48,14 @@ class ParallelTaskAssignment {
   // 'shape_size': shape size function used by HloCostAnalysis during parallel
   //               task assignment.
   // 'module': the containing HloModule.
+  // 'io_bound_max_parallelism': the maximum parallel task count for
+  // instructions whose cost is dominated by bytes accessed; 0 selects
+  // ceil(sqrt(number of schedulable CPUs)).
   ParallelTaskAssignment(int64_t max_parallelism,
                          const HloCostAnalysis::ShapeSizeFunction& shape_size,
                          HloModule* module,
-                         const TargetMachineFeatures* target_machine_features);
+                         const TargetMachineFeatures* target_machine_features,
+                         int64_t io_bound_max_parallelism = 0);
   ~ParallelTaskAssignment() {}
 
   // Computes and returns the target parallel task count for 'instruction'.
@@ -77,8 +81,10 @@ class ParallelTaskAssigner : public HloModulePass {
   //               task assignment.
   ParallelTaskAssigner(const int64_t max_parallelism,
                        const HloCostAnalysis::ShapeSizeFunction& shape_size,
-                       const TargetMachineFeatures* target_machine_features)
+                       const TargetMachineFeatures* target_machine_features,
+                       int64_t io_bound_max_parallelism = 0)
       : max_parallelism_(max_parallelism),
+        io_bound_max_parallelism_(io_bound_max_parallelism),
         shape_size_function_(shape_size),
         target_machine_features_(*target_machine_features) {}
   ~ParallelTaskAssigner() override {}
@@ -111,6 +117,7 @@ class ParallelTaskAssigner : public HloModulePass {
                                   HloToParallelTasks* hlo_to_parallel_tasks);
 
   int64_t max_parallelism_;
+  int64_t io_bound_max_parallelism_;
   HloCostAnalysis::ShapeSizeFunction shape_size_function_;
   const TargetMachineFeatures& target_machine_features_;
 };

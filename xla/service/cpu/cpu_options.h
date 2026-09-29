@@ -42,6 +42,10 @@ inline constexpr absl::string_view kDisableLoopUnrolling =
     "xla_cpu_disable_loop_unrolling";
 inline constexpr absl::string_view kFoldAllConstants =
     "xla_cpu_fold_all_constants";
+// Maximum number of parallel tasks assigned to an I/O-bound instruction.
+// Unset: ceil(sqrt(number of schedulable CPUs)).
+inline constexpr absl::string_view kIoBoundParallelism =
+    "xla_cpu_io_bound_parallelism";
 inline constexpr absl::string_view kSmallWhileLoopByteThreshold =
     "xla_cpu_small_while_loop_byte_threshold";
 inline constexpr absl::string_view kFlattenAfterFusion =
@@ -67,6 +71,9 @@ bool ForceEnableExperimentalLlvmIrGemm(const HloModuleConfig& config);
 std::optional<int64_t> LlvmIrGemvTilingFactor(const HloModuleConfig& config);
 std::optional<std::tuple<int64_t, int64_t, int64_t>> LlvmIrGemmTileSize(
     const HloModuleConfig& config);
+absl::StatusOr<std::optional<int64_t>> IoBoundParallelism(
+    const HloModuleConfig& config);
+
 absl::StatusOr<int64_t> SmallWhileLoopByteThreshold(
     const HloModuleConfig& config);
 bool FlattenAfterFusion(const HloModuleConfig& config);

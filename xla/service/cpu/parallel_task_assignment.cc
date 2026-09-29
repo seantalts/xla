@@ -71,9 +71,11 @@ class SimpleCostModel : public ParallelCostModel {
 class DefaultCostModel : public ParallelCostModel {
  public:
   DefaultCostModel(const int64_t max_parallelism,
+                   const int64_t io_bound_max_parallelism,
                    const HloCostAnalysis::ShapeSizeFunction& shape_size,
                    std::unique_ptr<HloCostAnalysis> cost_analysis)
       : max_parallelism_(max_parallelism),
+        io_bound_max_parallelism_(io_bound_max_parallelism),
         shape_size_(shape_size),
         cost_analysis_(std::move(cost_analysis)) {}
   ~DefaultCostModel() override {}
@@ -94,8 +96,7 @@ class DefaultCostModel : public ParallelCostModel {
       // Limit max parallelism for I/O bound instructions by assuming a
       // sub-linear scaling function (fit based on empirical benchmark results).
       // TODO(b/29630486) Develop system bandwidth model.
-      max_parallelism = std::min<int64_t>(
-          max_parallelism_, std::ceil(std::sqrt(tsl::port::MaxParallelism())));
+      max_parallelism = std::min(max_parallelism_, io_bound_max_parallelism_);
       // Use bytes accessed cost and L2 cache size min per-thread cost.
       instruction_cost = bytes_accessed;
       min_cost_per_thread = 256LL << 10;  // 256KB L2 Cache size.
@@ -121,6 +122,7 @@ class DefaultCostModel : public ParallelCostModel {
 
  private:
   const int64_t max_parallelism_;
+  const int64_t io_bound_max_parallelism_;
   const HloCostAnalysis::ShapeSizeFunction shape_size_;
   const std::unique_ptr<HloCostAnalysis> cost_analysis_;
 };
@@ -128,9 +130,14 @@ class DefaultCostModel : public ParallelCostModel {
 ParallelTaskAssignment::ParallelTaskAssignment(
     const int64_t max_parallelism,
     const HloCostAnalysis::ShapeSizeFunction& shape_size, HloModule* module,
-    const TargetMachineFeatures* target_machine_features)
+    const TargetMachineFeatures* target_machine_features,
+    int64_t io_bound_max_parallelism)
     : target_machine_features_(*target_machine_features) {
-  VLOG(1) << "ParallelTaskAssignment max_parallelism: " << max_parallelism;
+  if (io_bound_max_parallelism <= 0) {
+    io_bound_max_parallelism = std::ceil(std::sqrt(tsl::port::MaxParallelism()));
+  }
+  VLOG(1) << "ParallelTaskAssignment max_parallelism: " << max_parallelism
+          << " io_bound_max_parallelism: " << io_bound_max_parallelism;
   // Run cost analysis on 'module'.
   auto cost_analysis = std::make_unique<HloCostAnalysis>(shape_size);
   HloComputation* computation = module->entry_computation();
@@ -139,7 +146,8 @@ ParallelTaskAssignment::ParallelTaskAssignment(
   if (status.ok()) {
     // Set default cost model based on 'cost_analysis'.
     cost_model_ = std::make_unique<DefaultCostModel>(
-        max_parallelism, shape_size, std::move(cost_analysis));
+        max_parallelism, io_bound_max_parallelism, shape_size,
+        std::move(cost_analysis));
   } else {
     // Fall back to a simple cost model based on hlo size and L2 cache size.
     // Note that HloCostAnalysis can returns an error status (likely because
@@ -305,9 +313,9 @@ bool ParallelTaskAssigner::AssignParallelTasksHelper(
 
 void ParallelTaskAssigner::ComputeTargetParallelTasks(
     HloModule* module, HloToParallelTasks* hlo_to_parallel_tasks) {
-  ParallelTaskAssignment parallel_task_assignment(max_parallelism_,
-                                                  shape_size_function_, module,
-                                                  &target_machine_features_);
+  ParallelTaskAssignment parallel_task_assignment(
+      max_parallelism_, shape_size_function_, module, &target_machine_features_,
+      io_bound_max_parallelism_);
 
   // Compute parallel task counts for all instructions in 'module'.
   for (auto* computation : module->MakeNonfusionComputations()) {

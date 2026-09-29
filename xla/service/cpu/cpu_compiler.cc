@@ -1144,8 +1144,11 @@ absl::Status CpuCompiler::RunHloPassesAfterLayoutAssn(
     // and thread synchronization dependencies which would likely increase
     // binary size (and most AOT applications are single-threaded).
     // TODO(b/29630486) Support multi-threaded AOT.
+    ABSL_ASSIGN_OR_RETURN(std::optional<int64_t> io_bound_parallelism,
+                          options::IoBoundParallelism(module->config()));
     pipeline.AddPass<ParallelTaskAssigner>(
-        max_parallelism, ShapeSizeBytesFunction(), target_machine_features);
+        max_parallelism, ShapeSizeBytesFunction(), target_machine_features,
+        io_bound_parallelism.value_or(0));
   }
 
   // Copy insertion should be performed immediately before IR emission to
