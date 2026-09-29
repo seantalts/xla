@@ -1,0 +1,12 @@
+// RUN: cpu_fusion_to_mlir %s | FileCheck %s
+// RUN: cpu_test_correctness %s
+
+fusion {
+  param0 = f32[4,8]{0,1} parameter(0)
+  param1 = f32[4,4]{0,1} parameter(1)
+  ROOT concat = f32[4,12]{0,1} concatenate(param0, param1), dimensions={1}
+}
+
+// With dimension 1 most major, each operand is one run.
+// CHECK:       tensor.insert_slice %{{.*}} into %{{.*}}[0, 0] [4, 8] [1, 1]
+// CHECK:       tensor.insert_slice %{{.*}} into %{{.*}}[0, 8] [4, 4] [1, 1]

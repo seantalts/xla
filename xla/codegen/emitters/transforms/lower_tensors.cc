@@ -26,13 +26,13 @@ limitations under the License.
 #include "absl/numeric/bits.h"
 #include "absl/strings/str_cat.h"
 #include "absl/types/span.h"
-#include "google/protobuf/text_format.h"
 #include "llvm/ADT/STLExtras.h"
 #include "llvm/ADT/SmallBitVector.h"
 #include "llvm/ADT/StringRef.h"
 #include "llvm/Support/LogicalResult.h"
 #include "mlir/Conversion/LLVMCommon/TypeConverter.h"
 #include "mlir/Dialect/Arith/IR/Arith.h"
+#include "mlir/Dialect/Arith/Utils/Utils.h"
 #include "mlir/Dialect/Func/IR/FuncOps.h"
 #include "mlir/Dialect/GPU/IR/GPUDialect.h"
 #include "mlir/Dialect/LLVMIR/LLVMAttrs.h"
@@ -58,12 +58,13 @@ limitations under the License.
 #include "mlir/IR/Types.h"
 #include "mlir/IR/Value.h"
 #include "mlir/IR/ValueRange.h"
+#include "mlir/IR/Visitors.h"
 #include "mlir/Interfaces/DataLayoutInterfaces.h"
 #include "mlir/Pass/Pass.h"
 #include "mlir/Support/LLVM.h"
 #include "mlir/Support/LogicalResult.h"
 #include "mlir/Transforms/GreedyPatternRewriteDriver.h"
-#include "tsl/platform/protobuf.h"  // IWYU pragma: keep
+#include "google/protobuf/text_format.h"
 #include "xla/backends/gpu/codegen/emitters/ir/xla_gpu_ops.h"
 #include "xla/codegen/device_spec.h"
 #include "xla/codegen/emitters/ir/xla_ops.h"
@@ -75,6 +76,7 @@ limitations under the License.
 #include "xla/stream_executor/rocm/rocm_compute_capability.h"
 #include "xla/util.h"
 #include "xla/xla_data.pb.h"
+#include "tsl/platform/protobuf.h"  // IWYU pragma: keep
 
 namespace xla {
 namespace emitters {
@@ -112,6 +114,9 @@ Value GetDestinationBuffer(Value dest) {
     int result_number = mlir::cast<OpResult>(dest).getResultNumber();
     if (auto insert = dest.getDefiningOp<mlir::tensor::InsertOp>()) {
       dest = insert.getDest();
+    } else if (auto insert_slice =
+                   dest.getDefiningOp<mlir::tensor::InsertSliceOp>()) {
+      dest = insert_slice.getDest();
     } else if (auto scf_if = dest.getDefiningOp<scf::IfOp>()) {
       // Pick one of the branches, they're required to yield the same buffers.
       dest = scf_if.getThenRegion().front().getTerminator()->getOperand(
@@ -615,6 +620,75 @@ class RewriteTensorInsert : public OpRewritePattern<mlir::tensor::InsertOp> {
 
  private:
   const DeviceSpec& device_spec_;
+};
+
+bool IsUnitStrideSlice(llvm::ArrayRef<int64_t> strides) {
+  return llvm::all_of(strides, [](int64_t stride) { return stride == 1; });
+}
+
+// Lowers the copy of a contiguous run between two flat tensors to a memcpy.
+struct RewriteTensorInsertSlice
+    : public OpRewritePattern<mlir::tensor::InsertSliceOp> {
+  using OpRewritePattern::OpRewritePattern;
+
+  LogicalResult matchAndRewrite(
+      mlir::tensor::InsertSliceOp op,
+      mlir::PatternRewriter& rewriter) const override {
+    TypedValue<mlir::RankedTensorType> source = op.getSource();
+    mlir::OpFoldResult source_offset = rewriter.getIndexAttr(0);
+    if (auto extract = source.getDefiningOp<mlir::tensor::ExtractSliceOp>()) {
+      if (!IsUnitStrideSlice(extract.getStaticStrides())) {
+        return rewriter.notifyMatchFailure(op, "source slice is strided");
+      }
+      source = extract.getSource();
+      source_offset = extract.getMixedOffsets()[0];
+    }
+    if (op.getDestType().getRank() != 1 || op.getSourceType().getRank() != 1 ||
+        source.getType().getRank() != 1) {
+      return rewriter.notifyMatchFailure(op, "tensors are not flat");
+    }
+    if (!IsUnitStrideSlice(op.getStaticStrides())) {
+      return rewriter.notifyMatchFailure(op, "slice is strided");
+    }
+    int64_t num_elements = op.getSourceType().getDimSize(0);
+    if (mlir::ShapedType::isDynamic(num_elements)) {
+      return rewriter.notifyMatchFailure(op, "dynamic run length");
+    }
+    Type element_type = op.getDestType().getElementType();
+    if (element_type != source.getType().getElementType()) {
+      return rewriter.notifyMatchFailure(op, "element types differ");
+    }
+    int64_t element_bits = 0;
+    if (element_type.isIntOrFloat()) {
+      element_bits = element_type.getIntOrFloatBitWidth();
+    } else if (auto complex_type =
+                   mlir::dyn_cast<mlir::ComplexType>(element_type)) {
+      element_bits = 2 * complex_type.getElementType().getIntOrFloatBitWidth();
+    }
+    if (element_bits < 8) {
+      return rewriter.notifyMatchFailure(op, "unsupported element type");
+    }
+    Value dest = GetDestinationBuffer(op.getDest());
+    if (!dest) {
+      return failure();
+    }
+
+    mlir::ImplicitLocOpBuilder b(op.getLoc(), rewriter);
+    auto index_value = [&](mlir::OpFoldResult offset) {
+      return mlir::getValueOrCreateConstantIndexOp(b, b.getLoc(), offset);
+    };
+    auto dest_gep =
+        CreateGep(mlir::cast<TypedValue<mlir::RankedTensorType>>(dest),
+                  GetLinearIndex(index_value(op.getMixedOffsets()[0]), b), b);
+    auto source_gep =
+        CreateGep(source, GetLinearIndex(index_value(source_offset), b), b);
+    Value num_bytes = ml::ConstantOp::create(b, b.getI64Type(),
+                                             num_elements * (element_bits / 8));
+    ml::MemcpyOp::create(b, dest_gep, source_gep, num_bytes,
+                         /*isVolatile=*/false);
+    rewriter.replaceOp(op, op.getDest());
+    return success();
+  }
 };
 
 struct RewriteTransferWrite : OpRewritePattern<vector::TransferWriteOp> {
@@ -1480,13 +1554,22 @@ class LowerTensorsPass : public impl::LowerTensorsPassBase<LowerTensorsPass> {
 
     tensor_patterns.add<RewriteAtomicRMW, RewriteTensorInsert>(mlir_context,
                                                                device_spec_);
-    tensor_patterns
-        .add<RewriteAllocateShared, RewriteGetDynamicDimSize,
-             RewriteNonScalarConstants, RewriteSyncThreads,
-             RewriteTensorExtract, RewriteTransferRead, RewriteTransferWrite>(
-            mlir_context);
+    tensor_patterns.add<RewriteAllocateShared, RewriteGetDynamicDimSize,
+                        RewriteNonScalarConstants, RewriteSyncThreads,
+                        RewriteTensorExtract, RewriteTensorInsertSlice,
+                        RewriteTransferRead, RewriteTransferWrite>(
+        mlir_context);
     if (mlir::failed(mlir::applyPatternsGreedily(getOperation(),
                                                  std::move(tensor_patterns)))) {
+      signalPassFailure();
+      return;
+    }
+    mlir::WalkResult unlowered_copies =
+        getOperation()->walk([](mlir::tensor::InsertSliceOp op) {
+          op.emitOpError("cannot be lowered to a memcpy");
+          return mlir::WalkResult::interrupt();
+        });
+    if (unlowered_copies.wasInterrupted()) {
       signalPassFailure();
       return;
     }

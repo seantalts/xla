@@ -23,6 +23,7 @@ limitations under the License.
 #include "llvm/Support/LogicalResult.h"
 #include "llvm/Support/raw_ostream.h"
 #include "mlir/Dialect/Arith/IR/Arith.h"
+#include "mlir/Dialect/Arith/Utils/Utils.h"
 #include "mlir/Dialect/Func/IR/FuncOps.h"
 #include "mlir/Dialect/SCF/IR/SCF.h"
 #include "mlir/Dialect/SCF/Utils/Utils.h"
@@ -36,6 +37,7 @@ limitations under the License.
 #include "mlir/IR/BuiltinTypeInterfaces.h"
 #include "mlir/IR/BuiltinTypes.h"
 #include "mlir/IR/MLIRContext.h"
+#include "mlir/IR/OpDefinition.h"
 #include "mlir/IR/PatternMatch.h"
 #include "mlir/IR/TypeRange.h"
 #include "mlir/IR/Types.h"
@@ -85,7 +87,9 @@ using mlir::scf::ForOp;
 using mlir::scf::IfOp;
 using mlir::scf::IndexSwitchOp;
 using mlir::tensor::ExtractOp;
+using mlir::tensor::ExtractSliceOp;
 using mlir::tensor::InsertOp;
+using mlir::tensor::InsertSliceOp;
 namespace mv = mlir::vector;
 
 RankedTensorType GetFlattenedType(RankedTensorType tensor_type) {
@@ -390,6 +394,103 @@ struct RewriteTensorInsert : OpRewritePattern<InsertOp> {
     auto cast_to_orig_type = UnrealizedConversionCastOp::create(
         b, tensor_type, new_insert.getResult());
     rewriter.replaceOp(op, cast_to_orig_type.getResult(0));
+    return mlir::success();
+  }
+};
+
+// Number of elements in a slice with unit strides that is one contiguous run
+// of the (row-major in `minor_to_major` order) tensor, or nullopt otherwise.
+std::optional<int64_t> GetContiguousSliceSize(RankedTensorType tensor_type,
+                                              llvm::ArrayRef<int64_t> sizes,
+                                              llvm::ArrayRef<int64_t> strides) {
+  if (llvm::any_of(sizes, ShapedType::isDynamic) ||
+      !llvm::all_of(strides, [](int64_t stride) { return stride == 1; })) {
+    return std::nullopt;
+  }
+  auto byte_shape = ShapeUtil::MakeShape(U8, tensor_type.getShape());
+  if (Attribute encoding = tensor_type.getEncoding()) {
+    *byte_shape.mutable_layout() = LayoutUtil::MakeLayout(llvm::to_vector(
+        mlir::cast<mlir::DenseElementsAttr>(encoding).getValues<int64_t>()));
+  }
+  bool run_ended = false;
+  int64_t num_elements = 1;
+  for (int64_t dim : LayoutUtil::MinorToMajor(byte_shape)) {
+    if (run_ended && sizes[dim] != 1) {
+      return std::nullopt;
+    }
+    run_ended |= sizes[dim] != tensor_type.getDimSize(dim);
+    num_elements *= sizes[dim];
+  }
+  return num_elements;
+}
+
+struct RewriteTensorExtractSlice : OpRewritePattern<ExtractSliceOp> {
+  using OpRewritePattern::OpRewritePattern;
+
+  LogicalResult matchAndRewrite(ExtractSliceOp op,
+                                PatternRewriter& rewriter) const override {
+    auto tensor_type = op.getSourceType();
+    if (tensor_type.getRank() < 2) {
+      return rewriter.notifyMatchFailure(op, "the tensor is already flat");
+    }
+    std::optional<int64_t> num_elements = GetContiguousSliceSize(
+        tensor_type, op.getStaticSizes(), op.getStaticStrides());
+    if (!num_elements.has_value()) {
+      return rewriter.notifyMatchFailure(op, "the slice is not contiguous");
+    }
+    auto loc = op.getLoc();
+    auto offsets = mlir::getValueOrCreateConstantIndexOp(rewriter, loc,
+                                                         op.getMixedOffsets());
+    auto linear_offset = LinearizeIndex(loc, tensor_type, offsets, rewriter,
+                                        tensor_type.getEncoding());
+    auto tensor_1D =
+        UnrealizedConversionCastOp::create(
+            rewriter, loc, GetFlattenedType(tensor_type), op.getSource())
+            .getResult(0);
+    SmallVector<mlir::OpFoldResult> offsets_1D{linear_offset};
+    SmallVector<mlir::OpFoldResult> sizes_1D{
+        rewriter.getIndexAttr(*num_elements)};
+    SmallVector<mlir::OpFoldResult> strides_1D{rewriter.getIndexAttr(1)};
+    Value slice_1D = ExtractSliceOp::create(rewriter, loc, tensor_1D,
+                                            offsets_1D, sizes_1D, strides_1D);
+    rewriter.replaceOpWithNewOp<UnrealizedConversionCastOp>(op, op.getType(),
+                                                            slice_1D);
+    return mlir::success();
+  }
+};
+
+struct RewriteTensorInsertSlice : OpRewritePattern<InsertSliceOp> {
+  using OpRewritePattern::OpRewritePattern;
+
+  LogicalResult matchAndRewrite(InsertSliceOp op,
+                                PatternRewriter& rewriter) const override {
+    auto tensor_type = op.getDestType();
+    if (tensor_type.getRank() < 2) {
+      return rewriter.notifyMatchFailure(op, "the tensor is already flat");
+    }
+    std::optional<int64_t> num_elements = GetContiguousSliceSize(
+        tensor_type, op.getStaticSizes(), op.getStaticStrides());
+    if (!num_elements.has_value()) {
+      return rewriter.notifyMatchFailure(op, "the slice is not contiguous");
+    }
+    auto loc = op.getLoc();
+    auto offsets = mlir::getValueOrCreateConstantIndexOp(rewriter, loc,
+                                                         op.getMixedOffsets());
+    auto linear_offset = LinearizeIndex(loc, tensor_type, offsets, rewriter,
+                                        tensor_type.getEncoding());
+    auto tensor_1D =
+        UnrealizedConversionCastOp::create(
+            rewriter, loc, GetFlattenedType(tensor_type), op.getDest())
+            .getResult(0);
+    SmallVector<mlir::OpFoldResult> offsets_1D{linear_offset};
+    SmallVector<mlir::OpFoldResult> sizes_1D{
+        rewriter.getIndexAttr(*num_elements)};
+    SmallVector<mlir::OpFoldResult> strides_1D{rewriter.getIndexAttr(1)};
+    Value new_insert =
+        InsertSliceOp::create(rewriter, loc, Flatten(op.getSource(), rewriter),
+                              tensor_1D, offsets_1D, sizes_1D, strides_1D);
+    rewriter.replaceOpWithNewOp<UnrealizedConversionCastOp>(op, tensor_type,
+                                                            new_insert);
     return mlir::success();
   }
 };
@@ -786,7 +887,9 @@ class FlattenTensorsPass
         RewritePureCall,
         RewriteSyncThreads,
         RewriteTensorExtract,
+        RewriteTensorExtractSlice,
         RewriteTensorInsert,
+        RewriteTensorInsertSlice,
         RewriteVectorExtract,
         RewriteVectorFromElements,
         RewriteVectorInsert,

@@ -49,6 +49,14 @@ _FILECHECK_ONLY_TESTS = [
 ]
 
 _CPU_ONLY_TESTS = [
+    "concatenate/cpu_contiguous_copy.hlo",
+    "concatenate/cpu_contiguous_copy_column_major.hlo",
+    "concatenate/cpu_contiguous_copy_major_dim.hlo",
+    "concatenate/cpu_contiguous_copy_minor_dim.hlo",
+    "concatenate/cpu_contiguous_copy_rank1.hlo",
+    "concatenate/cpu_epilogue_uses_loop.hlo",
+    "concatenate/cpu_fused_producer_uses_loop.hlo",
+    "concatenate/cpu_layout_mismatch_uses_loop.hlo",
     "dynamic_update_slice/out_of_place.hlo",
 ]
 

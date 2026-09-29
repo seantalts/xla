@@ -1,0 +1,16 @@
+// RUN: cpu_fusion_to_mlir %s | FileCheck %s
+// RUN: cpu_test_correctness %s
+
+fusion {
+  param0 = f32[4,8,16] parameter(0)
+  param1 = f32[4,4,16] parameter(1)
+  neg = f32[4,4,16] negate(param1)
+  ROOT concat = f32[4,12,16] concatenate(param0, neg), dimensions={1}
+}
+
+// CHECK-NOT:   tensor.extract_slice
+// CHECK:       xla.pure_call @fusion_param0
+// CHECK:       tensor.insert %
+// CHECK:       xla.pure_call @fusion_neg
+// CHECK:       tensor.insert %
+// CHECK-NOT:   tensor.extract_slice

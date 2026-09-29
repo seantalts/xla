@@ -17,6 +17,7 @@ limitations under the License.
 
 #include <array>
 #include <cstdint>
+#include <iterator>
 #include <numeric>
 #include <optional>
 #include <utility>
@@ -30,6 +31,7 @@ limitations under the License.
 #include "absl/status/statusor.h"
 #include "absl/strings/str_cat.h"
 #include "absl/strings/string_view.h"
+#include "absl/types/span.h"
 #include "llvm/ADT/STLExtras.h"
 #include "llvm/ADT/SmallVector.h"
 #include "mlir/Dialect/Func/IR/FuncOps.h"
@@ -59,8 +61,13 @@ limitations under the License.
 #include "xla/hlo/analysis/indexing_analysis.h"
 #include "xla/hlo/analysis/indexing_map.h"
 #include "xla/hlo/ir/hlo_computation.h"
+#include "xla/hlo/ir/hlo_instruction.h"
 #include "xla/hlo/ir/hlo_instructions.h"
+#include "xla/hlo/ir/hlo_opcode.h"
 #include "xla/hlo/utils/hlo_traversal.h"
+#include "xla/layout.h"
+#include "xla/layout_util.h"
+#include "xla/primitive_util.h"
 #include "xla/runtime/work_dimensions.h"
 #include "xla/runtime/work_item.h"
 #include "xla/service/buffer_assignment.h"
@@ -74,6 +81,25 @@ limitations under the License.
 namespace xla::emitters {
 
 using ::mlir::MLIRContext;
+
+namespace {
+
+Layout GetLayoutOrDefault(const Shape& shape) {
+  return shape.has_layout() ? shape.layout()
+                            : LayoutUtil::GetDefaultLayoutForShape(shape);
+}
+
+// Dimensions major to `concat_dim`, in logical order.
+std::vector<int64_t> GetOuterDimensions(const Layout& layout,
+                                        int64_t concat_dim) {
+  absl::Span<const int64_t> minor_to_major = layout.minor_to_major();
+  auto concat_pos = absl::c_find(minor_to_major, concat_dim);
+  std::vector<int64_t> outer_dims(std::next(concat_pos), minor_to_major.end());
+  absl::c_sort(outer_dims);
+  return outer_dims;
+}
+
+}  // namespace
 
 ConcatenateFusionKernelEmitter::ConcatenateFusionKernelEmitter(
     MLIRContext& mlir_context, const HloFusionInstruction& fusion,
@@ -151,6 +177,50 @@ int ConcatenateFusionKernelEmitter::GetValidUnrollFactor(
   return unroll_factor;
 }
 
+std::optional<Shape>
+ConcatenateFusionKernelEmitter::GetContiguousCopyOuterShape(
+    const HloFusionSpec& fusion_spec) {
+  if (fusion_spec.fusion_roots().size() != 1) {
+    return std::nullopt;
+  }
+  const HloInstruction& concat = fusion_spec.fusion_hero(0).instruction();
+  if (&concat != &fusion_spec.fusion_root(0).instruction()) {
+    return std::nullopt;
+  }
+  const Shape& shape = concat.shape();
+  if (!shape.IsArray() || ShapeUtil::IsZeroElementArray(shape) ||
+      primitive_util::StorageBitWidth(shape.element_type()) < 8) {
+    return std::nullopt;
+  }
+  Layout layout = GetLayoutOrDefault(shape);
+  for (const HloInstruction* operand : concat.operands()) {
+    if (operand->opcode() != HloOpcode::kParameter ||
+        ShapeUtil::IsZeroElementArray(operand->shape()) ||
+        !LayoutUtil::Equal(GetLayoutOrDefault(operand->shape()), layout)) {
+      return std::nullopt;
+    }
+  }
+
+  std::vector<int64_t> outer_dims =
+      GetOuterDimensions(layout, concat.concatenate_dimension());
+  if (outer_dims.empty()) {
+    return ShapeUtil::MakeShapeWithDenseLayout(shape.element_type(), {1}, {0});
+  }
+  std::vector<int64_t> dimensions;
+  std::vector<int64_t> minor_to_major;
+  for (int64_t dim : outer_dims) {
+    dimensions.push_back(shape.dimensions(dim));
+  }
+  for (int64_t dim : layout.minor_to_major()) {
+    auto outer_it = absl::c_find(outer_dims, dim);
+    if (outer_it != outer_dims.end()) {
+      minor_to_major.push_back(outer_it - outer_dims.begin());
+    }
+  }
+  return ShapeUtil::MakeShapeWithDenseLayout(shape.element_type(), dimensions,
+                                             minor_to_major);
+}
+
 IndexingMap ConcatenateFusionKernelEmitter::ComputeWorkItemIdToOutputIndexing(
     const WorkDimensions& work_dimensions, const Shape& largest_shape,
     MLIRContext* ctx) {
@@ -161,6 +231,66 @@ IndexingMap ConcatenateFusionKernelEmitter::ComputeWorkItemIdToOutputIndexing(
     MLIRContext* ctx) const {
   return ComputeWorkItemIdToOutputIndexing(work_dimensions_, largest_shape_,
                                            ctx);
+}
+
+llvm::SmallVector<mlir::Value>
+ConcatenateFusionKernelEmitter::EmitContiguousCopies(
+    mlir::ImplicitLocOpBuilder& builder, const Shape& outer_shape,
+    mlir::ValueRange work_dims, mlir::ValueRange input_tensors,
+    llvm::SmallVector<mlir::Value> result_tensors) const {
+  const HloInstruction& concat = fusion_spec_.fusion_hero(0).instruction();
+  const Shape& shape = concat.shape();
+  int64_t rank = shape.dimensions().size();
+  int64_t concat_dim = concat.concatenate_dimension();
+  std::vector<int64_t> outer_dims =
+      GetOuterDimensions(GetLayoutOrDefault(shape), concat_dim);
+
+  IndexingMap outer_index_map = GetDefaultWorkItemIndexingMap(
+      work_dimensions_, outer_shape, &mlir_context_);
+
+  auto body_builder =
+      [&](mlir::ImplicitLocOpBuilder& nested_b, mlir::ValueRange ivs,
+          mlir::ValueRange outer_index,
+          mlir::ValueRange output_tensors) -> llvm::SmallVector<mlir::Value> {
+    llvm::SmallVector<mlir::Value> updated_tensors(output_tensors);
+    int64_t concat_offset = 0;
+    for (const HloInstruction* operand : concat.operands()) {
+      int64_t operand_concat_size = operand->shape().dimensions(concat_dim);
+      llvm::SmallVector<mlir::OpFoldResult> source_offsets;
+      llvm::SmallVector<mlir::OpFoldResult> output_offsets;
+      llvm::SmallVector<mlir::OpFoldResult> sizes;
+      llvm::SmallVector<mlir::OpFoldResult> strides(rank,
+                                                    nested_b.getIndexAttr(1));
+      for (int64_t dim = 0; dim < rank; ++dim) {
+        auto outer_it = absl::c_find(outer_dims, dim);
+        if (outer_it != outer_dims.end()) {
+          mlir::Value index = outer_index[outer_it - outer_dims.begin()];
+          source_offsets.push_back(index);
+          output_offsets.push_back(index);
+          sizes.push_back(nested_b.getIndexAttr(1));
+        } else if (dim == concat_dim) {
+          source_offsets.push_back(nested_b.getIndexAttr(0));
+          output_offsets.push_back(nested_b.getIndexAttr(concat_offset));
+          sizes.push_back(nested_b.getIndexAttr(operand_concat_size));
+        } else {
+          source_offsets.push_back(nested_b.getIndexAttr(0));
+          output_offsets.push_back(nested_b.getIndexAttr(0));
+          sizes.push_back(nested_b.getIndexAttr(shape.dimensions(dim)));
+        }
+      }
+      mlir::Value run = nested_b.create<mlir::tensor::ExtractSliceOp>(
+          input_tensors[operand->parameter_number()], source_offsets, sizes,
+          strides);
+      for (mlir::Value& output_tensor : updated_tensors) {
+        output_tensor = nested_b.create<mlir::tensor::InsertSliceOp>(
+            run, output_tensor, output_offsets, sizes, strides);
+      }
+      concat_offset += operand_concat_size;
+    }
+    return updated_tensors;
+  };
+  return emitters::EmitXlaLoopOp(builder, work_dims, result_tensors,
+                                 outer_index_map, body_builder);
 }
 
 absl::Status ConcatenateFusionKernelEmitter::EmitEntryFunction(
@@ -193,6 +323,11 @@ absl::Status ConcatenateFusionKernelEmitter::EmitEntryFunction(
 
   const auto* concat = &fusion_spec_.fusion_hero(0).instruction();
 
+  std::optional<Shape> contiguous_copy_outer_shape;
+  if (backend_kind_ == BackendKind::kCpu) {
+    contiguous_copy_outer_shape = GetContiguousCopyOuterShape(fusion_spec_);
+  }
+
   const auto forall_body_builder = [&](mlir::OpBuilder& builder,
                                        mlir::Location loc,
                                        mlir::ValueRange
@@ -207,52 +342,60 @@ absl::Status ConcatenateFusionKernelEmitter::EmitEntryFunction(
     work_dims.insert(work_dims.end(), workgroup_ids.begin(),
                      workgroup_ids.end());
 
-    for (auto [operand_index, operand] : llvm::enumerate(concat->operands())) {
-      IndexingMap input_to_output_map =
-          ComputeInputToOutputIndexing(concat, /*input_id=*/operand_index,
-                                       &mlir_context_)
-              .indexing_maps.front()
-              .begin()
-              ->map();
-      auto thread_id_to_output_map = ComposeIndexingMaps(
-          ComposeIndexingMaps(work_item_id_to_input_map, input_to_output_map),
-          epilogue_indexing);
-      thread_id_to_output_map.Simplify();
+    if (contiguous_copy_outer_shape.has_value()) {
+      result_tensors =
+          EmitContiguousCopies(nested_b, *contiguous_copy_outer_shape,
+                               work_dims, input_tensors, result_tensors);
+    } else {
+      for (auto [operand_index, operand] :
+           llvm::enumerate(concat->operands())) {
+        IndexingMap input_to_output_map =
+            ComputeInputToOutputIndexing(concat, /*input_id=*/operand_index,
+                                         &mlir_context_)
+                .indexing_maps.front()
+                .begin()
+                ->map();
+        auto thread_id_to_output_map = ComposeIndexingMaps(
+            ComposeIndexingMaps(work_item_id_to_input_map, input_to_output_map),
+            epilogue_indexing);
+        thread_id_to_output_map.Simplify();
 
-      auto loop_nest_body_builder = [&, operand_index = operand_index](
-                                        mlir::ImplicitLocOpBuilder& nested_b,
-                                        mlir::ValueRange symbol_values,
-                                        mlir::ValueRange output_indices,
-                                        mlir::ValueRange output_tensors)
-          -> llvm::SmallVector<mlir::Value> {
-        auto input_indices = emitters::ApplyIndexing(
-            work_item_id_to_input_map, work_dims, symbol_values, nested_b);
+        auto loop_nest_body_builder = [&, operand_index = operand_index](
+                                          mlir::ImplicitLocOpBuilder& nested_b,
+                                          mlir::ValueRange symbol_values,
+                                          mlir::ValueRange output_indices,
+                                          mlir::ValueRange output_tensors)
+            -> llvm::SmallVector<mlir::Value> {
+          auto input_indices = emitters::ApplyIndexing(
+              work_item_id_to_input_map, work_dims, symbol_values, nested_b);
 
-        auto result_scalar = emitters::ProvideParameter(
-            root_computation, concat, operand_index, input_indices,
-            call_targets, entry_function, nested_b);
-        absl::flat_hash_map<const HloInstruction*,
-                            llvm::SmallVector<mlir::Value>>
-            hero_value{{concat, result_scalar}};
-        auto result_scalars = EmitEpilogue(
-            /*epilogue_index=*/0, computations, entry_function, hero_value,
-            output_indices,
-            nested_b)[&fusion_spec_.fusion_root(0).instruction()];
+          auto result_scalar = emitters::ProvideParameter(
+              root_computation, concat, operand_index, input_indices,
+              call_targets, entry_function, nested_b);
+          absl::flat_hash_map<const HloInstruction*,
+                              llvm::SmallVector<mlir::Value>>
+              hero_value{{concat, result_scalar}};
+          auto result_scalars = EmitEpilogue(
+              /*epilogue_index=*/0, computations, entry_function, hero_value,
+              output_indices,
+              nested_b)[&fusion_spec_.fusion_root(0).instruction()];
 
-        llvm::SmallVector<mlir::Value> result_tensors;
-        result_tensors.reserve(output_tensor_args.size());
-        for (auto [tensor, value] : llvm::zip(output_tensors, result_scalars)) {
-          result_tensors.push_back(
-              nested_b
-                  .create<mlir::tensor::InsertOp>(value, tensor, output_indices)
-                  .getResult());
-        }
+          llvm::SmallVector<mlir::Value> result_tensors;
+          result_tensors.reserve(output_tensor_args.size());
+          for (auto [tensor, value] :
+               llvm::zip(output_tensors, result_scalars)) {
+            result_tensors.push_back(nested_b
+                                         .create<mlir::tensor::InsertOp>(
+                                             value, tensor, output_indices)
+                                         .getResult());
+          }
 
-        return result_tensors;
-      };
-      result_tensors = emitters::EmitXlaLoopOp(
-          nested_b, work_dims, result_tensors, thread_id_to_output_map,
-          loop_nest_body_builder);
+          return result_tensors;
+        };
+        result_tensors = emitters::EmitXlaLoopOp(
+            nested_b, work_dims, result_tensors, thread_id_to_output_map,
+            loop_nest_body_builder);
+      }
     }
 
     auto terminator = nested_b.create<mlir::scf::InParallelOp>();

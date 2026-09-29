@@ -242,7 +242,10 @@ static WorkDimensions GetLoopEmitterWorkDims(const HloFusionInstruction& fusion,
 static WorkDimensions GetConcatenateEmitterWorkDims(
     const HloFusionInstruction& fusion, const HloFusionSpec& fusion_spec) {
   Shape indexing_shape =
-      emitters::ConcatenateFusionKernelEmitter::GetIndexingShape(fusion_spec);
+      emitters::ConcatenateFusionKernelEmitter::GetContiguousCopyOuterShape(
+          fusion_spec)
+          .value_or(emitters::ConcatenateFusionKernelEmitter::GetIndexingShape(
+              fusion_spec));
 
   return GetWorkDimensions(indexing_shape, fusion,
                            /*allow_sub_byte_multi_work_group=*/false);

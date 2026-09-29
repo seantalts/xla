@@ -17,10 +17,6 @@ fusion {
 // CHECK-GPU-DAG: #[[LOOPMAP_2:.*]] = #xla.indexing_map<"(th_x, bl_x) -> (bl_x * 128 + th_x + 200)
 // CHECK-GPU-DAG: #[[LOOPMAP_3:.*]] = #xla.indexing_map<"(th_x, bl_x) -> (bl_x * 128 + th_x + 600)
 
-// CHECK-CPU-DAG: #[[MAP:.*]] = #xla.indexing_map<"()[s0] -> (s0)
-// CHECK-CPU-DAG: #[[LOOPMAP_2:.*]] = #xla.indexing_map<"()[s0] -> (s0 + 200)
-// CHECK-CPU-DAG: #[[LOOPMAP_3:.*]] = #xla.indexing_map<"()[s0] -> (s0 + 600)
-
 // CHECK:       func.func @main
 // CHECK-SAME:    %[[ARG_0:[a-zA-Z0-9]*]]: {{[^,]*}},
 // CHECK-SAME:    %[[ARG_1:[a-zA-Z0-9]*]]: {{[^,]*}},
@@ -30,17 +26,24 @@ fusion {
 // CHECK-GPU: %[[WORKGROUP_ID:.*]] = xla.workgroup_id x
 // CHECK-GPU: scf.forall (%[[THREAD_ID:.*]]) in (128)
 
-// CHECK: xla.loop ({{.*}})[{{.*}}] -> (%[[RA:.*]]) in #[[MAP]]
+// CHECK-GPU: xla.loop ({{.*}})[{{.*}}] -> (%[[RA:.*]]) in #[[MAP]]
 // CHECK-GPU:   xla.apply_indexing #[[MAP]]
-// CHECK:   %[[VAL_1:.*]] = xla.pure_call @fusion_param0
-// CHECK:   %[[INSERTED_1:.*]] = tensor.insert %[[VAL_1:.*]] into {{.*}}[%[[RA]]]
+// CHECK-GPU:   %[[VAL_1:.*]] = xla.pure_call @fusion_param0
+// CHECK-GPU:   %[[INSERTED_1:.*]] = tensor.insert %[[VAL_1:.*]] into {{.*}}[%[[RA]]]
 
-// CHECK: xla.loop ({{.*}})[{{.*}}] -> (%[[RA:.*]]) in #[[LOOPMAP_2]]
+// CHECK-GPU: xla.loop ({{.*}})[{{.*}}] -> (%[[RA:.*]]) in #[[LOOPMAP_2]]
 // CHECK-GPU:   xla.apply_indexing #[[MAP]]
-// CHECK:   %[[VAL_2:.*]] = xla.pure_call @fusion_param1
-// CHECK:   %[[INSERTED_2:.*]] = tensor.insert %[[VAL_2:.*]] into {{.*}}[%[[RA]]]
+// CHECK-GPU:   %[[VAL_2:.*]] = xla.pure_call @fusion_param1
+// CHECK-GPU:   %[[INSERTED_2:.*]] = tensor.insert %[[VAL_2:.*]] into {{.*}}[%[[RA]]]
 
-// CHECK: xla.loop ({{.*}})[{{.*}}] -> (%[[RA:.*]]) in #[[LOOPMAP_3]]
+// CHECK-GPU: xla.loop ({{.*}})[{{.*}}] -> (%[[RA:.*]]) in #[[LOOPMAP_3]]
 // CHECK-GPU:   xla.apply_indexing #[[MAP]]
-// CHECK:   %[[VAL_3:.*]] = xla.pure_call @fusion_param2
-// CHECK:   %[[INSERTED_3:.*]] = tensor.insert %[[VAL_3:.*]] into {{.*}}[%[[RA]]]
+// CHECK-GPU:   %[[VAL_3:.*]] = xla.pure_call @fusion_param2
+// CHECK-GPU:   %[[INSERTED_3:.*]] = tensor.insert %[[VAL_3:.*]] into {{.*}}[%[[RA]]]
+
+// On CPU each parameter is one contiguous run copy.
+// CHECK-CPU-NOT: xla.pure_call
+// CHECK-CPU:     tensor.insert_slice %[[ARG_0]] into %{{.*}}[0] [200] [1]
+// CHECK-CPU:     tensor.insert_slice %[[ARG_1]] into %{{.*}}[200] [400] [1]
+// CHECK-CPU:     tensor.insert_slice %[[ARG_2]] into %{{.*}}[600] [300] [1]
+// CHECK-CPU-NOT: xla.pure_call

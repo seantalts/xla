@@ -249,6 +249,7 @@ cc_library(
         "@com_google_protobuf//:protobuf",
         "@llvm-project//llvm:Support",
         "@llvm-project//mlir:ArithDialect",
+        "@llvm-project//mlir:ArithUtils",
         "@llvm-project//mlir:ComplexDialect",
         "@llvm-project//mlir:DataLayoutInterfaces",
         "@llvm-project//mlir:DialectUtils",

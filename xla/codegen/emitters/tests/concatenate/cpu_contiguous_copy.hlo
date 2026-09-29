@@ -1,0 +1,27 @@
+// RUN: cpu_fusion_to_mlir %s | FileCheck %s
+// RUN: cpu_test_correctness %s
+
+fusion {
+  param0 = f32[4,8,16] parameter(0)
+  param1 = f32[4,4,16] parameter(1)
+  ROOT concat = f32[4,12,16] concatenate(param0, param1), dimensions={1}
+}
+
+// One contiguous run per operand and outer index, no per-element loop.
+// CHECK-LABEL: func.func @main(
+// CHECK-SAME:    %[[P0:[a-zA-Z0-9]*]]: tensor<4x8x16xf32>
+// CHECK-SAME:    %[[P1:[a-zA-Z0-9]*]]: tensor<4x4x16xf32>
+// CHECK-SAME:    %[[OUT:[a-zA-Z0-9]*]]: tensor<4x12x16xf32>
+// CHECK:       scf.forall
+// CHECK-NOT:     xla.pure_call
+// CHECK-NOT:     tensor.insert %
+// CHECK:         xla.loop ({{.*}})[%{{.*}}] -> (%[[I:.*]]) in
+// CHECK-SAME:      -> (s0), domain: {{.*}} s0 in [0, 3]
+// CHECK:           %[[RUN0:.*]] = tensor.extract_slice %[[P0]][%[[I]], 0, 0] [1, 8, 16] [1, 1, 1]
+// CHECK:           %[[OUT0:.*]] = tensor.insert_slice %[[RUN0]] into %{{.*}}[%[[I]], 0, 0] [1, 8, 16] [1, 1, 1]
+// CHECK:           %[[RUN1:.*]] = tensor.extract_slice %[[P1]][%[[I]], 0, 0] [1, 4, 16] [1, 1, 1]
+// CHECK:           tensor.insert_slice %[[RUN1]] into %[[OUT0]][%[[I]], 8, 0] [1, 4, 16] [1, 1, 1]
+// CHECK-NOT:     xla.loop
+// CHECK-NOT:     xla.pure_call
+// CHECK-NOT:     tensor.insert %
+// CHECK:         scf.forall.in_parallel

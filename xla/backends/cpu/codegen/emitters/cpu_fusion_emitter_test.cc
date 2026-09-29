@@ -293,6 +293,27 @@ INSTANTIATE_TEST_SUITE_P(
             /*root_op=*/"concatenate(p0), dimensions={0}",
         },
         {
+            // A concatenate of plain parameters is emitted as contiguous run
+            // copies, so the work is split over the dimensions major to the
+            // concatenate dimension: 6 rows over 2 workgroups.
+            /*test_name=*/"ConcatenateContiguousCopySplitsOuterDims",
+            /*shape_and_layout=*/"s32[6,3]{1,0}",
+            /*outer_dimension_partitions=*/2,
+            /*expected_num_work_groups=*/2,
+            /*expected_work_tile_size=*/{3},
+            /*root_op=*/"concatenate(p0), dimensions={1}",
+        },
+        {
+            // Concatenating along the most-major dimension leaves no outer
+            // dimensions, so the copies run in a single workgroup.
+            /*test_name=*/"ConcatenateContiguousCopyMajorDimSingleWorkGroup",
+            /*shape_and_layout=*/"s32[6,3]{1,0}",
+            /*outer_dimension_partitions=*/2,
+            /*expected_num_work_groups=*/1,
+            /*expected_work_tile_size=*/{1},
+            /*root_op=*/"concatenate(p0), dimensions={0}",
+        },
+        {
             // DynamicUpdateSlice fusions with packed sub-byte outputs must also
             // run in a single workgroup covering the entire shape, because the
             // update index may land at a non-byte aligned offset.

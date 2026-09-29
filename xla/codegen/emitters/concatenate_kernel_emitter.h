@@ -16,14 +16,19 @@ limitations under the License.
 #ifndef XLA_CODEGEN_EMITTERS_CONCATENATE_KERNEL_EMITTER_H_
 #define XLA_CODEGEN_EMITTERS_CONCATENATE_KERNEL_EMITTER_H_
 
+#include <optional>
 #include <string>
 #include <vector>
 
 #include "absl/status/status.h"
 #include "absl/status/statusor.h"
 #include "absl/strings/string_view.h"
+#include "llvm/ADT/SmallVector.h"
 #include "mlir/Dialect/Func/IR/FuncOps.h"
+#include "mlir/IR/ImplicitLocOpBuilder.h"
 #include "mlir/IR/MLIRContext.h"
+#include "mlir/IR/Value.h"
+#include "mlir/IR/ValueRange.h"
 #include "xla/codegen/emitters/computation_partitioner.h"
 #include "xla/codegen/emitters/ir/xla_ops.h"
 #include "xla/codegen/emitters/kernel_arguments.h"
@@ -70,8 +75,22 @@ class ConcatenateFusionKernelEmitter final
   static int GetValidUnrollFactor(const HloFusionSpec& fusion_spec,
                                   int max_unroll_factor);
 
+  // The fusion can be emitted as contiguous run copies when every operand is
+  // a fusion parameter with the result's layout, the concatenate is the fusion
+  // root and elements are stored in whole bytes. Returns the shape of the
+  // dimensions major to the concatenate dimension (one run per operand is
+  // copied for each index of this shape), or nullopt when the fast path does
+  // not apply.
+  static std::optional<Shape> GetContiguousCopyOuterShape(
+      const HloFusionSpec& fusion_spec);
+
  private:
   IndexingMap ComputeWorkItemIdToOutputIndexing(mlir::MLIRContext* ctx) const;
+
+  llvm::SmallVector<mlir::Value> EmitContiguousCopies(
+      mlir::ImplicitLocOpBuilder& builder, const Shape& outer_shape,
+      mlir::ValueRange work_dims, mlir::ValueRange input_tensors,
+      llvm::SmallVector<mlir::Value> result_tensors) const;
 
   absl::Status EmitEntryFunction(
       const emitters::PartitionedComputations& computations,

@@ -422,3 +422,54 @@ func.func @get_dynamic_dim_size(%in: tensor<16x8x4xf32>) -> (i32) {
 // CHECK-LABEL: func.func @get_dynamic_dim_size(
 // CHECK-SAME:      %[[TENSOR:.*]]: tensor<512xf32>) -> i32 {
 // CHECK:         xla.get_dynamic_dim_size %[[TENSOR]] 1 : tensor<512xf32>
+
+// -----
+
+func.func @contiguous_slice_copy(%src: tensor<4x8x16xf32>,
+    %dst: tensor<4x12x16xf32>, %i: index) -> tensor<4x12x16xf32> {
+  %run = tensor.extract_slice %src[%i, 0, 0] [1, 8, 16] [1, 1, 1]
+    : tensor<4x8x16xf32> to tensor<1x8x16xf32>
+  %out = tensor.insert_slice %run into %dst[%i, 4, 0] [1, 8, 16] [1, 1, 1]
+    : tensor<1x8x16xf32> into tensor<4x12x16xf32>
+  func.return %out : tensor<4x12x16xf32>
+}
+// CHECK: #[[$SRC_MAP:.+]] = #xla.indexing_map<"(d0) -> (d0 * 128), domain: d0 in [0, 3]">
+// CHECK: #[[$DST_MAP:.+]] = #xla.indexing_map<"(d0) -> (d0 * 192 + 64), domain: d0 in [0, 3]">
+
+// CHECK-LABEL: func.func @contiguous_slice_copy(
+// CHECK-SAME:      %[[SRC:.*]]: tensor<512xf32>, %[[DST:.*]]: tensor<768xf32>,
+// CHECK-SAME:      %[[I:.*]]: index) -> tensor<768xf32> {
+// CHECK-NOT:     builtin.unrealized_conversion_cast
+// CHECK:         %[[SRC_OFFSET:.*]] = xla.apply_indexing #[[$SRC_MAP]](%[[I]])
+// CHECK:         %[[RUN:.*]] = tensor.extract_slice %[[SRC]][%[[SRC_OFFSET]]] [128] [1]
+// CHECK-SAME:      : tensor<512xf32> to tensor<128xf32>
+// CHECK:         %[[DST_OFFSET:.*]] = xla.apply_indexing #[[$DST_MAP]](%[[I]])
+// CHECK:         %[[OUT:.*]] = tensor.insert_slice %[[RUN]] into %[[DST]][%[[DST_OFFSET]]] [128] [1]
+// CHECK-SAME:      : tensor<128xf32> into tensor<768xf32>
+// CHECK:         return %[[OUT]] : tensor<768xf32>
+
+// -----
+
+func.func @contiguous_slice_copy_column_major(
+    %src: tensor<4x8xf32, dense<[0, 1]> : tensor<2xi64>>,
+    %dst: tensor<4x12xf32, dense<[0, 1]> : tensor<2xi64>>, %i: index)
+    -> tensor<4x12xf32, dense<[0, 1]> : tensor<2xi64>> {
+  %run = tensor.extract_slice %src[0, %i] [4, 1] [1, 1]
+    : tensor<4x8xf32, dense<[0, 1]> : tensor<2xi64>>
+    to tensor<4x1xf32, dense<[0, 1]> : tensor<2xi64>>
+  %out = tensor.insert_slice %run into %dst[0, %i] [4, 1] [1, 1]
+    : tensor<4x1xf32, dense<[0, 1]> : tensor<2xi64>>
+    into tensor<4x12xf32, dense<[0, 1]> : tensor<2xi64>>
+  func.return %out : tensor<4x12xf32, dense<[0, 1]> : tensor<2xi64>>
+}
+// CHECK: #[[$SRC_MAP:.+]] = #xla.indexing_map<"(d0) -> (d0 * 4), domain: d0 in [0, 7]">
+// CHECK: #[[$DST_MAP:.+]] = #xla.indexing_map<"(d0) -> (d0 * 4), domain: d0 in [0, 11]">
+
+// CHECK-LABEL: func.func @contiguous_slice_copy_column_major(
+// CHECK-SAME:      %[[SRC:.*]]: tensor<32xf32>, %[[DST:.*]]: tensor<48xf32>,
+// CHECK-SAME:      %[[I:.*]]: index) -> tensor<48xf32> {
+// CHECK-NOT:     builtin.unrealized_conversion_cast
+// CHECK:         %[[SRC_OFFSET:.*]] = xla.apply_indexing #[[$SRC_MAP]](%[[I]])
+// CHECK:         %[[RUN:.*]] = tensor.extract_slice %[[SRC]][%[[SRC_OFFSET]]] [4] [1]
+// CHECK:         %[[DST_OFFSET:.*]] = xla.apply_indexing #[[$DST_MAP]](%[[I]])
+// CHECK:         tensor.insert_slice %[[RUN]] into %[[DST]][%[[DST_OFFSET]]] [4] [1]
