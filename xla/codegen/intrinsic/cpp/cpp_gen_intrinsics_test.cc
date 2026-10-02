@@ -198,6 +198,23 @@ TEST(CppGenIntrinsicsTest, WideAtanIsAdaptedFromLibraryIr) {
   ExpectAtan16NearStd<double, 8>({0.0, 0.5, -1.0, 1.5, -2.0, 3.0, 1e-4, -1e3});
 }
 
+// A compiler without the required vector extensions compiles the library
+// sources to an empty module, which must not count as available.
+TEST(CppGenIntrinsicsTest, ContainsCppGenFunctions) {
+  EXPECT_FALSE(ContainsCppGenFunctions(""));
+  EXPECT_FALSE(ContainsCppGenFunctions("target triple = \"x86_64-unknown\"\n"));
+  EXPECT_FALSE(ContainsCppGenFunctions("declare float @xla.atan.f32(float)\n"));
+  EXPECT_FALSE(ContainsCppGenFunctions(
+      "define float @other(float %x) {\n  ret float %x\n}\n"));
+  EXPECT_TRUE(ContainsCppGenFunctions(
+      "define float @xla.atan.f32(float %x) {\n  ret float %x\n}\n"));
+  EXPECT_TRUE(ContainsCppGenFunctions(llvm_ir::kEigenUnary16LlIr));
+}
+
+TEST(CppGenIntrinsicsTest, EigenIntrinsicsAreAvailable) {
+  EXPECT_TRUE(AreEigenIntrinsicsAvailable());
+}
+
 TEST(CppGenIntrinsicsTest, AtanV2F64FromLibraryIr) {
   ExpectAtan16NearStd<double, 2>({0.5, -3.0, 1.0, -0.1, 1e-4, 1e3});
 }
