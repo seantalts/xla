@@ -176,9 +176,11 @@ void ExpectAtan16NearStd(const std::vector<T>& xs) {
   }
 }
 
-// x86-64 without AVX-512 and AArch64 pass 512-bit vectors indirectly, so these
-// go through CreateDirectAdapter.
+// x86-64 SysV without AVX-512 and AArch64 pass 512-bit vectors indirectly, so
+// these go through CreateDirectAdapter. The Windows x64 ABI that clang-cl emits
+// IR for passes them by value, so there is nothing to adapt there.
 TEST(CppGenIntrinsicsTest, WideAtanIsAdaptedFromLibraryIr) {
+#ifndef _WIN32
   {
     llvm::LLVMContext context;
     std::unique_ptr<llvm::Module> module =
@@ -189,6 +191,7 @@ TEST(CppGenIntrinsicsTest, WideAtanIsAdaptedFromLibraryIr) {
           << name;
     }
   }
+#endif
   ExpectAtan16NearStd<float, 16>({0.0f, 0.5f, -1.0f, 1.5f, -2.0f, 3.0f, 0.1f,
                                   -0.25f, 10.0f, -40.0f, 1e-4f, -0.9f, 7.0f,
                                   -1e3f, 0.75f, -5.5f});
